@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -128,22 +129,33 @@ def _fps_range_distance(camera_format: CameraFormatInfo, requested_fps: float | 
 def select_recording_profile(
     file_formats: Sequence[object],
     video_codecs: Sequence[object],
+    *,
+    is_supported: Callable[[RecordingProfile], bool] = lambda _profile: True,
 ) -> RecordingProfile:
     """Choose deterministic video encode settings from Qt-reported capabilities."""
 
     if not file_formats or not video_codecs:
         raise ValueError("no supported video recording profile")
-    file_format = _preferred_enum(file_formats, ("MPEG4", "Matroska"))
-    video_codec = _preferred_enum(video_codecs, ("H264", "H265", "VP9", "AV1"))
-    return RecordingProfile(file_format, video_codec)
+    ordered_file_formats = _preferred_enums(file_formats, ("MPEG4", "Matroska"))
+    ordered_video_codecs = _preferred_enums(
+        video_codecs,
+        ("H264", "H265", "VP9", "AV1"),
+    )
+    for file_format in ordered_file_formats:
+        for video_codec in ordered_video_codecs:
+            profile = RecordingProfile(file_format, video_codec)
+            if is_supported(profile):
+                return profile
+    raise ValueError("no supported video recording profile")
 
 
-def _preferred_enum(values: Sequence[object], preferred_names: Sequence[str]) -> object:
+def _preferred_enums(
+    values: Sequence[object],
+    preferred_names: Sequence[str],
+) -> tuple[object, ...]:
     by_name = {_enum_name(value): value for value in values}
-    for name in preferred_names:
-        if name in by_name:
-            return by_name[name]
-    return min(values, key=_enum_sort_key)
+    preferred = [by_name.pop(name) for name in preferred_names if name in by_name]
+    return (*preferred, *sorted(by_name.values(), key=_enum_sort_key))
 
 
 def _enum_name(value: object) -> str:
@@ -246,6 +258,7 @@ ObjectFactory = Callable[[QObject], _CaptureSessionLike]
 RecorderFactory = Callable[[QObject], _RecorderLike]
 MediaFormatFactory = Callable[[RecordingProfile], object]
 FormatCapabilities = Callable[[], tuple[Sequence[object], Sequence[object]]]
+ProfileSupport = Callable[[RecordingProfile], bool]
 Probe = Callable[[Path], VideoMetadata]
 DecodeValidator = Callable[[Path], object]
 
@@ -270,6 +283,7 @@ class QtCaptureController(QObject):
         recorder_factory: RecorderFactory | None = None,
         media_format_factory: MediaFormatFactory | None = None,
         format_capabilities: FormatCapabilities | None = None,
+        profile_is_supported: ProfileSupport | None = None,
         probe: Probe = probe_video,
         decode_validator: DecodeValidator = first_video_frame,
         capture_directory: Path | None = None,
@@ -281,6 +295,7 @@ class QtCaptureController(QObject):
         self._recorder_factory = recorder_factory or _create_qt_recorder
         self._media_format_factory = media_format_factory or _create_qt_media_format
         self._format_capabilities = format_capabilities or _qt_format_capabilities
+        self._profile_is_supported = profile_is_supported or _qt_profile_is_supported
         self._probe = probe
         self._decode_validator = decode_validator
         self._capture_directory = (
@@ -296,11 +311,16 @@ class QtCaptureController(QObject):
         self._recorder: _RecorderLike | None = None
         self._request: CaptureRequest | None = None
         self._selected_format: CameraFormatInfo | None = None
+        self._staging_directory: Path | None = None
         self._temporary_path: Path | None = None
+        self._actual_path: Path | None = None
         self._final_path: Path | None = None
         self._recording_pending = False
         self._recording_active = False
         self._discarding = False
+        self._graph_generation = 0
+        self._failed_generation: int | None = None
+        self._failure_message: str | None = None
         self._media_devices.videoInputsChanged.connect(self._on_devices_changed)
 
     @property
@@ -337,19 +357,32 @@ class QtCaptureController(QObject):
         camera = self._camera_factory(cast(_CameraDeviceLike, device.qt_device), self)
         session = self._capture_session_factory(self)
         recorder = self._recorder_factory(self)
+        self._graph_generation += 1
+        generation = self._graph_generation
         self._camera = camera
         self._session = session
         self._recorder = recorder
         self._request = request
         self._selected_format = selected
-        camera.errorOccurred.connect(self._on_camera_error)
-        recorder.recorderStateChanged.connect(self._on_recorder_state_changed)
-        recorder.errorOccurred.connect(self._on_recorder_error)
+        camera.errorOccurred.connect(
+            lambda error, message: self._on_camera_error(generation, error, message)
+        )
+        recorder.recorderStateChanged.connect(
+            lambda state: self._on_recorder_state_changed(generation, state)
+        )
+        recorder.errorOccurred.connect(
+            lambda error, message: self._on_recorder_error(generation, error, message)
+        )
         camera.setCameraFormat(selected.qt_format)
+        self._require_active_graph(generation, camera, recorder)
         session.setCamera(camera)
+        self._require_active_graph(generation, camera, recorder)
         session.setRecorder(recorder)
+        self._require_active_graph(generation, camera, recorder)
         session.setVideoOutput(video_output)
+        self._require_active_graph(generation, camera, recorder)
         camera.start()
+        self._require_active_graph(generation, camera, recorder)
         self.previewStarted.emit(selected)
         return selected
 
@@ -365,28 +398,47 @@ class QtCaptureController(QObject):
         self.previewStopped.emit()
 
     def start_recording(self, final_path: Path | None = None) -> None:
-        """Start video-only recording to an owned sibling temporary path."""
+        """Start video-only recording in a private same-filesystem staging directory."""
 
-        if self._recorder is None or self._request is None or self._selected_format is None:
+        if (
+            self._camera is None
+            or self._recorder is None
+            or self._request is None
+            or self._selected_format is None
+        ):
             raise RuntimeError("camera preview is not active")
         if self._recording_pending or self._recording_active:
             raise RuntimeError("camera recording is already active")
-        profile = select_recording_profile(*self._format_capabilities())
+        camera = self._camera
+        recorder = self._recorder
+        generation = self._graph_generation
+        profile = select_recording_profile(
+            *self._format_capabilities(),
+            is_supported=self._profile_is_supported,
+        )
         destination = self._resolve_final_path(final_path, profile)
         if destination.exists():
             raise FileExistsError(f"capture destination already exists: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary_path = destination.parent / (
-            f".{destination.stem}.{uuid4().hex}.part{destination.suffix or _profile_extension(profile)}"
+        staging_directory = Path(
+            tempfile.mkdtemp(prefix=".capture-", dir=destination.parent)
         )
+        temporary_path = staging_directory / (
+            f"recording{destination.suffix or _profile_extension(profile)}"
+        )
+        self._staging_directory = staging_directory.resolve()
         self._temporary_path = temporary_path.resolve()
+        self._actual_path = None
         self._final_path = destination.resolve()
         self._discarding = False
         self._recording_pending = True
         self._recording_active = False
-        self._recorder.setMediaFormat(self._media_format_factory(profile))
-        self._recorder.setOutputLocation(QUrl.fromLocalFile(str(self._temporary_path)))
-        self._recorder.record()
+        recorder.setMediaFormat(self._media_format_factory(profile))
+        self._require_active_graph(generation, camera, recorder)
+        recorder.setOutputLocation(QUrl.fromLocalFile(str(self._temporary_path)))
+        self._require_active_graph(generation, camera, recorder)
+        recorder.record()
+        self._require_active_graph(generation, camera, recorder)
 
     def stop_recording(self) -> None:
         """Request recorder finalization; publication follows StoppedState."""
@@ -402,14 +454,19 @@ class QtCaptureController(QObject):
         self._recording_pending = False
         self._recording_active = False
         recorder = self._recorder
+        self._graph_generation += 1
         if recorder is not None:
             recorder.stop()
         had_preview = self._camera is not None
-        self._cleanup_owned_temporary()
-        self._release_media()
+        cleanup_diagnostics = self._cleanup_owned_temporary()
+        self._release_media(invalidate=False)
         self._discarding = False
         if had_preview:
             self.previewStopped.emit()
+        if cleanup_diagnostics:
+            self.errorOccurred.emit(
+                "capture discard failed; cleanup failed: " + "; ".join(cleanup_diagnostics)
+            )
 
     def _describe_device(self, device: _CameraDeviceLike) -> CameraDeviceInfo:
         formats: list[CameraFormatInfo] = []
@@ -453,13 +510,29 @@ class QtCaptureController(QObject):
     def _on_devices_changed(self) -> None:
         self.devicesChanged.emit()
 
-    def _on_camera_error(self, _error: object, message: str) -> None:
+    def _on_camera_error(
+        self,
+        generation: int,
+        _error: object,
+        message: str,
+    ) -> None:
+        if generation != self._graph_generation:
+            return
         self._fail(message or "camera error")
 
-    def _on_recorder_error(self, _error: object, message: str) -> None:
+    def _on_recorder_error(
+        self,
+        generation: int,
+        _error: object,
+        message: str,
+    ) -> None:
+        if generation != self._graph_generation:
+            return
         self._fail(message or "camera recorder error")
 
-    def _on_recorder_state_changed(self, state: object) -> None:
+    def _on_recorder_state_changed(self, generation: int, state: object) -> None:
+        if generation != self._graph_generation:
+            return
         if state == QMediaRecorder.RecorderState.RecordingState:
             if self._recording_pending and not self._recording_active:
                 self._recording_active = True
@@ -477,26 +550,36 @@ class QtCaptureController(QObject):
         recorder = self._recorder
         request = self._request
         selected = self._selected_format
+        staging_directory = self._staging_directory
         temporary_path = self._temporary_path
         final_path = self._final_path
-        if None in (recorder, request, selected, temporary_path, final_path):
+        if None in (
+            recorder,
+            request,
+            selected,
+            staging_directory,
+            temporary_path,
+            final_path,
+        ):
             self._fail("camera recording state is incomplete")
             return
         assert recorder is not None
         assert request is not None
         assert selected is not None
+        assert staging_directory is not None
         assert temporary_path is not None
         assert final_path is not None
-        actual_location = recorder.actualLocation().toLocalFile()
-        actual_path = Path(actual_location).resolve() if actual_location else None
-        if actual_path != temporary_path:
-            self._fail("recorder reported an unexpected output location")
-            return
         try:
-            self._decode_validator(temporary_path)
-            metadata = self._probe(temporary_path)
+            actual_path = _owned_actual_path(recorder.actualLocation(), staging_directory)
+        except ValueError as error:
+            self._fail(str(error))
+            return
+        self._actual_path = actual_path
+        try:
+            self._decode_validator(actual_path)
+            metadata = self._probe(actual_path)
             validate_capture_result(request, metadata)
-            digest = _sha256_file(temporary_path)
+            digest = _sha256_file(actual_path)
             result = CaptureResult(
                 request=request,
                 selected_width=selected.width,
@@ -515,47 +598,112 @@ class QtCaptureController(QObject):
                 path=final_path,
                 sha256=digest,
             )
-            if final_path.exists():
-                raise FileExistsError(f"capture destination already exists: {final_path}")
-            os.replace(temporary_path, final_path)
+            try:
+                os.link(actual_path, final_path)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"capture destination already exists: {final_path}"
+                ) from None
+            except OSError as error:
+                raise OSError(
+                    f"atomic capture publication is unavailable: {error.strerror or error}"
+                ) from None
         except Exception as error:  # noqa: BLE001 - terminal boundary must clean injected failures
             self._fail(str(error))
             return
-        self._temporary_path = None
-        self._final_path = None
+        cleanup_diagnostics = self._cleanup_owned_temporary()
         had_preview = self._camera is not None
         self._release_media()
         if had_preview:
             self.previewStopped.emit()
+        if cleanup_diagnostics:
+            self.errorOccurred.emit(
+                "capture published but cleanup failed: " + "; ".join(cleanup_diagnostics)
+            )
         self.recordingFinished.emit(result)
 
     def _fail(self, message: str) -> None:
+        failed_generation = self._graph_generation
         self._discarding = True
         self._recording_pending = False
         self._recording_active = False
         recorder = self._recorder
+        self._graph_generation += 1
         if recorder is not None:
             recorder.stop()
         had_preview = self._camera is not None
-        self._cleanup_owned_temporary()
-        self._release_media()
+        cleanup_diagnostics = self._cleanup_owned_temporary()
+        self._release_media(invalidate=False)
         self._discarding = False
         if had_preview:
             self.previewStopped.emit()
+        if cleanup_diagnostics:
+            message += "; cleanup failed: " + "; ".join(cleanup_diagnostics)
+        self._failed_generation = failed_generation
+        self._failure_message = message
         self.errorOccurred.emit(message)
 
-    def _cleanup_owned_temporary(self) -> None:
+    def _cleanup_owned_temporary(self) -> tuple[str, ...]:
+        diagnostics: list[str] = []
+        staging_directory = self._staging_directory
         temporary_path = self._temporary_path
-        self._temporary_path = None
-        self._final_path = None
-        if temporary_path is None:
-            return
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+        actual_path = self._actual_path
+        for owned_path in dict.fromkeys((actual_path, temporary_path)):
+            if owned_path is not None:
+                try:
+                    _unlink_file(owned_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as error:  # noqa: BLE001 - cleanup must preserve primary failure
+                    diagnostics.append(
+                        f"could not remove staged file {owned_path}: {error}"
+                    )
+                    continue
+                if self._actual_path == owned_path:
+                    self._actual_path = None
+                if self._temporary_path == owned_path:
+                    self._temporary_path = None
+        if (
+            staging_directory is not None
+            and self._actual_path is None
+            and self._temporary_path is None
+        ):
+            content_diagnostics = _remove_owned_contents(staging_directory)
+            diagnostics.extend(content_diagnostics)
+            if not content_diagnostics:
+                try:
+                    _remove_directory(staging_directory)
+                except FileNotFoundError:
+                    self._staging_directory = None
+                except Exception as error:  # noqa: BLE001 - preserve primary failure
+                    diagnostics.append(
+                        f"could not remove staging directory {staging_directory}: {error}"
+                    )
+                else:
+                    self._staging_directory = None
+        if self._staging_directory is None:
+            self._final_path = None
+        return tuple(diagnostics)
 
-    def _release_media(self) -> None:
+    def _require_active_graph(
+        self,
+        generation: int,
+        camera: _CameraLike,
+        recorder: _RecorderLike,
+    ) -> None:
+        if (
+            generation == self._graph_generation
+            and self._camera is camera
+            and self._recorder is recorder
+        ):
+            return
+        if self._failed_generation == generation and self._failure_message is not None:
+            raise RuntimeError(self._failure_message)
+        raise RuntimeError("camera operation was interrupted")
+
+    def _release_media(self, *, invalidate: bool = True) -> None:
+        if invalidate:
+            self._graph_generation += 1
         camera = self._camera
         session = self._session
         recorder = self._recorder
@@ -601,6 +749,11 @@ def _qt_format_capabilities() -> tuple[Sequence[object], Sequence[object]]:
     )
 
 
+def _qt_profile_is_supported(profile: RecordingProfile) -> bool:
+    media_format = _create_qt_media_format(profile)
+    return cast(QMediaFormat, media_format).isSupported(QMediaFormat.ConversionMode.Encode)
+
+
 def _profile_extension(profile: RecordingProfile) -> str:
     return {
         "WMV": ".wmv",
@@ -611,6 +764,78 @@ def _profile_extension(profile: RecordingProfile) -> str:
         "QuickTime": ".mov",
         "WebM": ".webm",
     }.get(_enum_name(profile.file_format), ".video")
+
+
+def _owned_actual_path(location: QUrl, staging_directory: Path) -> Path:
+    if not location.isLocalFile():
+        raise ValueError("recorder reported an unexpected output location")
+    raw_path = Path(location.toLocalFile())
+    if ".." in raw_path.parts:
+        raise ValueError("recorder reported an unexpected output location")
+    try:
+        actual_path = raw_path.resolve(strict=True)
+        owned_directory = staging_directory.resolve(strict=True)
+    except OSError:
+        raise ValueError("recorder reported an unexpected output location") from None
+    if not actual_path.is_relative_to(owned_directory) or actual_path == owned_directory:
+        raise ValueError("recorder reported an unexpected output location")
+    relative_path = raw_path.relative_to(staging_directory)
+    current_path = staging_directory
+    for part in relative_path.parts:
+        current_path /= part
+        if _is_link_like(current_path):
+            raise ValueError("recorder reported an unexpected output location")
+    if not actual_path.is_file():
+        raise ValueError("recorder reported an unexpected output location")
+    return actual_path
+
+
+def _unlink_file(path: Path) -> None:
+    path.unlink()
+
+
+def _remove_directory(path: Path) -> None:
+    path.rmdir()
+
+
+def _remove_owned_contents(directory: Path) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    try:
+        children = tuple(directory.iterdir())
+    except FileNotFoundError:
+        return ()
+    except Exception as error:  # noqa: BLE001 - cleanup is a terminal boundary
+        return (f"could not inspect staging directory {directory}: {error}",)
+    for child in children:
+        try:
+            link_like = _is_link_like(child)
+            is_directory = child.is_dir()
+        except Exception as error:  # noqa: BLE001 - cleanup is a terminal boundary
+            diagnostics.append(f"could not inspect staged path {child}: {error}")
+            continue
+        if not is_directory or link_like:
+            try:
+                _unlink_file(child)
+            except FileNotFoundError:
+                pass
+            except Exception as error:  # noqa: BLE001 - cleanup is a terminal boundary
+                diagnostics.append(f"could not remove staged file {child}: {error}")
+            continue
+        child_diagnostics = _remove_owned_contents(child)
+        diagnostics.extend(child_diagnostics)
+        if child_diagnostics:
+            continue
+        try:
+            _remove_directory(child)
+        except FileNotFoundError:
+            pass
+        except Exception as error:  # noqa: BLE001 - cleanup is a terminal boundary
+            diagnostics.append(f"could not remove staging directory {child}: {error}")
+    return tuple(diagnostics)
+
+
+def _is_link_like(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
 
 
 def _sha256_file(path: Path) -> str:

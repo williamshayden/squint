@@ -131,6 +131,11 @@ class MainWindow(QMainWindow):
     def load_video(self, path: Path) -> None:
         """Decode and display one bounded preview frame from a local video."""
 
+        if self._camera_recording_in_progress():
+            raise RuntimeError("cannot replace source while camera recording is active")
+        if self._preview_active and self._capture_controller is not None:
+            self._capture_controller.stop_preview()
+        self._source_mode_combo.setCurrentText("Video file")
         self._load_video(Path(path), capture=None)
 
     def _load_video(self, path: Path, *, capture: CaptureResult | None) -> None:
@@ -171,7 +176,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.load_video(Path(selected))
-        except (OSError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError) as error:
             self.statusBar().showMessage(str(error))
 
     def _camera_controls(self) -> QGroupBox:
@@ -243,16 +248,32 @@ class MainWindow(QMainWindow):
 
     def _source_mode_changed(self, source_mode: str) -> None:
         camera_mode = source_mode == "Camera"
+        if not camera_mode and self._camera_recording_in_progress():
+            self._source_mode_combo.blockSignals(True)
+            self._source_mode_combo.setCurrentText("Camera")
+            self._source_mode_combo.blockSignals(False)
+            self._camera_group.setEnabled(True)
+            self.statusBar().showMessage(
+                "Stop or discard the camera recording before replacing the source"
+            )
+            self._update_control_state()
+            return
         self._camera_group.setEnabled(camera_mode)
         if camera_mode:
             self._connect_capture_controller()
             self._populate_camera_devices()
         elif self._capture_controller is not None:
-            if self._recording_active or self._record_start_requested:
-                self._capture_controller.discard()
-            elif self._preview_active:
+            if self._preview_active:
                 self._capture_controller.stop_preview()
         self._update_control_state()
+
+    def _camera_recording_in_progress(self) -> bool:
+        controller = self._capture_controller
+        return (
+            self._record_start_requested
+            or self._recording_active
+            or (controller is not None and controller.is_recording)
+        )
 
     def _populate_camera_devices(self) -> None:
         controller = self._connect_capture_controller()

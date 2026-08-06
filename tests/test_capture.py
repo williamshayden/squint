@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import os
 from dataclasses import replace
 from enum import IntEnum
 from hashlib import sha256
@@ -11,6 +13,7 @@ from PySide6.QtMultimedia import QMediaRecorder, QVideoFrameFormat
 from pytestqt.qtbot import QtBot
 
 from edge_perception.config import CaptureRequest, CaptureResult
+from edge_perception.gui import capture
 from edge_perception.gui.capture import (
     CameraDeviceInfo,
     CameraFormatInfo,
@@ -99,9 +102,16 @@ class FakeMediaDevices(QObject):
 class FakeCamera(QObject):
     errorOccurred = Signal(object, str)
 
-    def __init__(self, device: object, parent: QObject) -> None:
+    def __init__(
+        self,
+        device: object,
+        parent: QObject,
+        *,
+        start_error: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.device = device
+        self.start_error = start_error
         self.camera_format: object | None = None
         self.start_count = 0
         self.stop_count = 0
@@ -111,6 +121,8 @@ class FakeCamera(QObject):
 
     def start(self) -> None:
         self.start_count += 1
+        if self.start_error is not None:
+            self.errorOccurred.emit(QMediaRecorder.Error.ResourceError, self.start_error)
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -141,8 +153,16 @@ class FakeRecorder(QObject):
     recorderStateChanged = Signal(object)
     errorOccurred = Signal(object, str)
 
-    def __init__(self, parent: QObject) -> None:
+    def __init__(
+        self,
+        parent: QObject,
+        *,
+        output_error: str | None = None,
+        record_error: str | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.output_error = output_error
+        self.record_error = record_error
         self.media_format: object | None = None
         self.output_location = QUrl()
         self.actual_location: QUrl | None = None
@@ -154,12 +174,16 @@ class FakeRecorder(QObject):
 
     def setOutputLocation(self, location: QUrl) -> None:
         self.output_location = location
+        if self.output_error is not None:
+            self.errorOccurred.emit(QMediaRecorder.Error.ResourceError, self.output_error)
 
     def actualLocation(self) -> QUrl:
         return self.actual_location or self.output_location
 
     def record(self) -> None:
         self.record_count += 1
+        if self.record_error is not None:
+            self.errorOccurred.emit(QMediaRecorder.Error.ResourceError, self.record_error)
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -172,6 +196,9 @@ class ControllerHarness:
         metadata: VideoMetadata | None = None,
         *,
         decode_error: Exception | None = None,
+        camera_start_error: str | None = None,
+        recorder_output_error: str | None = None,
+        recorder_record_error: str | None = None,
     ) -> None:
         self.qt_formats = (
             FakeCameraFormat(
@@ -197,6 +224,9 @@ class ControllerHarness:
         self.probed_paths: list[Path] = []
         self.decoded_paths: list[Path] = []
         self.decode_error = decode_error
+        self.camera_start_error = camera_start_error
+        self.recorder_output_error = recorder_output_error
+        self.recorder_record_error = recorder_record_error
         self.metadata = metadata or VideoMetadata(
             1280,
             720,
@@ -217,6 +247,7 @@ class ControllerHarness:
                 (FakeFileFormat.MPEG4,),
                 (FakeVideoCodec.H264,),
             ),
+            profile_is_supported=lambda _profile: True,
             probe=self._probe,
             decode_validator=self._decode,
             capture_directory=tmp_path / "captures",
@@ -256,7 +287,7 @@ class ControllerHarness:
         return Path(self.recorder.output_location.toLocalFile())
 
     def _camera_factory(self, device: object, parent: QObject) -> FakeCamera:
-        camera = FakeCamera(device, parent)
+        camera = FakeCamera(device, parent, start_error=self.camera_start_error)
         self.cameras.append(camera)
         return camera
 
@@ -266,7 +297,11 @@ class ControllerHarness:
         return session
 
     def _recorder_factory(self, parent: QObject) -> FakeRecorder:
-        recorder = FakeRecorder(parent)
+        recorder = FakeRecorder(
+            parent,
+            output_error=self.recorder_output_error,
+            record_error=self.recorder_record_error,
+        )
         self.recorders.append(recorder)
         return recorder
 
@@ -381,6 +416,37 @@ def test_recording_profile_uses_documented_preference_order() -> None:
     assert profile == RecordingProfile(FakeFileFormat.MPEG4, FakeVideoCodec.H264)
 
 
+def test_recording_profile_selects_first_compatible_preferred_pair() -> None:
+    checked: list[RecordingProfile] = []
+
+    def is_supported(profile: RecordingProfile) -> bool:
+        checked.append(profile)
+        return profile == RecordingProfile(FakeFileFormat.Matroska, FakeVideoCodec.H264)
+
+    profile = select_recording_profile(
+        (FakeFileFormat.Matroska, FakeFileFormat.MPEG4),
+        (FakeVideoCodec.VP9, FakeVideoCodec.H265, FakeVideoCodec.H264),
+        is_supported=is_supported,
+    )
+
+    assert profile == RecordingProfile(FakeFileFormat.Matroska, FakeVideoCodec.H264)
+    assert checked == [
+        RecordingProfile(FakeFileFormat.MPEG4, FakeVideoCodec.H264),
+        RecordingProfile(FakeFileFormat.MPEG4, FakeVideoCodec.H265),
+        RecordingProfile(FakeFileFormat.MPEG4, FakeVideoCodec.VP9),
+        RecordingProfile(FakeFileFormat.Matroska, FakeVideoCodec.H264),
+    ]
+
+
+def test_recording_profile_rejects_nonempty_but_incompatible_capabilities() -> None:
+    with pytest.raises(ValueError, match="^no supported video recording profile$"):
+        select_recording_profile(
+            (FakeFileFormat.MPEG4,),
+            (FakeVideoCodec.H264,),
+            is_supported=lambda _profile: False,
+        )
+
+
 def test_recording_profile_falls_back_to_enum_order() -> None:
     profile = select_recording_profile(
         (FakeFileFormat.AVI,),
@@ -448,6 +514,53 @@ def test_preview_applies_selected_format(tmp_path: Path) -> None:
     assert selected_events == [selected]
 
 
+def test_synchronous_camera_error_does_not_emit_preview_success(tmp_path: Path) -> None:
+    harness = ControllerHarness(tmp_path, camera_start_error="sync camera failed")
+    previews: list[CameraFormatInfo] = []
+    errors: list[str] = []
+    harness.controller.previewStarted.connect(previews.append)
+    harness.controller.errorOccurred.connect(errors.append)
+
+    with pytest.raises(RuntimeError, match="^sync camera failed$"):
+        harness.start_preview()
+
+    assert previews == []
+    assert errors == ["sync camera failed"]
+    assert harness.controller.is_previewing is False
+
+
+@pytest.mark.parametrize(
+    ("error_stage", "message"),
+    [
+        ("output", "sync output failed"),
+        ("record", "sync record failed"),
+    ],
+)
+def test_synchronous_recorder_error_aborts_start_without_stale_dereference(
+    tmp_path: Path,
+    error_stage: str,
+    message: str,
+) -> None:
+    harness = ControllerHarness(
+        tmp_path,
+        recorder_output_error=message if error_stage == "output" else None,
+        recorder_record_error=message if error_stage == "record" else None,
+    )
+    harness.start_preview()
+    started: list[None] = []
+    errors: list[str] = []
+    harness.controller.recordingStarted.connect(lambda: started.append(None))
+    harness.controller.errorOccurred.connect(errors.append)
+
+    with pytest.raises(RuntimeError, match=f"^{message}$"):
+        harness.controller.start_recording(tmp_path / "finished.mp4")
+
+    assert started == []
+    assert errors == [message]
+    assert harness.controller.is_previewing is False
+    assert not list(tmp_path.glob(".capture-*"))
+
+
 def test_recording_state_is_explicit(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()
@@ -470,9 +583,10 @@ def test_recording_state_is_explicit(tmp_path: Path) -> None:
 def test_discard_removes_only_owned_temporary_file(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()
-    temporary_path = harness.start_recording(tmp_path / "finished.mp4")
+    final_path = tmp_path / "finished.mp4"
+    temporary_path = harness.start_recording(final_path)
     temporary_path.write_bytes(b"partial")
-    unrelated = temporary_path.parent / "unrelated.part.mp4"
+    unrelated = final_path.parent / "unrelated.part.mp4"
     unrelated.write_bytes(b"keep")
 
     harness.controller.discard()
@@ -485,9 +599,10 @@ def test_discard_removes_only_owned_temporary_file(tmp_path: Path) -> None:
 def test_recorder_error_cleans_temporary_file(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()
-    temporary_path = harness.start_recording(tmp_path / "finished.mp4")
+    final_path = tmp_path / "finished.mp4"
+    temporary_path = harness.start_recording(final_path)
     temporary_path.write_bytes(b"partial")
-    unrelated = temporary_path.parent / "keep.mp4"
+    unrelated = final_path.parent / "keep.mp4"
     unrelated.write_bytes(b"keep")
     errors: list[str] = []
     finished: list[CaptureResult] = []
@@ -502,6 +617,73 @@ def test_recorder_error_cleans_temporary_file(tmp_path: Path) -> None:
     assert finished == []
 
 
+def test_cleanup_permission_error_preserves_primary_failure_and_owned_file(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    staged_path = harness.start_recording(tmp_path / "finished.mp4")
+    staged_path.write_bytes(b"partial")
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    def deny_unlink(_path: Path) -> None:
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(capture, "_unlink_file", deny_unlink, raising=False)
+    with qtbot.captureExceptions() as exceptions:
+        harness.recorder.errorOccurred.emit(
+            QMediaRecorder.Error.ResourceError,
+            "camera failed",
+        )
+
+    assert exceptions == []
+    assert errors == [
+        f"camera failed; cleanup failed: could not remove staged file {staged_path}: access denied"
+    ]
+    assert staged_path.read_bytes() == b"partial"
+    assert harness.controller.is_previewing is False
+
+    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+    harness.controller.discard()
+
+    assert not staged_path.parent.exists()
+
+
+def test_cleanup_retains_owned_staging_directory_until_rmdir_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    staged_path = harness.start_recording(tmp_path / "finished.mp4")
+    staged_path.write_bytes(b"partial")
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    def deny_rmdir(_path: Path) -> None:
+        raise PermissionError("directory busy")
+
+    monkeypatch.setattr(capture, "_remove_directory", deny_rmdir, raising=False)
+    harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
+
+    assert not staged_path.exists()
+    assert staged_path.parent.is_dir()
+    assert errors == [
+        (
+            "camera failed; cleanup failed: "
+            f"could not remove staging directory {staged_path.parent}: directory busy"
+        )
+    ]
+
+    monkeypatch.setattr(capture, "_remove_directory", lambda path: path.rmdir())
+    harness.controller.discard()
+
+    assert not staged_path.parent.exists()
+
+
 def test_success_atomically_publishes_capture(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()
@@ -512,6 +694,8 @@ def test_success_atomically_publishes_capture(tmp_path: Path) -> None:
     harness.controller.recordingFinished.connect(finished.append)
     harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.RecordingState)
 
+    assert temporary_path.parent.parent == final_path.parent
+    assert temporary_path.parent != final_path.parent
     assert not final_path.exists()
     harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
 
@@ -521,6 +705,76 @@ def test_success_atomically_publishes_capture(tmp_path: Path) -> None:
     assert harness.probed_paths == [temporary_path]
     assert len(finished) == 1
     assert finished[0].path == final_path.resolve()
+
+
+def test_owned_rewritten_actual_location_is_probed_hashed_and_published(tmp_path: Path) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    requested_path = harness.start_recording(final_path)
+    actual_path = requested_path.parent / "backend-rewritten.mp4"
+    actual_path.write_bytes(b"payload")
+    harness.recorder.actual_location = QUrl.fromLocalFile(str(actual_path))
+    finished: list[CaptureResult] = []
+    harness.controller.recordingFinished.connect(finished.append)
+
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert final_path.read_bytes() == b"payload"
+    assert harness.decoded_paths == [actual_path]
+    assert harness.probed_paths == [actual_path]
+    assert finished[0].sha256 == sha256(b"payload").hexdigest()
+    assert not requested_path.parent.exists()
+
+
+def test_collision_race_preserves_existing_completed_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    staged_path = harness.start_recording(final_path)
+    staged_path.write_bytes(b"new capture")
+    real_link = os.link
+
+    def collide_then_link(source: Path, destination: Path) -> None:
+        destination.write_bytes(b"completed capture")
+        real_link(source, destination)
+
+    monkeypatch.setattr(capture.os, "link", collide_then_link)
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert final_path.read_bytes() == b"completed capture"
+    assert errors == [f"capture destination already exists: {final_path.resolve()}"]
+    assert not staged_path.parent.exists()
+
+
+def test_unsupported_hard_links_fail_without_copy_or_replace_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    staged_path = harness.start_recording(final_path)
+    staged_path.write_bytes(b"payload")
+
+    def unsupported_link(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EPERM, "hard links unsupported")
+
+    monkeypatch.setattr(capture.os, "link", unsupported_link)
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert not final_path.exists()
+    assert errors == ["atomic capture publication is unavailable: hard links unsupported"]
+    assert not staged_path.parent.exists()
 
 
 def test_capture_result_uses_probed_metadata(tmp_path: Path) -> None:
@@ -614,4 +868,51 @@ def test_unexpected_actual_location_is_not_owned_or_deleted(tmp_path: Path) -> N
     assert not temporary_path.exists()
     assert foreign_path.read_bytes() == b"foreign"
     assert not final_path.exists()
+    assert errors == ["recorder reported an unexpected output location"]
+
+
+def test_traversing_actual_location_is_rejected_and_owned_stage_is_removed(
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    requested_path = harness.start_recording(final_path)
+    requested_path.write_bytes(b"partial")
+    nested_directory = requested_path.parent / "nested"
+    nested_directory.mkdir()
+    traversing_path = nested_directory / ".." / requested_path.name
+    harness.recorder.actual_location = QUrl.fromLocalFile(str(traversing_path))
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert not final_path.exists()
+    assert not requested_path.parent.exists()
+    assert errors == ["recorder reported an unexpected output location"]
+
+
+def test_symlinked_actual_location_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    requested_path = harness.start_recording(final_path)
+    requested_path.write_bytes(b"partial")
+    real_is_symlink = Path.is_symlink
+
+    def report_actual_as_symlink(path: Path) -> bool:
+        return path == requested_path or real_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", report_actual_as_symlink)
+    errors: list[str] = []
+    harness.controller.errorOccurred.connect(errors.append)
+
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert not final_path.exists()
+    assert not requested_path.parent.exists()
     assert errors == ["recorder reported an unexpected output location"]

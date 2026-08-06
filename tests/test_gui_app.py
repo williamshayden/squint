@@ -83,6 +83,7 @@ class FakeWindowCaptureController(QObject):
         self.record_calls = 0
         self.stop_recording_calls = 0
         self.stop_preview_calls = 0
+        self.discard_calls = 0
         self.preview_active = False
         self.recording_active = False
 
@@ -120,6 +121,7 @@ class FakeWindowCaptureController(QObject):
         self.stop_recording_calls += 1
 
     def discard(self) -> None:
+        self.discard_calls += 1
         self.recording_active = False
         self.stop_preview()
 
@@ -229,6 +231,97 @@ def test_camera_record_and_stop_transitions_are_explicit(qtbot: QtBot) -> None:
 
     assert controller.stop_recording_calls == 1
     assert stop.isEnabled() is False
+
+
+def test_loading_file_stops_preview_before_replacing_source(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    assert source_mode is not None
+    assert preview is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    video_path = tmp_path / "replacement.mp4"
+    window.load_video(video_path)
+
+    assert controller.stop_preview_calls == 1
+    assert controller.discard_calls == 0
+    assert controller.preview_active is False
+    assert source_mode.currentText() == "Video file"
+    assert window.findChild(QLabel, "source-path").text() == str(video_path)
+
+
+def test_loading_file_while_recording_is_rejected_without_discard(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    decoded: list[Path] = []
+
+    def decode(path: Path) -> DecodedFrame:
+        decoded.append(path)
+        return _preview_frame()
+
+    monkeypatch.setattr(main_window, "first_video_frame", decode)
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^cannot replace source while camera recording is active$",
+    ):
+        window.load_video(tmp_path / "replacement.mp4")
+
+    assert decoded == []
+    assert controller.discard_calls == 0
+    assert controller.stop_preview_calls == 0
+    assert controller.recording_active is True
+    assert source_mode.currentText() == "Camera"
+
+
+def test_switching_to_file_mode_while_recording_restores_camera_mode(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    source_mode.setCurrentText("Video file")
+
+    assert source_mode.currentText() == "Camera"
+    assert controller.discard_calls == 0
+    assert controller.stop_preview_calls == 0
+    assert controller.recording_active is True
+    assert window.statusBar().currentMessage() == (
+        "Stop or discard the camera recording before replacing the source"
+    )
 
 
 def test_completed_camera_capture_loads_final_rgb_and_probed_metadata(
