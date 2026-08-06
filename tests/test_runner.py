@@ -9,6 +9,7 @@ from conftest import FakeDetector
 
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
+from edge_perception.progress import ProgressEvent
 from edge_perception.runner import RunConfig, run_checkpoint
 
 
@@ -202,6 +203,51 @@ def test_run_checkpoint_finalizes_failed_artifacts_when_warmup_fails(
     assert _json_lines(run_dir / "detections.jsonl") == []
     assert _json_lines(run_dir / "hardware.jsonl") == []
     video_path.rename(tmp_path / "preview-was-closed.mp4")
+
+
+def test_runner_cancels_between_completed_frames(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    events: list[ProgressEvent] = []
+    config = RunConfig(video_path, tmp_path / "run", (), 0.3, None, 0, 0)
+
+    summary = run_checkpoint(
+        config,
+        fake_detector,
+        progress=events.append,
+        cancel_requested=lambda: len(fake_detector.predict_batch_sizes) >= 1,
+    )
+
+    persisted = json.loads((config.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "cancelled"
+    assert summary["frames_processed"] == 1
+    assert persisted["status"] == "cancelled"
+    assert len(_json_lines(config.output_dir / "inferences.jsonl")) == 1
+    assert events[-1].phase == "cancelled"
+    assert sum(event.phase in {"complete", "cancelled", "failed"} for event in events) == 1
+
+
+def test_runner_emits_one_failed_terminal_event_when_detector_fails(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    events: list[ProgressEvent] = []
+
+    def fail(_images: tuple[object, ...]) -> object:
+        raise RuntimeError("detector failed")
+
+    fake_detector.predict = fail  # type: ignore[method-assign]
+    config = RunConfig(video_path, tmp_path / "failed-progress", (), 0.3, 1, 0, 0)
+
+    with pytest.raises(RuntimeError, match="detector failed"):
+        run_checkpoint(config, fake_detector, progress=events.append)
+
+    assert [event.phase for event in events] == ["validating", "warming_up", "failed"]
+    assert events[-1].error == "RuntimeError: detector failed"
+    assert sum(event.phase in {"complete", "cancelled", "failed"} for event in events) == 1
 
 
 def test_run_checkpoint_rejects_nonempty_output_before_detector_work(
