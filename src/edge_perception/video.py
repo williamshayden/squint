@@ -36,3 +36,18 @@ def iter_video(path: Path) -> Iterator[DecodedFrame]:
                 source_time_ms=source_time_ms,
                 image=frame.to_ndarray(format="rgb24"),
             )
+
+
+def first_video_frame(path: Path) -> DecodedFrame:
+    """Decode one frame and promptly close the underlying iterator."""
+
+    frames = iter_video(path)
+    try:
+        try:
+            return next(frames)
+        except StopIteration as error:
+            raise ValueError(f"video contains no decoded frames: {path}") from error
+    finally:
+        close = getattr(frames, "close", None)
+        if close is not None:
+            close()

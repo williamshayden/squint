@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import wave
+from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
 
@@ -8,7 +9,8 @@ import av
 import numpy as np
 import pytest
 
-from edge_perception.video import iter_video
+from edge_perception import video
+from edge_perception.video import DecodedFrame, first_video_frame, iter_video
 
 
 def _write_mpeg4_video(path: Path) -> None:
@@ -68,3 +70,26 @@ def test_iter_video_rejects_container_without_video_stream(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="video stream"):
         list(iter_video(audio_path))
+
+
+def test_first_video_frame_closes_iterator(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed = False
+    expected = DecodedFrame(
+        frame_index=0,
+        source_time_ms=0.0,
+        image=np.zeros((2, 3, 3), dtype=np.uint8),
+    )
+
+    def frames() -> Iterator[DecodedFrame]:
+        nonlocal closed
+        try:
+            yield expected
+        finally:
+            closed = True
+
+    monkeypatch.setattr(video, "iter_video", lambda _path: frames())
+
+    actual = first_video_frame(Path("unused.mp4"))
+
+    assert actual is expected
+    assert closed is True
