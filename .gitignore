@@ -1,4 +1,7 @@
 .venv/
+.tools/
+.worktrees/
+.superpowers/sdd/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -14,6 +17,8 @@ dist/
 .cache/
 artifacts/
 runs/
+fixtures/private/
+docs/checkpoints/artifacts/
 *.pt
 *.pth
 *.onnx
@@ -21,4 +26,3 @@ runs/
 *.safetensors
 .DS_Store
 Thumbs.db
-
