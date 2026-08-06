@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -25,7 +28,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from edge_perception.config import CaptureRequest, CaptureResult, RunConfig
+from edge_perception.config import (
+    CaptureRequest,
+    CaptureResult,
+    RunConfig,
+    render_run_cli,
+)
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import detector_descriptors
 from edge_perception.gui.capture import (
@@ -35,6 +43,8 @@ from edge_perception.gui.capture import (
     select_camera_format,
 )
 from edge_perception.gui.region_view import RegionView
+from edge_perception.gui.run_controller import RunController
+from edge_perception.progress import ProgressEvent
 from edge_perception.runner import validate_output_directory
 from edge_perception.video import first_video_frame
 
@@ -47,6 +57,9 @@ class MainWindow(QMainWindow):
         run_dir: Path | None = None,
         *,
         capture_controller: QtCaptureController | None = None,
+        process: QProcess | None = None,
+        close_decision: Callable[[str], str] | None = None,
+        kill_timer: QTimer | None = None,
     ) -> None:
         super().__init__()
         self.setObjectName("edge-perception-main-window")
@@ -63,6 +76,15 @@ class MainWindow(QMainWindow):
         self._record_start_requested = False
         self._recording_stop_requested = False
         self._updating_region_controls = False
+        self._close_decision = close_decision
+        self._exit_after_run = False
+        self._allow_close = False
+        self._run_failure_shown = False
+        self.runController = RunController(process=process)
+        self.runController.setParent(self)
+        self._kill_timer = QTimer(self) if kill_timer is None else kill_timer
+        self._kill_timer.setSingleShot(True)
+        self._kill_timer.timeout.connect(self._kill_active_run)
 
         self._create_file_menu()
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -89,19 +111,36 @@ class MainWindow(QMainWindow):
         form.addRow("Detector", self._detector_combo)
         form.addRow("Device", self._device_combo)
         form.addRow("Threshold", self._threshold_spin)
+        self._max_frames_spin = self._max_frames()
+        self._warmup_runs_spin = self._execution_count("warmup-runs")
+        self._annotate_every_spin = self._execution_count("annotate-every")
+        form.addRow("Max frames", self._max_frames_spin)
+        form.addRow("Warm-up runs", self._warmup_runs_spin)
+        form.addRow("Annotate every", self._annotate_every_spin)
         self._output_line = self._output(run_dir)
         form.addRow("Output", self._output_line)
+        self._config_path_line = self._readonly_line("config-path")
+        self._run_cli_line = self._readonly_line("run-cli")
+        form.addRow("Experiment config", self._config_path_line)
+        form.addRow("CLI", self._run_cli_line)
         controls_layout.addLayout(form)
         controls_layout.addWidget(self._camera_controls())
         controls_layout.addWidget(self._region_controls())
+        self._run_progress = QLabel("No active run")
+        self._run_progress.setObjectName("run-progress")
+        self._run_progress.setWordWrap(True)
+        controls_layout.addWidget(self._run_progress)
         controls_layout.addLayout(self._actions())
 
-        completed_run = QGroupBox("Completed run")
-        completed_run.setObjectName("completed-run")
-        completed_run.setVisible(False)
-        completed_layout = QVBoxLayout(completed_run)
-        completed_layout.addWidget(QLabel("Results will appear here in a later task."))
-        controls_layout.addWidget(completed_run)
+        self._completed_run = QGroupBox("Completed run")
+        self._completed_run.setObjectName("completed-run")
+        self._completed_run.setVisible(False)
+        completed_layout = QVBoxLayout(self._completed_run)
+        self._completed_run_path = QLabel("—")
+        self._completed_run_path.setObjectName("completed-run-path")
+        self._completed_run_path.setWordWrap(True)
+        completed_layout.addWidget(self._completed_run_path)
+        controls_layout.addWidget(self._completed_run)
         controls_layout.addStretch()
         splitter.addWidget(controls)
         splitter.setStretchFactor(0, 1)
@@ -122,6 +161,12 @@ class MainWindow(QMainWindow):
         self._start_preview_button.clicked.connect(self._start_camera_preview)
         self._record_button.clicked.connect(self._start_camera_recording)
         self._stop_recording_button.clicked.connect(self._stop_camera_recording)
+        self._run_button.clicked.connect(self._start_run)
+        self._cancel_button.clicked.connect(self._cancel_run)
+        self.runController.progressChanged.connect(self._run_progress_changed)
+        self.runController.runFinished.connect(self._run_finished)
+        self.runController.runFailed.connect(self._run_failed)
+        self.runController.processTerminated.connect(self._run_process_terminated)
         if self._capture_controller is not None:
             self._connect_capture_controller()
         self._clear_region_values()
@@ -131,6 +176,8 @@ class MainWindow(QMainWindow):
     def load_video(self, path: Path) -> None:
         """Decode and display one bounded preview frame from a local video."""
 
+        if self.runController.is_active:
+            raise RuntimeError("cannot replace source while a run is active")
         if self._camera_recording_in_progress():
             raise RuntimeError("cannot replace source while camera recording is active")
         if self._preview_active and self._capture_controller is not None:
@@ -160,10 +207,10 @@ class MainWindow(QMainWindow):
 
     def _create_file_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        open_video = QAction("Open Video…", self)
-        open_video.setObjectName("open-video-action")
-        open_video.triggered.connect(self._choose_video)
-        file_menu.addAction(open_video)
+        self._open_video_action = QAction("Open Video…", self)
+        self._open_video_action.setObjectName("open-video-action")
+        self._open_video_action.triggered.connect(self._choose_video)
+        file_menu.addAction(self._open_video_action)
 
     def _choose_video(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
@@ -458,6 +505,7 @@ class MainWindow(QMainWindow):
 
     def _region_controls(self) -> QGroupBox:
         group = QGroupBox("Source regions")
+        self._region_group = group
         region_layout = QVBoxLayout(group)
         form = QFormLayout()
         self._region_id = QLineEdit()
@@ -584,58 +632,210 @@ class MainWindow(QMainWindow):
         self._updating_region_controls = False
 
     def _update_control_state(self) -> None:
+        run_active = self.runController.is_active
         has_source = self._source_path is not None
         camera_mode = self._source_mode_combo.currentText() == "Camera"
         has_camera = isinstance(self._camera_combo.currentData(), CameraDeviceInfo)
         selected = self._source_view.selected_region()
+        self._open_video_action.setEnabled(not run_active)
+        self._source_mode_combo.setEnabled(not run_active)
+        self._detector_combo.setEnabled(not run_active)
+        self._device_combo.setEnabled(not run_active)
+        self._threshold_spin.setEnabled(not run_active)
+        self._max_frames_spin.setEnabled(not run_active)
+        self._warmup_runs_spin.setEnabled(not run_active)
+        self._annotate_every_spin.setEnabled(not run_active)
+        self._output_line.setEnabled(not run_active)
+        self._source_view.setEnabled(not run_active)
+        self._region_group.setEnabled(not run_active)
+        self._camera_group.setEnabled(camera_mode and not run_active)
         for spin_box in self._region_spin_boxes:
-            spin_box.setEnabled(selected is not None)
+            spin_box.setEnabled(selected is not None and not run_active)
         self._new_region_button.setEnabled(
-            has_source
+            not run_active
+            and has_source
             and bool(self._region_id.text().strip())
             and not self._source_view.is_drawing_region()
         )
         self._delete_region_button.setEnabled(
-            has_source and selected is not None
+            not run_active and has_source and selected is not None
         )
         self._start_preview_button.setEnabled(
-            camera_mode
+            not run_active
+            and camera_mode
             and has_camera
             and not self._preview_active
             and not self._record_start_requested
             and not self._recording_active
         )
         self._record_button.setEnabled(
-            camera_mode
+            not run_active
+            and camera_mode
             and self._preview_active
             and not self._record_start_requested
             and not self._recording_active
         )
         self._stop_recording_button.setEnabled(
-            camera_mode and self._recording_active and not self._recording_stop_requested
+            not run_active
+            and camera_mode
+            and self._recording_active
+            and not self._recording_stop_requested
         )
-        self._run_button.setEnabled(self._current_run_config() is not None)
+        self._run_button.setEnabled(not run_active and self._current_run_config() is not None)
+        self._cancel_button.setEnabled(run_active)
 
     def _current_run_config(self) -> RunConfig | None:
-        if self._source_path is None or not self._output_line.text().strip():
-            return None
         try:
-            config = RunConfig(
-                input_path=self._source_path,
-                output_dir=Path(self._output_line.text().strip()),
-                regions=self._source_view.regions(),
-                threshold=self._threshold_spin.value(),
-                max_frames=None,
-                warmup_runs=0,
-                annotate_every=0,
-                detector_id=str(self._detector_combo.currentData()),
-                device=self._device_combo.currentText().lower(),
-                capture=self._capture_result,
-            )
-            validate_output_directory(config.output_dir)
-        except (OSError, TypeError, ValueError):
+            return self.resolved_config()
+        except (OSError, RuntimeError, TypeError, ValueError):
             return None
+
+    def resolved_config(self) -> RunConfig:
+        """Resolve and validate the current native controls into one run config."""
+
+        if self._source_path is None or self._camera_recording_in_progress():
+            raise ValueError("finalized video source is required")
+        output_text = self._output_line.text().strip()
+        if not output_text:
+            raise ValueError("new empty output directory is required")
+        max_frames_value = self._max_frames_spin.value()
+        config = RunConfig(
+            input_path=self._source_path,
+            output_dir=Path(output_text),
+            regions=self._source_view.regions(),
+            threshold=self._threshold_spin.value(),
+            max_frames=None if max_frames_value < 0 else max_frames_value,
+            warmup_runs=self._warmup_runs_spin.value(),
+            annotate_every=self._annotate_every_spin.value(),
+            detector_id=str(self._detector_combo.currentData()),
+            device=self._device_combo.currentText().lower(),
+            capture=self._capture_result,
+        )
+        validate_output_directory(config.output_dir)
+        config_path = (
+            config.output_dir.parent / f"{config.output_dir.name}.experiment.json"
+        ).resolve()
+        if config_path.exists():
+            raise FileExistsError(f"experiment config already exists: {config_path}")
         return config
+
+    def _start_run(self) -> None:
+        try:
+            config = self.resolved_config()
+            self._run_failure_shown = False
+            self.runController.start(config)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._run_failed(str(error))
+            self._update_control_state()
+            return
+        config_path = self.runController.config_path
+        if config_path is not None:
+            self._config_path_line.setText(str(config_path))
+            self._run_cli_line.setText(shlex.join(render_run_cli(config_path)))
+        self._update_control_state()
+        if self.runController.is_active:
+            self.statusBar().showMessage(f"Run started: {config.output_dir}")
+
+    def _cancel_run(self) -> None:
+        try:
+            self.runController.cancel()
+        except OSError as error:
+            self._run_failed(str(error))
+            return
+        self.statusBar().showMessage("Cancellation requested")
+
+    def _run_progress_changed(self, value: object) -> None:
+        if not isinstance(value, ProgressEvent):
+            return
+        self._run_progress.setText(
+            f"{value.phase}: {value.frames_processed} frames, "
+            f"{value.inference_count} inferences, {value.elapsed_ms:.1f} ms"
+        )
+
+    def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
+        path = run_dir.resolve()
+        self._completed_run_path.setText(str(path))
+        self._completed_run.setVisible(True)
+        phase = payload.get("phase")
+        self.statusBar().showMessage(f"Run {phase}: {path}")
+        self._update_control_state()
+
+    def _run_failed(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        if not self._run_failure_shown:
+            self._run_failure_shown = True
+            QMessageBox.critical(self, "Run failed", message)
+        self._update_control_state()
+
+    def _run_process_terminated(self) -> None:
+        self._update_control_state()
+        if not self._exit_after_run:
+            return
+        self._kill_timer.stop()
+        self._exit_after_run = False
+        self._allow_close = True
+        self.close()
+
+    def _kill_active_run(self) -> None:
+        self.runController.kill()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Make recording discard and inference cancellation explicit."""
+
+        if self._allow_close:
+            event.accept()
+            return
+        if self._camera_recording_in_progress():
+            decision = self._resolve_close_decision("recording")
+            if decision != "Stop and Discard":
+                event.ignore()
+                return
+            controller = self._capture_controller
+            if controller is not None:
+                try:
+                    controller.discard()
+                except (OSError, RuntimeError) as error:
+                    self.statusBar().showMessage(str(error))
+                    event.ignore()
+                    return
+            event.accept()
+            return
+        if self.runController.is_active:
+            if self._exit_after_run:
+                self._kill_timer.start(5_000)
+                event.ignore()
+                return
+            decision = self._resolve_close_decision("inference")
+            if decision != "Cancel Run and Exit":
+                event.ignore()
+                return
+            try:
+                self.runController.cancel()
+            except OSError as error:
+                self.statusBar().showMessage(str(error))
+                event.ignore()
+                return
+            self._exit_after_run = True
+            self._kill_timer.start(5_000)
+            event.ignore()
+            return
+        event.accept()
+
+    def _resolve_close_decision(self, activity: str) -> str:
+        if self._close_decision is not None:
+            return self._close_decision(activity)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Active work")
+        if activity == "recording":
+            dialog.setText("A camera recording is still active.")
+            action_text = "Stop and Discard"
+        else:
+            dialog.setText("An inference run is still active.")
+            action_text = "Cancel Run and Exit"
+        keep = dialog.addButton("Keep Window Open", QMessageBox.ButtonRole.RejectRole)
+        action = dialog.addButton(action_text, QMessageBox.ButtonRole.DestructiveRole)
+        dialog.exec()
+        return action_text if dialog.clickedButton() is action else keep.text()
 
     @staticmethod
     def _source_mode() -> QComboBox:
@@ -669,6 +869,22 @@ class MainWindow(QMainWindow):
         return threshold
 
     @staticmethod
+    def _max_frames() -> QSpinBox:
+        max_frames = QSpinBox()
+        max_frames.setObjectName("max-frames")
+        max_frames.setRange(-1, 2_147_483_647)
+        max_frames.setSpecialValueText("All")
+        max_frames.setValue(-1)
+        return max_frames
+
+    @staticmethod
+    def _execution_count(object_name: str) -> QSpinBox:
+        count = QSpinBox()
+        count.setObjectName(object_name)
+        count.setRange(0, 2_147_483_647)
+        return count
+
+    @staticmethod
     def _output(run_dir: Path | None) -> QLineEdit:
         output = QLineEdit()
         output.setObjectName("output")
@@ -677,14 +893,21 @@ class MainWindow(QMainWindow):
             output.setText(str(run_dir))
         return output
 
+    @staticmethod
+    def _readonly_line(object_name: str) -> QLineEdit:
+        line = QLineEdit()
+        line.setObjectName(object_name)
+        line.setReadOnly(True)
+        return line
+
     def _actions(self) -> QHBoxLayout:
         actions = QHBoxLayout()
         self._run_button = QPushButton("Run")
         self._run_button.setObjectName("run-button")
         self._run_button.setEnabled(False)
-        cancel = QPushButton("Cancel")
-        cancel.setObjectName("cancel-button")
-        cancel.setEnabled(False)
+        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button.setObjectName("cancel-button")
+        self._cancel_button.setEnabled(False)
         actions.addWidget(self._run_button)
-        actions.addWidget(cancel)
+        actions.addWidget(self._cancel_button)
         return actions

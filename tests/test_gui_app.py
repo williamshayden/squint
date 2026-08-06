@@ -1,27 +1,37 @@
 from __future__ import annotations
 
+import json
+import shlex
 from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QObject, QPointF, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QByteArray, QObject, QPointF, QProcess, Qt, Signal
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsView,
+    QGroupBox,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSpinBox,
 )
 from pytestqt.qtbot import QtBot
 
-from edge_perception.config import CaptureRequest, CaptureResult
+from edge_perception.config import (
+    CaptureRequest,
+    CaptureResult,
+    RunConfig,
+    render_run_cli,
+)
 from edge_perception.contracts import Region
 from edge_perception.gui import main_window
 from edge_perception.gui.capture import (
@@ -31,6 +41,8 @@ from edge_perception.gui.capture import (
 )
 from edge_perception.gui.main_window import MainWindow
 from edge_perception.gui.region_view import RegionView
+from edge_perception.gui.run_controller import MALFORMED_PROGRESS_ERROR
+from edge_perception.progress import ProgressEvent
 from edge_perception.video import DecodedFrame
 
 
@@ -130,6 +142,81 @@ class FakeWindowCaptureController(QObject):
         self.preview_active = False
         self.previewStopped.emit()
         self.recordingFinished.emit(result)
+
+
+class FakeGuiProcess(QObject):
+    readyReadStandardOutput = Signal()
+    readyReadStandardError = Signal()
+    finished = Signal(int, object)
+    errorOccurred = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.program: str | None = None
+        self.arguments: list[str] | None = None
+        self.start_count = 0
+        self.kill_count = 0
+        self._stdout = bytearray()
+        self._stderr = bytearray()
+
+    def setProgram(self, program: str) -> None:
+        self.program = program
+
+    def setArguments(self, arguments: list[str]) -> None:
+        self.arguments = list(arguments)
+
+    def start(self) -> None:
+        self.start_count += 1
+
+    def kill(self) -> None:
+        self.kill_count += 1
+
+    def readAllStandardOutput(self) -> QByteArray:
+        data = QByteArray(bytes(self._stdout))
+        self._stdout.clear()
+        return data
+
+    def readAllStandardError(self) -> QByteArray:
+        data = QByteArray(bytes(self._stderr))
+        self._stderr.clear()
+        return data
+
+    def emit_stdout(self, data: str) -> None:
+        self._stdout.extend(data.encode("utf-8"))
+        self.readyReadStandardOutput.emit()
+
+    def finish(
+        self,
+        exit_code: int = 0,
+        exit_status: QProcess.ExitStatus = QProcess.ExitStatus.NormalExit,
+    ) -> None:
+        self.finished.emit(exit_code, exit_status)
+
+
+class FakeKillTimer(QObject):
+    timeout = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.single_shot: bool | None = None
+        self.start_intervals: list[int] = []
+        self.stop_count = 0
+
+    def setSingleShot(self, single_shot: bool) -> None:
+        self.single_shot = single_shot
+
+    def start(self, interval: int) -> None:
+        self.start_intervals.append(interval)
+
+    def stop(self) -> None:
+        self.stop_count += 1
+
+    def trigger(self) -> None:
+        self.timeout.emit()
+
+
+def _progress_record(event: ProgressEvent) -> str:
+    return json.dumps(event.to_dict(), allow_nan=False, sort_keys=True) + "\n"
 
 
 def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
@@ -382,7 +469,7 @@ def test_completed_camera_capture_loads_final_rgb_and_probed_metadata(
     assert not any(isinstance(item, QGraphicsVideoItem) for item in view.scene().items())
     assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
     output.setText(str(tmp_path / "run"))
-    config = window._current_run_config()
+    config = window.resolved_config()
     assert config is not None
     assert config.capture == result
 
@@ -744,3 +831,306 @@ def test_file_menu_opens_selected_video(
     path_label = window.findChild(QLabel, "source-path")
     assert path_label is not None
     assert path_label.text() == str(selected_path)
+
+
+def test_resolved_config_reads_ordered_regions_and_execution_controls(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    source = tmp_path / "source.mp4"
+    output_dir = tmp_path / "empty-run"
+    output_dir.mkdir()
+    window.load_video(source)
+    view = window.findChild(RegionView, "source-view")
+    output = window.findChild(QLineEdit, "output")
+    device = window.findChild(QComboBox, "device")
+    threshold = window.findChild(QDoubleSpinBox, "threshold")
+    max_frames = window.findChild(QSpinBox, "max-frames")
+    warmup_runs = window.findChild(QSpinBox, "warmup-runs")
+    annotate_every = window.findChild(QSpinBox, "annotate-every")
+    assert all(
+        widget is not None
+        for widget in (
+            view,
+            output,
+            device,
+            threshold,
+            max_frames,
+            warmup_runs,
+            annotate_every,
+        )
+    )
+    assert view is not None
+    assert output is not None
+    assert device is not None
+    assert threshold is not None
+    assert max_frames is not None
+    assert warmup_runs is not None
+    assert annotate_every is not None
+    view.add_region(Region("first", 1, 2, 3, 4))
+    view.add_region(Region("second", 5, 6, 7, 8))
+    output.setText(str(output_dir))
+    device.setCurrentText("CUDA")
+    threshold.setValue(0.45)
+    max_frames.setValue(12)
+    warmup_runs.setValue(2)
+    annotate_every.setValue(3)
+
+    config = window.resolved_config()
+
+    assert config == RunConfig(
+        input_path=source,
+        output_dir=output_dir,
+        regions=(Region("first", 1, 2, 3, 4), Region("second", 5, 6, 7, 8)),
+        threshold=0.45,
+        max_frames=12,
+        warmup_runs=2,
+        annotate_every=3,
+        detector_id="dfine-nano-coco",
+        device="cuda",
+        capture=None,
+    )
+
+
+def test_resolved_config_requires_a_finalized_source(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    output = window.findChild(QLineEdit, "output")
+    assert output is not None
+    output.setText(str(tmp_path / "run"))
+
+    with pytest.raises(ValueError, match="^finalized video source is required$"):
+        window.resolved_config()
+
+
+def test_gui_run_displays_reproducibility_input_and_restores_controls(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    window = MainWindow(process=process)
+    qtbot.addWidget(window)
+    source = tmp_path / "source.mp4"
+    output_dir = tmp_path / "run"
+    window.load_video(source)
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    cancel = window.findChild(QPushButton, "cancel-button")
+    source_mode = window.findChild(QComboBox, "source-mode")
+    detector = window.findChild(QComboBox, "detector")
+    progress = window.findChild(QLabel, "run-progress")
+    config_path_line = window.findChild(QLineEdit, "config-path")
+    cli_line = window.findChild(QLineEdit, "run-cli")
+    completed = window.findChild(QGroupBox, "completed-run")
+    completed_path = window.findChild(QLabel, "completed-run-path")
+    open_action = window.findChild(QAction, "open-video-action")
+    view = window.findChild(RegionView, "source-view")
+    assert all(
+        widget is not None
+        for widget in (
+            output,
+            run,
+            cancel,
+            source_mode,
+            detector,
+            progress,
+            config_path_line,
+            cli_line,
+            completed,
+            completed_path,
+            open_action,
+            view,
+        )
+    )
+    assert output is not None
+    assert run is not None
+    assert cancel is not None
+    assert source_mode is not None
+    assert detector is not None
+    assert progress is not None
+    assert config_path_line is not None
+    assert cli_line is not None
+    assert completed is not None
+    assert completed_path is not None
+    assert open_action is not None
+    assert view is not None
+    output.setText(str(output_dir))
+
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+
+    expected_config_path = (tmp_path / "run.experiment.json").resolve()
+    assert process.start_count == 1
+    assert config_path_line.text() == str(expected_config_path)
+    assert cli_line.text() == shlex.join(render_run_cli(expected_config_path))
+    assert source_mode.isEnabled() is False
+    assert detector.isEnabled() is False
+    assert output.isEnabled() is False
+    assert open_action.isEnabled() is False
+    assert view.isEnabled() is False
+    assert run.isEnabled() is False
+    assert cancel.isEnabled() is True
+    with pytest.raises(RuntimeError, match="^cannot replace source while a run is active$"):
+        window.load_video(tmp_path / "replacement.mp4")
+
+    running = ProgressEvent("running", 2, 3, 4.5, None)
+    process.emit_stdout(_progress_record(running))
+
+    assert progress.text() == "running: 2 frames, 3 inferences, 4.5 ms"
+
+    terminal = ProgressEvent("complete", 4, 5, 6.5, None)
+    process.emit_stdout(_progress_record(terminal))
+    process.finish()
+
+    assert source_mode.isEnabled() is True
+    assert detector.isEnabled() is True
+    assert output.isEnabled() is True
+    assert open_action.isEnabled() is True
+    assert view.isEnabled() is True
+    assert cancel.isEnabled() is False
+    assert run.isEnabled() is False
+    assert completed.isHidden() is False
+    assert completed_path.text() == str(output_dir.resolve())
+
+
+def test_gui_run_failure_shows_one_message_and_status(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+    process = FakeGuiProcess()
+    window = MainWindow(process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    assert output is not None
+    assert run is not None
+    output.setText(str(tmp_path / "run"))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+
+    process.emit_stdout("not-json\n")
+
+    assert messages == [("Run failed", MALFORMED_PROGRESS_ERROR)]
+    assert window.statusBar().currentMessage() == MALFORMED_PROGRESS_ERROR
+    assert output.isEnabled() is False
+
+    process.finish(1, QProcess.ExitStatus.CrashExit)
+
+    assert messages == [("Run failed", MALFORMED_PROGRESS_ERROR)]
+    assert output.isEnabled() is True
+
+
+def test_close_while_recording_uses_injected_keep_or_discard_decision(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    decisions = iter(("Keep Window Open", "Stop and Discard"))
+    activities: list[str] = []
+
+    def decide(activity: str) -> str:
+        activities.append(activity)
+        return next(decisions)
+
+    window = MainWindow(capture_controller=controller, close_decision=decide)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    keep_event = QCloseEvent()
+    window.closeEvent(keep_event)
+
+    assert keep_event.isAccepted() is False
+    assert controller.discard_calls == 0
+
+    discard_event = QCloseEvent()
+    window.closeEvent(discard_event)
+
+    assert discard_event.isAccepted() is True
+    assert controller.discard_calls == 1
+    assert activities == ["recording", "recording"]
+
+
+def test_close_while_inference_cancels_restarts_kill_timer_and_waits_for_finished(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    timer = FakeKillTimer()
+    activities: list[str] = []
+
+    def decide(activity: str) -> str:
+        activities.append(activity)
+        return "Cancel Run and Exit"
+
+    window = MainWindow(process=process, close_decision=decide, kill_timer=timer)
+    qtbot.addWidget(window)
+    window.show()
+    output_dir = tmp_path / "run"
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    assert output is not None
+    assert run is not None
+    output.setText(str(output_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+
+    first_close = QCloseEvent()
+    window.closeEvent(first_close)
+    second_close = QCloseEvent()
+    window.closeEvent(second_close)
+
+    cancel_path = (tmp_path / ".run.cancel").resolve()
+    assert first_close.isAccepted() is False
+    assert second_close.isAccepted() is False
+    assert cancel_path.exists()
+    assert timer.single_shot is True
+    assert timer.start_intervals == [5000, 5000]
+    assert activities == ["inference"]
+    assert window.isVisible() is True
+
+    timer.trigger()
+
+    assert process.kill_count == 1
+    assert window.isVisible() is True
+
+    process.emit_stdout(_progress_record(ProgressEvent("cancelled", 1, 1, 2.0, None)))
+    process.finish()
+
+    assert timer.stop_count == 1
+    assert not cancel_path.exists()
+    assert window.isVisible() is False
+
+
+def test_close_without_active_work_accepts_immediately(qtbot: QtBot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert event.isAccepted() is True
