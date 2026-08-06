@@ -27,6 +27,9 @@ cu128 = [
     "safetensors>=0.6,<1",
     "nvidia-ml-py>=13,<14",
 ]
+gui = [
+    "PySide6>=6.8,<7",
+]
 
 [project.scripts]
 edge-perception = "edge_perception.cli:main"
@@ -62,6 +65,7 @@ torch = [
 dev = [
     "pytest",
     "pytest-cov",
+    "pytest-qt>=4.4,<5",
     "ruff",
     "mypy",
 ]

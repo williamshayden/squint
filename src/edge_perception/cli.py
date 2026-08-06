@@ -112,6 +112,9 @@ def _build_parser() -> _Parser:
         type=_nonnegative_tolerance("score-atol"),
         default=1e-4,
     )
+
+    gui = subparsers.add_parser("gui", help="open the native research GUI")
+    gui.add_argument("--run", type=Path)
     return parser
 
 
@@ -216,6 +219,22 @@ def _compare_command(args: argparse.Namespace) -> int:
     return 0 if equivalent else 1
 
 
+def _gui_command(args: argparse.Namespace) -> int:
+    run_dir = cast(Path | None, args.run)
+    if run_dir is not None:
+        run_dir = run_dir.resolve()
+        for artifact in ("manifest.json", "summary.json"):
+            if not (run_dir / artifact).is_file():
+                raise _CliError(f"run directory is missing {artifact}: {run_dir}")
+    try:
+        from edge_perception.gui.app import launch_gui
+    except ImportError as error:
+        raise _CliError(
+            "native GUI dependencies are unavailable; install adaptive-edge-perception[gui]"
+        ) from error
+    return launch_gui(run_dir)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse and execute one CLI command, returning a process exit code."""
 
@@ -225,6 +244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_command(args)
         if args.command == "compare":
             return _compare_command(args)
+        if args.command == "gui":
+            return _gui_command(args)
         raise _CliError("a command is required")
     except (_CliError, OSError, RuntimeError, ValueError) as error:
         message = " ".join(str(error).splitlines()) or type(error).__name__

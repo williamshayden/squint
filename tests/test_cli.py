@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -10,6 +11,63 @@ from conftest import FakeDetector
 
 from edge_perception import cli
 from edge_perception.config import RunConfig, write_run_config
+
+
+def test_gui_command_lazily_launches_native_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path | None] = []
+    module = ModuleType("edge_perception.gui.app")
+    module.launch_gui = lambda run_dir=None: calls.append(run_dir) or 0  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "edge_perception.gui.app", module)
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+
+    assert cli.main(["gui", "--run", str(tmp_path)]) == 0
+    assert calls == [tmp_path.resolve()]
+
+
+def test_gui_command_reports_missing_optional_extra(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original_import = __import__
+
+    def import_without_gui_extra(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "edge_perception.gui.app":
+            raise ImportError("No module named 'PySide6'")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", import_without_gui_extra)
+
+    assert cli.main(["gui"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "error: native GUI dependencies are unavailable; install adaptive-edge-perception[gui]\n"
+    )
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("missing", ["manifest.json", "summary.json"])
+def test_gui_command_requires_run_artifacts(
+    tmp_path: Path,
+    missing: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    for name in {"manifest.json", "summary.json"} - {missing}:
+        (run_dir / name).write_text("{}", encoding="utf-8")
+
+    assert cli.main(["gui", "--run", str(run_dir)]) == 2
+    assert capsys.readouterr().err == f"error: run directory is missing {missing}: {run_dir.resolve()}\n"
 
 
 def _install_fake_detector(
