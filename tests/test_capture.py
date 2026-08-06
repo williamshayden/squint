@@ -684,6 +684,70 @@ def test_cleanup_retains_owned_staging_directory_until_rmdir_succeeds(
     assert not staged_path.parent.exists()
 
 
+def test_retained_cleanup_failure_blocks_reuse_without_losing_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    old_staged_path = harness.start_recording(tmp_path / "first.mp4")
+    old_staged_path.write_bytes(b"partial")
+
+    def deny_unlink(_path: Path) -> None:
+        raise PermissionError("still locked")
+
+    monkeypatch.setattr(capture, "_unlink_file", deny_unlink)
+    harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
+    harness.start_preview()
+    replacement_recorder = harness.recorder
+
+    with pytest.raises(RuntimeError) as raised:
+        harness.controller.start_recording(tmp_path / "second.mp4")
+
+    assert str(raised.value) == (
+        "cannot start recording while prior capture cleanup is incomplete: "
+        f"could not remove staged file {old_staged_path}: still locked"
+    )
+    assert old_staged_path.read_bytes() == b"partial"
+    assert set(tmp_path.glob(".capture-*")) == {old_staged_path.parent}
+    assert replacement_recorder.record_count == 0
+    assert replacement_recorder.output_location.isEmpty()
+
+    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+    harness.controller.discard()
+
+    assert not old_staged_path.parent.exists()
+
+
+def test_reuse_proceeds_after_retained_cleanup_retry_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    old_staged_path = harness.start_recording(tmp_path / "first.mp4")
+    old_staged_path.write_bytes(b"partial")
+
+    def deny_unlink(_path: Path) -> None:
+        raise PermissionError("temporarily locked")
+
+    monkeypatch.setattr(capture, "_unlink_file", deny_unlink)
+    harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
+    harness.start_preview()
+    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+
+    new_staged_path = harness.start_recording(tmp_path / "second.mp4")
+
+    assert not old_staged_path.parent.exists()
+    assert new_staged_path.parent != old_staged_path.parent
+    assert set(tmp_path.glob(".capture-*")) == {new_staged_path.parent}
+    assert harness.recorder.record_count == 1
+
+    harness.controller.discard()
+
+    assert not list(tmp_path.glob(".capture-*"))
+
+
 def test_success_atomically_publishes_capture(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()

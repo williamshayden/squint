@@ -400,6 +400,18 @@ class QtCaptureController(QObject):
     def start_recording(self, final_path: Path | None = None) -> None:
         """Start video-only recording in a private same-filesystem staging directory."""
 
+        if self._recording_pending or self._recording_active:
+            raise RuntimeError("camera recording is already active")
+        if self._has_retained_capture_ownership():
+            cleanup_diagnostics = self._cleanup_owned_temporary()
+            if cleanup_diagnostics or self._has_retained_capture_ownership():
+                detail = "; ".join(cleanup_diagnostics)
+                if not detail:
+                    detail = "owned capture paths remain"
+                raise RuntimeError(
+                    "cannot start recording while prior capture cleanup is incomplete: "
+                    + detail
+                )
         if (
             self._camera is None
             or self._recorder is None
@@ -407,8 +419,6 @@ class QtCaptureController(QObject):
             or self._selected_format is None
         ):
             raise RuntimeError("camera preview is not active")
-        if self._recording_pending or self._recording_active:
-            raise RuntimeError("camera recording is already active")
         camera = self._camera
         recorder = self._recorder
         generation = self._graph_generation
@@ -684,6 +694,17 @@ class QtCaptureController(QObject):
         if self._staging_directory is None:
             self._final_path = None
         return tuple(diagnostics)
+
+    def _has_retained_capture_ownership(self) -> bool:
+        return any(
+            owned_path is not None
+            for owned_path in (
+                self._staging_directory,
+                self._temporary_path,
+                self._actual_path,
+                self._final_path,
+            )
+        )
 
     def _require_active_graph(
         self,
