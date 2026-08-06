@@ -147,8 +147,8 @@ class FakeWindowCaptureController(QObject):
 class FakeGuiProcess(QObject):
     readyReadStandardOutput = Signal()
     readyReadStandardError = Signal()
-    finished = Signal(int, object)
-    errorOccurred = Signal(object)
+    finished = Signal(int, QProcess.ExitStatus)
+    errorOccurred = Signal(QProcess.ProcessError)
 
     def __init__(self) -> None:
         super().__init__()
@@ -191,6 +191,9 @@ class FakeGuiProcess(QObject):
         exit_status: QProcess.ExitStatus = QProcess.ExitStatus.NormalExit,
     ) -> None:
         self.finished.emit(exit_code, exit_status)
+
+    def emit_error(self, error: QProcess.ProcessError) -> None:
+        self.errorOccurred.emit(error)
 
 
 class FakeKillTimer(QObject):
@@ -1134,3 +1137,59 @@ def test_close_without_active_work_accepts_immediately(qtbot: QtBot) -> None:
     window.closeEvent(event)
 
     assert event.isAccepted() is True
+
+
+@pytest.mark.parametrize("terminal_kind", ["finished", "failed_to_start"])
+def test_gui_cleanup_failure_reports_once_and_restores_controls(
+    terminal_kind: str,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+    process = FakeGuiProcess()
+    window = MainWindow(process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    cancel = window.findChild(QPushButton, "cancel-button")
+    assert output is not None
+    assert run is not None
+    assert cancel is not None
+    output.setText(str(tmp_path / "run"))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(cancel, Qt.MouseButton.LeftButton)
+    cancel_path = tmp_path / ".run.cancel"
+    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
+    actual_unlink = Path.unlink
+
+    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
+        if path == cancel_path:
+            raise OSError("locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_owned)
+    if terminal_kind == "finished":
+        process.emit_stdout(_progress_record(ProgressEvent("complete", 1, 1, 2.0, None)))
+        expected = cleanup_error
+        process.finish()
+    else:
+        expected = f"worker failed to start\n{cleanup_error}"
+        process.emit_error(QProcess.ProcessError.FailedToStart)
+
+    assert messages == [("Run failed", expected)]
+    assert window.statusBar().currentMessage() == expected
+    assert output.isEnabled() is True
+    assert cancel.isEnabled() is False
+    assert window.runController.is_active is False
+
+    process.finish(1, QProcess.ExitStatus.CrashExit)
+
+    assert messages == [("Run failed", expected)]

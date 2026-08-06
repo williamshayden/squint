@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -171,6 +172,18 @@ def test_render_run_cli_returns_resolved_argument_tuple(tmp_path: Path) -> None:
         "--output",
         str(output.resolve()),
     )
+
+
+def test_write_run_config_remains_an_explicit_replacing_write(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    first = RunConfig(source, tmp_path / "run", (), 0.3, 2, 0, 0)
+    second = replace(first, threshold=0.7)
+    config_path = tmp_path / "experiment.json"
+
+    write_run_config(config_path, first)
+    write_run_config(config_path, second)
+
+    assert load_run_config(config_path) == second
 
 
 def _capture_result_payload() -> dict[str, object]:

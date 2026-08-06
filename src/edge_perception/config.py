@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
@@ -341,9 +342,48 @@ def load_run_config(path: Path) -> RunConfig:
 def write_run_config(path: Path, config: RunConfig) -> None:
     """Atomically write a deterministic versioned experiment document."""
 
+    encoded = _encoded_run_config(config)
+    config_path = Path(path)
+    temporary = config_path.with_name(f"{config_path.name}.tmp")
+    temporary.write_text(encoded, encoding="utf-8")
+    os.replace(temporary, config_path)
+
+
+def publish_run_config(path: Path, config: RunConfig) -> None:
+    """Durably publish a new config without replacing an existing document."""
+
+    encoded = _encoded_run_config(config)
+    config_path = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=config_path.parent,
+        prefix=f".{config_path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    stream_open = False
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream_open = True
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, config_path)
+        except FileExistsError as error:
+            raise FileExistsError(f"experiment config already exists: {config_path}") from error
+        except OSError as error:
+            raise OSError(
+                f"exclusive config publication requires hard-link support: {config_path}"
+            ) from error
+    finally:
+        if not stream_open:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _encoded_run_config(config: RunConfig) -> str:
     if not isinstance(config, RunConfig):
         raise TypeError("config must be a RunConfig")
-    config_path = Path(path)
     capture: dict[str, object] | None = None
     capture_result = config.capture
     if capture_result is not None:
@@ -365,10 +405,7 @@ def write_run_config(path: Path, config: RunConfig) -> None:
             "annotate_every": config.annotate_every,
         },
     }
-    encoded = json.dumps(document, allow_nan=False, sort_keys=True)
-    temporary = config_path.with_name(f"{config_path.name}.tmp")
-    temporary.write_text(encoded + "\n", encoding="utf-8")
-    os.replace(temporary, config_path)
+    return json.dumps(document, allow_nan=False, sort_keys=True) + "\n"
 
 
 def render_run_cli(config_path: Path, output_override: Path | None = None) -> tuple[str, ...]:
