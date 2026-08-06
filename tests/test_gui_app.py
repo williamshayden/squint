@@ -4,9 +4,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QObject, QPointF, Qt, Signal
 from PySide6.QtGui import QAction
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsView,
     QLabel,
@@ -17,8 +21,14 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.qtbot import QtBot
 
+from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
 from edge_perception.gui import main_window
+from edge_perception.gui.capture import (
+    CameraDeviceInfo,
+    CameraFormatInfo,
+    select_camera_format,
+)
 from edge_perception.gui.main_window import MainWindow
 from edge_perception.gui.region_view import RegionView
 from edge_perception.video import DecodedFrame
@@ -53,6 +63,73 @@ def _draw_on_viewport(
     qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=finish_pos)
 
 
+class FakeWindowCaptureController(QObject):
+    devicesChanged = Signal()
+    previewStarted = Signal(object)
+    previewStopped = Signal()
+    recordingStarted = Signal()
+    recordingFinished = Signal(object)
+    errorOccurred = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.formats = (
+            CameraFormatInfo(1280, 720, 15.0, 60.0, "NV12", object()),
+            CameraFormatInfo(1920, 1080, 30.0, 30.0, "YUYV", object()),
+        )
+        self.device = CameraDeviceInfo("camera-1", "EMEET", self.formats, object())
+        self.preview_requests: list[CaptureRequest] = []
+        self.video_outputs: list[object] = []
+        self.record_calls = 0
+        self.stop_recording_calls = 0
+        self.stop_preview_calls = 0
+        self.preview_active = False
+        self.recording_active = False
+
+    @property
+    def is_recording(self) -> bool:
+        return self.recording_active
+
+    def devices(self) -> tuple[CameraDeviceInfo, ...]:
+        return (self.device,)
+
+    def start_preview(
+        self,
+        request: CaptureRequest,
+        video_output: object,
+    ) -> CameraFormatInfo:
+        self.preview_requests.append(request)
+        self.video_outputs.append(video_output)
+        self.preview_active = True
+        selected = select_camera_format(self.formats, request)
+        self.previewStarted.emit(selected)
+        return selected
+
+    def stop_preview(self) -> None:
+        self.stop_preview_calls += 1
+        if self.preview_active:
+            self.preview_active = False
+            self.previewStopped.emit()
+
+    def start_recording(self, _final_path: Path | None = None) -> None:
+        self.record_calls += 1
+        self.recording_active = True
+        self.recordingStarted.emit()
+
+    def stop_recording(self) -> None:
+        self.stop_recording_calls += 1
+
+    def discard(self) -> None:
+        self.recording_active = False
+        self.stop_preview()
+
+    def complete(self, result: CaptureResult) -> None:
+        self.recording_active = False
+        self.preview_active = False
+        self.previewStopped.emit()
+        self.recordingFinished.emit(result)
+
+
 def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
@@ -61,6 +138,160 @@ def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     assert window.objectName() == "edge-perception-main-window"
     assert window.findChild(QGraphicsView, "source-view") is not None
     assert window.findChild(QPushButton, "run-button") is not None
+
+
+def test_region_view_owns_one_raw_video_item_then_restores_rgb_frame(
+    qtbot: QtBot,
+) -> None:
+    view = RegionView()
+    qtbot.addWidget(view)
+
+    first = view.begin_video_preview(1280, 720)
+    second = view.begin_video_preview(1920, 1080)
+
+    video_items = [item for item in view.scene().items() if isinstance(item, QGraphicsVideoItem)]
+    assert first is not second
+    assert video_items == [second]
+    assert view.scene().sceneRect().width() == 1920.0
+    assert view.scene().sceneRect().height() == 1080.0
+
+    view.set_rgb_frame(np.zeros((48, 64, 3), dtype=np.uint8))
+
+    assert not any(isinstance(item, QGraphicsVideoItem) for item in view.scene().items())
+    assert sum(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items()) == 1
+    assert view.scene().sceneRect().width() == 64.0
+    assert view.scene().sceneRect().height() == 48.0
+
+
+def test_camera_controls_map_auto_independently_and_show_selected_mode(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    width = window.findChild(QComboBox, "capture-width")
+    height = window.findChild(QComboBox, "capture-height")
+    fps = window.findChild(QComboBox, "capture-fps")
+    strict = window.findChild(QCheckBox, "capture-strict")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    selected_label = window.findChild(QLabel, "capture-selected-format")
+    assert all(
+        widget is not None
+        for widget in (source_mode, width, height, fps, strict, preview, selected_label)
+    )
+    assert source_mode is not None
+    assert width is not None
+    assert height is not None
+    assert fps is not None
+    assert strict is not None
+    assert preview is not None
+    assert selected_label is not None
+    source_mode.setCurrentText("Camera")
+    width.setCurrentIndex(width.findData(1920))
+    height.setCurrentIndex(height.findData(None))
+    fps.setCurrentIndex(fps.findData(60.0))
+    strict.setChecked(False)
+
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert controller.preview_requests == [
+        CaptureRequest("camera-1", "EMEET", 1920, None, 60.0, False)
+    ]
+    assert len(controller.video_outputs) == 1
+    assert isinstance(controller.video_outputs[0], QGraphicsVideoItem)
+    assert selected_label.text() == "1920 × 1080 px · YUYV · 30–30 FPS"
+
+
+def test_camera_record_and_stop_transitions_are_explicit(qtbot: QtBot) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    stop = window.findChild(QPushButton, "stop-recording-button")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert stop is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert record.isEnabled() is True
+    assert stop.isEnabled() is False
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    assert controller.record_calls == 1
+    assert record.isEnabled() is False
+    assert stop.isEnabled() is True
+
+    qtbot.mouseClick(stop, Qt.MouseButton.LeftButton)
+
+    assert controller.stop_recording_calls == 1
+    assert stop.isEnabled() is False
+
+
+def test_completed_camera_capture_loads_final_rgb_and_probed_metadata(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    output = window.findChild(QLineEdit, "output")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert output is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    request = controller.preview_requests[-1]
+    final_path = tmp_path / "capture.mp4"
+    result = CaptureResult(
+        request=request,
+        selected_width=1280,
+        selected_height=720,
+        selected_min_fps=15.0,
+        selected_max_fps=60.0,
+        selected_pixel_format="NV12",
+        actual_width=64,
+        actual_height=48,
+        actual_fps=29.97,
+        container="mp4",
+        codec="h264",
+        duration_seconds=2.0,
+        has_audio=False,
+        file_size_bytes=7,
+        path=final_path,
+        sha256="a" * 64,
+    )
+
+    controller.complete(result)
+
+    view = window.findChild(RegionView, "source-view")
+    path_label = window.findChild(QLabel, "source-path")
+    requested_label = window.findChild(QLabel, "capture-requested-metadata")
+    actual_label = window.findChild(QLabel, "capture-actual-metadata")
+    assert view is not None
+    assert path_label is not None
+    assert requested_label is not None
+    assert actual_label is not None
+    assert source_mode.currentText() == "Video file"
+    assert path_label.text() == str(final_path.resolve())
+    assert requested_label.text() == "Requested: width Auto · height Auto · FPS Auto · normal"
+    assert actual_label.text() == "Actual: 64 × 48 px · 29.97 FPS · mp4/h264 · no audio"
+    assert not any(isinstance(item, QGraphicsVideoItem) for item in view.scene().items())
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+    output.setText(str(tmp_path / "run"))
+    config = window._current_run_config()
+    assert config is not None
+    assert config.capture == result
 
 
 def test_load_video_replaces_stale_regions_and_shows_source_metadata(

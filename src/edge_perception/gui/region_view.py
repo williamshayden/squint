@@ -6,8 +6,9 @@ from math import ceil, floor
 from typing import Any, override
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSizeF, Qt, Signal
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QResizeEvent
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPixmapItem,
@@ -75,6 +76,7 @@ class RegionView(QGraphicsView):
         self.setScene(self._source_scene)
         self._image: QImage | None = None
         self._pixmap_item: QGraphicsPixmapItem | None = None
+        self._video_item: QGraphicsVideoItem | None = None
         self._region_items: list[_RegionItem] = []
         self._drawing_region_id: str | None = None
         self._draw_origin: QPointF | None = None
@@ -97,6 +99,7 @@ class RegionView(QGraphicsView):
         ).copy()
         self._region_items.clear()
         self._pixmap_item = None
+        self._video_item = None
         self._reset_draw_state(remove_item=False)
         previous_signal_state = self._source_scene.blockSignals(True)
         try:
@@ -108,6 +111,41 @@ class RegionView(QGraphicsView):
         self._source_scene.setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
         self._fit_source()
         self.regionsChanged.emit(())
+
+    def begin_video_preview(self, width: int, height: int) -> QGraphicsVideoItem:
+        """Display one raw Qt video item behind overlays in source coordinates."""
+
+        if width <= 0 or height <= 0:
+            raise ValueError("video preview dimensions must be positive")
+        self._region_items.clear()
+        self._pixmap_item = None
+        self._video_item = None
+        self._image = None
+        self._reset_draw_state(remove_item=False)
+        previous_signal_state = self._source_scene.blockSignals(True)
+        try:
+            self._source_scene.clear()
+        finally:
+            self._source_scene.blockSignals(previous_signal_state)
+        video_item = QGraphicsVideoItem()
+        video_item.setSize(QSizeF(float(width), float(height)))
+        video_item.setZValue(-1.0)
+        self._source_scene.addItem(video_item)
+        self._video_item = video_item
+        self._source_scene.setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
+        self._fit_source()
+        self.regionsChanged.emit(())
+        return video_item
+
+    def end_video_preview(self) -> None:
+        """Remove the owned raw video item while awaiting a finalized RGB frame."""
+
+        video_item = self._video_item
+        self._video_item = None
+        if video_item is not None and video_item.scene() is self._source_scene:
+            self._source_scene.removeItem(video_item)
+        if self._pixmap_item is None:
+            self._source_scene.setSceneRect(QRectF())
 
     def add_region(self, region: Region) -> None:
         """Add a named source-pixel rectangle in insertion order."""
