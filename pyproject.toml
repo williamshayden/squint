@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "edge-perception"
+version = "0.1.0"
+description = "Adaptive edge-perception checkpoint tooling."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "av>=16,<17",
+    "numpy>=2.2,<3",
+    "pillow>=11,<13",
+    "psutil>=7,<8",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch==2.11.0",
+    "transformers==4.57.6",
+    "safetensors>=0.6,<1",
+]
+cu128 = [
+    "torch==2.11.0",
+    "transformers==4.57.6",
+    "safetensors>=0.6,<1",
+    "nvidia-ml-py>=13,<14",
+]
+
+[project.scripts]
+edge-perception = "edge_perception.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/edge_perception"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu128" },
+    ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
