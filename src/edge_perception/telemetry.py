@@ -69,6 +69,7 @@ class HardwareProbe:
         self._process = self._read(lambda: self._psutil.Process())
         self._nvml: Any | None = None
         self._nvml_handle: Any | None = None
+        self._nvml_owner: Any | None = None
         self._gpu_identity: dict[str, str] | None = None
         self._capability_messages: list[str] = []
         self._initialize_nvml(nvml_module)
@@ -99,11 +100,13 @@ class HardwareProbe:
 
         try:
             nvml_module.nvmlInit()
+            self._nvml_owner = nvml_module
             if int(nvml_module.nvmlDeviceGetCount()) < 1:
                 raise RuntimeError("no NVIDIA devices detected")
             handle = nvml_module.nvmlDeviceGetHandleByIndex(0)
         except Exception as error:  # noqa: BLE001 - NVML failures must not abort a run
             self._mark_nvml_unavailable(error)
+            self.close()
             return
 
         self._nvml = nvml_module
@@ -118,6 +121,20 @@ class HardwareProbe:
     def _mark_nvml_unavailable(self, error: Exception | None) -> None:
         detail = "not installed or disabled" if error is None else f"{type(error).__name__}: {error}"
         self._capability_messages.append(f"NVIDIA telemetry unavailable: {detail}")
+
+    def close(self) -> None:
+        """Release an NVML initialization owned by this probe exactly once."""
+
+        nvml_owner = self._nvml_owner
+        if nvml_owner is None:
+            return
+        self._nvml_owner = None
+        self._nvml = None
+        self._nvml_handle = None
+        try:
+            nvml_owner.nvmlShutdown()
+        except Exception:  # noqa: BLE001 - cleanup must never abort a run
+            return
 
     @property
     def capability_messages(self) -> tuple[str, ...]:
@@ -174,15 +191,24 @@ class HardwareProbe:
 def collect_host_report(probe: HardwareProbe | None = None) -> dict[str, object]:
     """Collect JSON-native host identity and telemetry capability information."""
 
-    hardware = HardwareProbe() if probe is None else probe
-    return {
-        "os": platform.platform(),
-        "python_version": platform.python_version(),
-        "logical_cpu_count": hardware.logical_cpu_count(),
-        "total_ram_bytes": hardware.total_ram_bytes(),
-        "gpu": hardware.gpu_identity,
-        "capability_messages": list(hardware.capability_messages),
-    }
+    if probe is None:
+        hardware = HardwareProbe()
+        owns_probe = True
+    else:
+        hardware = probe
+        owns_probe = False
+    try:
+        return {
+            "os": platform.platform(),
+            "python_version": platform.python_version(),
+            "logical_cpu_count": hardware.logical_cpu_count(),
+            "total_ram_bytes": hardware.total_ram_bytes(),
+            "gpu": hardware.gpu_identity,
+            "capability_messages": list(hardware.capability_messages),
+        }
+    finally:
+        if owns_probe:
+            hardware.close()
 
 
 class TelemetryMonitor:
@@ -197,7 +223,8 @@ class TelemetryMonitor:
     ) -> None:
         if interval_seconds <= 0.0:
             raise ValueError("interval_seconds must be positive")
-        self._probe = HardwareProbe() if probe is None else probe
+        self._owns_probe = probe is None
+        self._probe: Any = HardwareProbe() if probe is None else probe
         self._interval_seconds = interval_seconds
         self._clock = clock
         self._samples: list[TelemetrySample] = []
@@ -244,9 +271,17 @@ class TelemetryMonitor:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Stop sampling and release only a probe owned by this monitor."""
+
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join()
+            self._thread = None
+        if self._owns_probe:
+            self._probe.close()
 
     def peaks(self) -> dict[str, int | float | None]:
         """Return maxima for every sampled sensor, ignoring unavailable values."""

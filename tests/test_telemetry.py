@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import edge_perception.telemetry as telemetry_module
 from edge_perception.telemetry import (
     HardwareProbe,
     TelemetryMonitor,
@@ -40,9 +41,15 @@ class FakeNvml:
 
     def __init__(self) -> None:
         self.initialized = False
+        self.shutdown_calls = 0
 
     def nvmlInit(self) -> None:
         self.initialized = True
+
+    def nvmlShutdown(self) -> None:
+        assert self.initialized
+        self.initialized = False
+        self.shutdown_calls += 1
 
     def nvmlDeviceGetCount(self) -> int:
         return 1
@@ -74,6 +81,11 @@ class FakeNvml:
         assert handle == "gpu-0"
         assert sensor == self.NVML_TEMPERATURE_GPU
         return 55
+
+
+class FailingEnumerationNvml(FakeNvml):
+    def nvmlDeviceGetCount(self) -> int:
+        raise RuntimeError("enumeration failed")
 
 
 def test_hardware_probe_returns_one_common_timestamped_record_shape() -> None:
@@ -120,6 +132,64 @@ def test_collect_host_report_includes_identity_and_one_capability_message() -> N
     assert unavailable_report["gpu"] is None
     assert len(unavailable_report["capability_messages"]) == 1
     assert "NVIDIA telemetry unavailable" in unavailable_report["capability_messages"][0]
+
+
+def test_default_collect_host_report_closes_its_owned_nvml_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nvml = FakeNvml()
+    monkeypatch.setattr(telemetry_module, "import_module", lambda _name: nvml)
+
+    collect_host_report()
+
+    assert nvml.shutdown_calls == 1
+
+
+def test_partial_nvml_initialization_failure_is_cleaned_up() -> None:
+    nvml = FailingEnumerationNvml()
+
+    probe = HardwareProbe(psutil_module=FakePsutil(), nvml_module=nvml)
+
+    assert nvml.shutdown_calls == 1
+    probe.close()
+    assert nvml.shutdown_calls == 1
+
+
+def test_hardware_probe_close_is_idempotent() -> None:
+    nvml = FakeNvml()
+    probe = HardwareProbe(psutil_module=FakePsutil(), nvml_module=nvml)
+
+    probe.close()
+    probe.close()
+
+    assert nvml.shutdown_calls == 1
+
+
+def test_default_monitor_closes_owned_probe_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned_nvml = FakeNvml()
+    monkeypatch.setattr(telemetry_module, "import_module", lambda _name: owned_nvml)
+
+    owned_monitor = TelemetryMonitor(interval_seconds=0.001)
+    with owned_monitor:
+        pass
+    owned_monitor.close()
+
+    assert owned_nvml.shutdown_calls == 1
+
+
+def test_monitor_and_host_report_preserve_external_probe_ownership() -> None:
+    external_nvml = FakeNvml()
+    external_probe = HardwareProbe(psutil_module=FakePsutil(), nvml_module=external_nvml)
+    with TelemetryMonitor(probe=external_probe, interval_seconds=0.001):
+        pass
+
+    assert external_nvml.shutdown_calls == 0
+    collect_host_report(external_probe)
+    assert external_nvml.shutdown_calls == 0
+    external_probe.close()
+    assert external_nvml.shutdown_calls == 1
 
 
 class SequenceProbe:
