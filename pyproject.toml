@@ -68,6 +68,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "model: opt-in tests that load external model artifacts",
+]
 
 [tool.mypy]
 python_version = "3.12"
