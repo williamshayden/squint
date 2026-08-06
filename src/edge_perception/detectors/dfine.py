@@ -161,8 +161,6 @@ class DfineDetector:
     def load(
         cls,
         *,
-        model_id: str = DEFAULT_MODEL_ID,
-        revision: str = DEFAULT_REVISION,
         threshold: float = DEFAULT_THRESHOLD,
         device: str = "auto",
     ) -> DfineDetector:
@@ -170,19 +168,19 @@ class DfineDetector:
         selected_device = _select_device(dependencies.torch, device)
         artifact_path = Path(
             dependencies.resolve_artifact(
-                repo_id=model_id,
+                repo_id=DEFAULT_MODEL_ID,
                 filename=WEIGHTS_FILENAME,
-                revision=revision,
+                revision=DEFAULT_REVISION,
             )
         )
         weights_sha256 = _sha256_file(artifact_path)
         processor = dependencies.processor_factory.from_pretrained(
-            model_id,
-            revision=revision,
+            DEFAULT_MODEL_ID,
+            revision=DEFAULT_REVISION,
         )
         model = dependencies.model_factory.from_pretrained(
-            model_id,
-            revision=revision,
+            DEFAULT_MODEL_ID,
+            revision=DEFAULT_REVISION,
         )
         model.to(device=selected_device, dtype=dependencies.torch.float32)
         model.eval()
@@ -194,8 +192,8 @@ class DfineDetector:
                 clock=monotonic_ns,
                 device=selected_device,
                 threshold=threshold,
-                model_id=model_id,
-                revision=revision,
+                model_id=DEFAULT_MODEL_ID,
+                revision=DEFAULT_REVISION,
                 weights_sha256=weights_sha256,
                 backend_version=str(dependencies.torch.__version__),
             )
@@ -231,6 +229,11 @@ class DfineDetector:
             target_sizes=target_sizes,
             threshold=self._threshold,
         )
+        if len(processed) != len(images):
+            raise RuntimeError(
+                "D-FINE postprocessing cardinality mismatch: "
+                f"expected {len(images)}, got {len(processed)}"
+            )
         detections = tuple(self._convert_image_detections(result) for result in processed)
         postprocess_end_ns = self._clock()
         return BatchPrediction(

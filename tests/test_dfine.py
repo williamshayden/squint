@@ -75,6 +75,7 @@ class FakeProcessor:
         self.image_modes: list[str] = []
         self.target_sizes: list[tuple[int, int]] = []
         self.threshold: float | None = None
+        self.result_count: int | None = None
 
     def __call__(self, *, images: list[Any], return_tensors: str) -> FakeInputs:
         assert return_tensors == "pt"
@@ -91,13 +92,14 @@ class FakeProcessor:
         assert outputs == {"logits": "outputs"}
         self.target_sizes = target_sizes
         self.threshold = threshold
+        result_count = len(target_sizes) if self.result_count is None else self.result_count
         return [
             {
                 "boxes": np.array([[1, 2, 11, 22]], dtype=np.int64),
                 "scores": np.array([np.float32(0.875)]),
                 "labels": np.array([1], dtype=np.int64),
             }
-            for _ in target_sizes
+            for _ in range(result_count)
         ]
 
 
@@ -286,6 +288,29 @@ def test_load_preserves_revision_hashes_weights_and_places_fp32_model(
     assert len(detector.identity.weights_sha256) == 64
 
 
+@pytest.mark.parametrize(
+    ("override"),
+    [
+        {"model_id": "other/model"},
+        {"revision": "other-revision"},
+    ],
+)
+def test_load_rejects_model_identity_overrides_before_external_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    override: dict[str, str],
+) -> None:
+    dependencies = fake_dependencies(tmp_path)
+    monkeypatch.setattr(dfine, "_load_dependencies", lambda: dependencies)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        DfineDetector.load(device="cpu", **override)
+
+    assert dependencies.resolve_calls == []
+    assert dependencies.processor_factory.calls == []
+    assert dependencies.model_factory.calls == []
+
+
 def test_load_auto_falls_back_explicitly_to_cpu(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -340,3 +365,19 @@ def test_dfine_rejects_malformed_weight_sha256(fake_runtime: FakeRuntime) -> Non
 
     with pytest.raises(ValueError, match="weights_sha256 must be 64 hexadecimal characters"):
         DfineDetector.from_components(fake_runtime)
+
+
+def test_dfine_rejects_too_few_postprocessed_records(fake_runtime: FakeRuntime) -> None:
+    fake_runtime.processor.result_count = 0
+    detector = DfineDetector.from_components(fake_runtime)
+
+    with pytest.raises(RuntimeError, match="cardinality mismatch: expected 1, got 0"):
+        detector.predict((np.zeros((32, 32, 3), dtype=np.uint8),))
+
+
+def test_dfine_rejects_too_many_postprocessed_records(fake_runtime: FakeRuntime) -> None:
+    fake_runtime.processor.result_count = 2
+    detector = DfineDetector.from_components(fake_runtime)
+
+    with pytest.raises(RuntimeError, match="cardinality mismatch: expected 1, got 2"):
+        detector.predict((np.zeros((32, 32, 3), dtype=np.uint8),))
