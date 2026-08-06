@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import FakeDetector
 
+from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
 from edge_perception.runner import RunConfig, run_checkpoint
 
@@ -84,6 +85,54 @@ def test_run_checkpoint_processes_full_frame_then_declared_crops(
     assert manifest["source_video"]["sha256"] == hashlib.sha256(video_path.read_bytes()).hexdigest()
     assert manifest["detector"] == fake_detector.identity.to_dict()
     assert set(manifest["timing_definitions"]) == set(summary["stage_latency_ms"])
+    assert manifest["source_video"]["capture"] is None
+    assert manifest["configuration"]["detector_id"] == "dfine-nano-coco"
+    assert manifest["configuration"]["device"] == "auto"
+
+
+def test_run_checkpoint_records_capture_provenance_and_requested_overrides(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    request = CaptureRequest("camera-1", "EMEET", 200, 100, 30.0, True)
+    capture = CaptureResult(
+        request=request,
+        selected_width=200,
+        selected_height=100,
+        selected_min_fps=30.0,
+        selected_max_fps=30.0,
+        selected_pixel_format="NV12",
+        actual_width=200,
+        actual_height=100,
+        actual_fps=30.0,
+        container="mp4",
+        codec="h264",
+        duration_seconds=0.1,
+        has_audio=False,
+        file_size_bytes=video_path.stat().st_size,
+        path=video_path,
+        sha256=hashlib.sha256(video_path.read_bytes()).hexdigest(),
+    )
+    config = RunConfig(
+        input_path=video_path,
+        output_dir=tmp_path / "captured-run",
+        regions=(),
+        threshold=0.3,
+        max_frames=0,
+        warmup_runs=0,
+        annotate_every=0,
+        detector_id="custom-detector",
+        device="cuda",
+        capture=capture,
+    )
+
+    run_checkpoint(config, fake_detector)
+
+    manifest = json.loads((config.output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_video"]["capture"] == capture.to_dict()
+    assert manifest["configuration"]["detector_id"] == "custom-detector"
+    assert manifest["configuration"]["device"] == "cuda"
 
 
 def test_run_checkpoint_finalizes_outputs_and_telemetry_when_detector_fails(

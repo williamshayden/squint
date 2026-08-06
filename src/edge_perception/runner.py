@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Generator
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from math import isfinite
 from pathlib import Path
 from time import perf_counter_ns
 from typing import cast
 from uuid import uuid4
 
+from edge_perception.config import RunConfig as _RunConfig
 from edge_perception.contracts import Detection, Region
 from edge_perception.detector import Detector
 from edge_perception.geometry import (
@@ -24,48 +23,7 @@ from edge_perception.outputs import RunOutputs, summarize_latencies
 from edge_perception.telemetry import TelemetryMonitor, collect_host_report
 from edge_perception.video import DecodedFrame, iter_video
 
-
-@dataclass(frozen=True, slots=True)
-class RunConfig:
-    input_path: Path
-    output_dir: Path
-    regions: tuple[Region, ...]
-    threshold: float
-    max_frames: int | None
-    warmup_runs: int
-    annotate_every: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "input_path", Path(self.input_path))
-        object.__setattr__(self, "output_dir", Path(self.output_dir))
-        if not isinstance(self.regions, tuple) or not all(
-            isinstance(region, Region) for region in self.regions
-        ):
-            raise TypeError("regions must be a tuple of Region values")
-        region_ids = [region.region_id for region in self.regions]
-        if "full-frame" in region_ids:
-            raise ValueError("full-frame is a reserved region ID")
-        if len(region_ids) != len(set(region_ids)):
-            raise ValueError("region IDs must be unique")
-
-        if isinstance(self.threshold, bool):
-            raise TypeError("threshold must be a finite number")
-        threshold = float(self.threshold)
-        if not isfinite(threshold) or not 0.0 <= threshold <= 1.0:
-            raise ValueError("threshold must be between 0 and 1")
-        object.__setattr__(self, "threshold", threshold)
-
-        if self.max_frames is not None:
-            _validate_nonnegative_integer(self.max_frames, "max_frames")
-        _validate_nonnegative_integer(self.warmup_runs, "warmup_runs")
-        _validate_nonnegative_integer(self.annotate_every, "annotate_every")
-        if self.input_path.resolve() == self.output_dir.resolve():
-            raise ValueError("output directory must differ from input path")
-
-
-def _validate_nonnegative_integer(value: int, field_name: str) -> None:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{field_name} must be a non-negative integer")
+RunConfig = _RunConfig
 
 
 def _milliseconds(start_ns: int, end_ns: int) -> float:
@@ -169,6 +127,8 @@ def _manifest(
             "max_frames": config.max_frames,
             "warmup_runs": config.warmup_runs,
             "annotate_every": config.annotate_every,
+            "detector_id": config.detector_id,
+            "device": config.device,
             "batch_size": 1,
         },
         "source_video": {
@@ -176,6 +136,7 @@ def _manifest(
             "sha256": _sha256_file(config.input_path),
             "frame_width": int(first_frame.image.shape[1]),
             "frame_height": int(first_frame.image.shape[0]),
+            "capture": None if config.capture is None else config.capture.to_dict(),
         },
         "host": collect_host_report(),
         "detector": detector.identity.to_dict(),
