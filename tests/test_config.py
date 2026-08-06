@@ -121,6 +121,44 @@ def test_run_config_file_round_trips_capture_provenance(tmp_path: Path) -> None:
     assert load_run_config(path) == config
 
 
+def test_run_config_file_round_trips_directly_constructed_relative_paths(tmp_path: Path) -> None:
+    input_path = Path("captures/camera-1.mp4")
+    request = CaptureRequest("camera-1", "EMEET", 1920, 1080, 30.0, True)
+    capture = CaptureResult(
+        request=request,
+        selected_width=1920,
+        selected_height=1080,
+        selected_min_fps=30.0,
+        selected_max_fps=30.0,
+        selected_pixel_format="NV12",
+        actual_width=1920,
+        actual_height=1080,
+        actual_fps=30.0,
+        container="mp4",
+        codec="h264",
+        duration_seconds=5.0,
+        has_audio=False,
+        file_size_bytes=5,
+        path=input_path,
+        sha256="a" * 64,
+    )
+    config = RunConfig(
+        input_path=input_path,
+        output_dir=Path("runs/camera-1"),
+        regions=(),
+        threshold=0.3,
+        max_frames=3,
+        warmup_runs=1,
+        annotate_every=1,
+        capture=capture,
+    )
+    config_path = tmp_path / "experiment.json"
+
+    write_run_config(config_path, config)
+
+    assert load_run_config(config_path) == config
+
+
 def test_render_run_cli_returns_resolved_argument_tuple(tmp_path: Path) -> None:
     config_path = tmp_path / "experiment.json"
     output = tmp_path / "run"

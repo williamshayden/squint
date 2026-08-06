@@ -148,7 +148,7 @@ class CaptureResult:
         )
         if not isinstance(self.path, (Path, str)):
             raise TypeError("path must be a path")
-        object.__setattr__(self, "path", Path(self.path))
+        object.__setattr__(self, "path", Path(self.path).resolve())
         if not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
             raise ValueError("sha256 must contain 64 lowercase hexadecimal characters")
 
@@ -243,8 +243,8 @@ class RunConfig:
     capture: CaptureResult | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "input_path", Path(self.input_path))
-        object.__setattr__(self, "output_dir", Path(self.output_dir))
+        object.__setattr__(self, "input_path", Path(self.input_path).resolve())
+        object.__setattr__(self, "output_dir", Path(self.output_dir).resolve())
         if not isinstance(self.regions, tuple) or not all(
             isinstance(region, Region) for region in self.regions
         ):
