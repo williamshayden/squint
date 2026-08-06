@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import NoReturn, cast
 
 from edge_perception.compare import compare_runs
+from edge_perception.config import RunConfig, load_run_config
 from edge_perception.contracts import Region
-from edge_perception.runner import RunConfig, run_checkpoint, validate_output_directory
+from edge_perception.detectors.registry import load_detector
+from edge_perception.runner import run_checkpoint, validate_output_directory
 
 
 class _CliError(ValueError):
@@ -85,14 +87,21 @@ def _build_parser() -> _Parser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run = subparsers.add_parser("run", help="run a chronological video checkpoint")
-    run.add_argument("input", type=Path)
-    run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--crop", action="append", type=_crop, default=[])
-    run.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    run.add_argument("--threshold", type=_threshold, default=0.3)
-    run.add_argument("--warmup-runs", type=_nonnegative("warmup-runs"), default=2)
-    run.add_argument("--max-frames", type=_nonnegative("max-frames"))
-    run.add_argument("--annotate-every", type=_nonnegative("annotate-every"), default=10)
+    run.add_argument("input", type=Path, nargs="?")
+    run.add_argument("--config", type=Path)
+    run.add_argument("--output", type=Path, default=argparse.SUPPRESS)
+    run.add_argument("--crop", action="append", type=_crop, default=argparse.SUPPRESS)
+    run.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default=argparse.SUPPRESS
+    )
+    run.add_argument("--threshold", type=_threshold, default=argparse.SUPPRESS)
+    run.add_argument(
+        "--warmup-runs", type=_nonnegative("warmup-runs"), default=argparse.SUPPRESS
+    )
+    run.add_argument("--max-frames", type=_nonnegative("max-frames"), default=argparse.SUPPRESS)
+    run.add_argument(
+        "--annotate-every", type=_nonnegative("annotate-every"), default=argparse.SUPPRESS
+    )
 
     compare = subparsers.add_parser("compare", help="compare semantic checkpoint detections")
     compare.add_argument("left", type=Path)
@@ -107,44 +116,87 @@ def _build_parser() -> _Parser:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    input_path = cast(Path, args.input).resolve()
-    output_dir = cast(Path, args.output).resolve()
-    regions = tuple(cast(list[Region], args.crop))
-    if not input_path.is_file():
-        raise _CliError(f"input video does not exist: {input_path}")
-    if output_dir == input_path:
-        raise _CliError("output must differ from input")
-    validate_output_directory(output_dir)
-    region_ids = [region.region_id for region in regions]
-    duplicates = sorted({region_id for region_id in region_ids if region_ids.count(region_id) > 1})
-    if duplicates:
-        raise _CliError(f"duplicate crop ID: {duplicates[0]}")
-
-    threshold = cast(float, args.threshold)
-    config = RunConfig(
-        input_path=input_path,
-        output_dir=output_dir,
-        regions=regions,
-        threshold=threshold,
-        max_frames=cast(int | None, args.max_frames),
-        warmup_runs=cast(int, args.warmup_runs),
-        annotate_every=cast(int, args.annotate_every),
-    )
-
-    from edge_perception.detectors.dfine import DfineDetector
-
-    detector = DfineDetector.load(
-        threshold=threshold,
-        device=cast(str, args.device),
+    config = _resolve_run_config(args)
+    if not config.input_path.is_file():
+        raise _CliError(f"input video does not exist: {config.input_path}")
+    validate_output_directory(config.output_dir)
+    detector = load_detector(
+        config.detector_id,
+        threshold=config.threshold,
+        device=config.device,
     )
     summary = run_checkpoint(config, detector)
-    print(f"output: {output_dir}")
+    print(f"output: {config.output_dir}")
     print(
         f"status={summary.get('status')} "
         f"frames={summary.get('frames_processed')} "
         f"inferences={summary.get('inference_count')}"
     )
     return 0
+
+
+def _resolve_run_config(args: argparse.Namespace) -> RunConfig:
+    input_path = cast(Path | None, args.input)
+    config_path = cast(Path | None, args.config)
+    if input_path is None and config_path is None:
+        raise _CliError("run requires INPUT or --config")
+    if input_path is not None and config_path is not None:
+        raise _CliError("INPUT cannot be combined with --config")
+    if config_path is None:
+        if not hasattr(args, "output"):
+            raise _CliError("--output is required without --config")
+        return _explicit_run_config(args, input_path)
+    return _apply_config_overrides(load_run_config(config_path), args)
+
+
+def _explicit_run_config(args: argparse.Namespace, input_path: Path | None) -> RunConfig:
+    if input_path is None:
+        raise AssertionError("input path is required for an explicit run")
+    output_dir = cast(Path, args.output)
+    if output_dir.resolve() == input_path.resolve():
+        raise _CliError("output must differ from input")
+    regions = tuple(cast(list[Region], getattr(args, "crop", [])))
+    region_ids = [region.region_id for region in regions]
+    duplicates = sorted({region_id for region_id in region_ids if region_ids.count(region_id) > 1})
+    if duplicates:
+        raise _CliError(f"duplicate crop ID: {duplicates[0]}")
+    return RunConfig(
+        input_path=input_path,
+        output_dir=output_dir,
+        regions=regions,
+        threshold=cast(float, getattr(args, "threshold", 0.3)),
+        max_frames=cast(int | None, getattr(args, "max_frames", None)),
+        warmup_runs=cast(int, getattr(args, "warmup_runs", 2)),
+        annotate_every=cast(int, getattr(args, "annotate_every", 10)),
+        device=cast(str, getattr(args, "device", "auto")),
+    )
+
+
+def _apply_config_overrides(config: RunConfig, args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        input_path=config.input_path,
+        output_dir=cast(Path, args.output) if hasattr(args, "output") else config.output_dir,
+        regions=(
+            tuple(cast(list[Region], args.crop)) if hasattr(args, "crop") else config.regions
+        ),
+        threshold=(
+            cast(float, args.threshold) if hasattr(args, "threshold") else config.threshold
+        ),
+        max_frames=(
+            cast(int | None, args.max_frames) if hasattr(args, "max_frames") else config.max_frames
+        ),
+        warmup_runs=(
+            cast(int, args.warmup_runs) if hasattr(args, "warmup_runs") else config.warmup_runs
+        ),
+        annotate_every=(
+            cast(int, args.annotate_every)
+            if hasattr(args, "annotate_every")
+            else config.annotate_every
+        ),
+        detector_id=config.detector_id,
+        device=cast(str, args.device) if hasattr(args, "device") else config.device,
+        capture=config.capture,
+    )
 
 
 def _compare_command(args: argparse.Namespace) -> int:
