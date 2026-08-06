@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -69,6 +70,41 @@ def test_worker_emits_one_finite_json_object_per_line(
     assert sum(event["phase"] in {"complete", "cancelled", "failed"} for event in events) == 1
 
 
+def test_worker_redirects_noisy_dependency_stdout_away_from_jsonl_protocol(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    config_path = tmp_path / "experiment.json"
+    _write_config(config_path, video_path=video_path, output_dir=tmp_path / "run")
+    protocol = StringIO()
+    diagnostics = StringIO()
+    original_predict = fake_detector.predict
+
+    def noisy_predict(images: tuple[object, ...]) -> object:
+        print("detector noise")
+        return original_predict(images)  # type: ignore[arg-type]
+
+    def noisy_loader(_detector_id: str, *, threshold: float, device: str) -> FakeDetector:
+        print("loader noise")
+        fake_detector.predict = noisy_predict  # type: ignore[method-assign]
+        return fake_detector
+
+    with redirect_stdout(protocol):
+        exit_code = run_worker(
+            config_path,
+            tmp_path / "cancel",
+            detector_loader=noisy_loader,
+            stream=protocol,
+            diagnostic_stream=diagnostics,
+        )
+
+    events = _events(protocol)
+    assert exit_code == 0
+    assert events[-1]["phase"] == "complete"
+    assert diagnostics.getvalue().splitlines() == ["loader noise", "detector noise"]
+
+
 def test_worker_honors_preexisting_cancel_file(
     video_path: Path,
     tmp_path: Path,
@@ -118,6 +154,35 @@ def test_worker_reports_detector_load_failure_once(
     assert [event["phase"] for event in events] == ["failed"]
     assert len(stderr_lines) == 1
     assert "unknown detector ID" in stderr_lines[0]
+
+
+def test_worker_main_reports_runner_failure_without_duplicate_terminal_event(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    config_path = tmp_path / "experiment.json"
+    _write_config(config_path, video_path=video_path, output_dir=tmp_path / "run")
+    protocol = StringIO()
+    diagnostics = StringIO()
+
+    def fail(_images: tuple[object, ...]) -> object:
+        raise RuntimeError("runner failed")
+
+    fake_detector.predict = fail  # type: ignore[method-assign]
+
+    exit_code = main(
+        ["--config", str(config_path), "--cancel-file", str(tmp_path / "cancel")],
+        detector_loader=lambda _detector_id, *, threshold, device: fake_detector,
+        protocol_stream=protocol,
+        diagnostic_stream=diagnostics,
+    )
+
+    events = _events(protocol)
+    assert exit_code == 2
+    assert [event["phase"] for event in events] == ["validating", "warming_up", "failed"]
+    assert sum(event["phase"] == "failed" for event in events) == 1
+    assert diagnostics.getvalue().splitlines() == ["error: runner failed"]
 
 
 def test_worker_argument_failure_preserves_jsonl_stdout(

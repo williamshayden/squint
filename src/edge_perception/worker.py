@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import redirect_stdout
 from pathlib import Path
 from time import perf_counter_ns
 from typing import NoReturn, TextIO
@@ -44,6 +45,7 @@ def run_worker(
     *,
     detector_loader: Callable[..., Detector] = load_detector,
     stream: TextIO = sys.stdout,
+    diagnostic_stream: TextIO = sys.stderr,
 ) -> int:
     """Load a configured detector and run it with JSONL progress output."""
 
@@ -54,18 +56,19 @@ def run_worker(
         def emit(event: ProgressEvent) -> None:
             _emit_json(stream, event)
 
-        detector = detector_loader(
-            config.detector_id,
-            threshold=config.threshold,
-            device=config.device,
-        )
-        runner_started = True
-        summary = run_checkpoint(
-            config,
-            detector,
-            progress=emit,
-            cancel_requested=cancel_file.exists,
-        )
+        with redirect_stdout(diagnostic_stream):
+            detector = detector_loader(
+                config.detector_id,
+                threshold=config.threshold,
+                device=config.device,
+            )
+            runner_started = True
+            summary = run_checkpoint(
+                config,
+                detector,
+                progress=emit,
+                cancel_requested=cancel_file.exists,
+            )
         return 0 if summary["status"] in {"complete", "cancelled"} else 2
     except Exception as error:
         raise _WorkerFailure(error, runner_started=runner_started) from error
@@ -87,11 +90,13 @@ def _report_failure(
     *,
     runner_started: bool,
     started_ns: int,
+    protocol_stream: TextIO,
+    diagnostic_stream: TextIO,
 ) -> int:
     message = _compact_error(error)
     if not runner_started:
         _emit_json(
-            sys.stdout,
+            protocol_stream,
             ProgressEvent(
                 phase="failed",
                 frames_processed=0,
@@ -100,24 +105,46 @@ def _report_failure(
                 error=f"{type(error).__name__}: {message}",
             ),
         )
-    print(f"error: {message}", file=sys.stderr)
+    print(f"error: {message}", file=diagnostic_stream)
     return 2
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    detector_loader: Callable[..., Detector] = load_detector,
+    protocol_stream: TextIO | None = None,
+    diagnostic_stream: TextIO | None = None,
+) -> int:
     """Run the internal worker command and return its process exit code."""
 
     started_ns = perf_counter_ns()
+    protocol = sys.stdout if protocol_stream is None else protocol_stream
+    diagnostics = sys.stderr if diagnostic_stream is None else diagnostic_stream
     try:
         args = _build_parser().parse_args(argv)
-        return run_worker(args.config, args.cancel_file, stream=sys.stdout)
+        return run_worker(
+            args.config,
+            args.cancel_file,
+            detector_loader=detector_loader,
+            stream=protocol,
+            diagnostic_stream=diagnostics,
+        )
     except _WorkerArgumentError as error:
-        return _report_failure(error, runner_started=False, started_ns=started_ns)
+        return _report_failure(
+            error,
+            runner_started=False,
+            started_ns=started_ns,
+            protocol_stream=protocol,
+            diagnostic_stream=diagnostics,
+        )
     except _WorkerFailure as failure:
         return _report_failure(
             failure.error,
             runner_started=failure.runner_started,
             started_ns=started_ns,
+            protocol_stream=protocol,
+            diagnostic_stream=diagnostics,
         )
 
 
