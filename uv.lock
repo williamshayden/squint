@@ -2,15 +2,72 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 resolution-markers = [
-    "extra != 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128'",
-    "sys_platform != 'darwin' and extra == 'extra-15-edge-perception-cpu' and extra != 'extra-15-edge-perception-cu128'",
-    "sys_platform == 'darwin' and extra == 'extra-15-edge-perception-cpu' and extra != 'extra-15-edge-perception-cu128'",
-    "extra != 'extra-15-edge-perception-cpu' and extra != 'extra-15-edge-perception-cu128'",
+    "extra != 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128'",
+    "sys_platform != 'darwin' and extra == 'extra-24-adaptive-edge-perception-cpu' and extra != 'extra-24-adaptive-edge-perception-cu128'",
+    "sys_platform == 'darwin' and extra == 'extra-24-adaptive-edge-perception-cpu' and extra != 'extra-24-adaptive-edge-perception-cu128'",
+    "extra != 'extra-24-adaptive-edge-perception-cpu' and extra != 'extra-24-adaptive-edge-perception-cu128'",
 ]
 conflicts = [[
-    { package = "edge-perception", extra = "cpu" },
-    { package = "edge-perception", extra = "cu128" },
+    { package = "adaptive-edge-perception", extra = "cpu" },
+    { package = "adaptive-edge-perception", extra = "cu128" },
 ]]
+
+[[package]]
+name = "adaptive-edge-perception"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "av" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "psutil" },
+]
+
+[package.optional-dependencies]
+cpu = [
+    { name = "safetensors" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-24-adaptive-edge-perception-cpu') or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-24-adaptive-edge-perception-cpu') or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
+    { name = "transformers" },
+]
+cu128 = [
+    { name = "nvidia-ml-py" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" } },
+    { name = "transformers" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "av", specifier = ">=16,<17" },
+    { name = "numpy", specifier = ">=2.2,<3" },
+    { name = "nvidia-ml-py", marker = "extra == 'cu128'", specifier = ">=13,<14" },
+    { name = "pillow", specifier = ">=11,<13" },
+    { name = "psutil", specifier = ">=7,<8" },
+    { name = "safetensors", marker = "extra == 'cpu'", specifier = ">=0.6,<1" },
+    { name = "safetensors", marker = "extra == 'cu128'", specifier = ">=0.6,<1" },
+    { name = "torch", marker = "extra == 'cpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "adaptive-edge-perception", extra = "cpu" } },
+    { name = "torch", marker = "extra == 'cu128'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "adaptive-edge-perception", extra = "cu128" } },
+    { name = "transformers", marker = "extra == 'cpu'", specifier = "==4.57.6" },
+    { name = "transformers", marker = "extra == 'cu128'", specifier = "==4.57.6" },
+]
+provides-extras = ["cpu", "cu128"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
 
 [[package]]
 name = "ast-serialize"
@@ -181,63 +238,6 @@ nvtx = [
 ]
 
 [[package]]
-name = "edge-perception"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "av" },
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "psutil" },
-]
-
-[package.optional-dependencies]
-cpu = [
-    { name = "safetensors" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-15-edge-perception-cpu') or (extra == 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128')" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-15-edge-perception-cpu') or (extra == 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128')" },
-    { name = "transformers" },
-]
-cu128 = [
-    { name = "nvidia-ml-py" },
-    { name = "safetensors" },
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" } },
-    { name = "transformers" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "av", specifier = ">=16,<17" },
-    { name = "numpy", specifier = ">=2.2,<3" },
-    { name = "nvidia-ml-py", marker = "extra == 'cu128'", specifier = ">=13,<14" },
-    { name = "pillow", specifier = ">=11,<13" },
-    { name = "psutil", specifier = ">=7,<8" },
-    { name = "safetensors", marker = "extra == 'cpu'", specifier = ">=0.6,<1" },
-    { name = "safetensors", marker = "extra == 'cu128'", specifier = ">=0.6,<1" },
-    { name = "torch", marker = "extra == 'cpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "edge-perception", extra = "cpu" } },
-    { name = "torch", marker = "extra == 'cu128'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "edge-perception", extra = "cu128" } },
-    { name = "transformers", marker = "extra == 'cpu'", specifier = "==4.57.6" },
-    { name = "transformers", marker = "extra == 'cu128'", specifier = "==4.57.6" },
-]
-provides-extras = ["cpu", "cu128"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[[package]]
 name = "filelock"
 version = "3.32.2"
 source = { registry = "https://pypi.org/simple" }
@@ -375,7 +375,7 @@ version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ast-serialize" },
-    { name = "librt", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128')" },
+    { name = "librt", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
     { name = "mypy-extensions" },
     { name = "pathspec" },
     { name = "typing-extensions" },
@@ -673,7 +673,7 @@ name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -900,7 +900,7 @@ version = "2.11.0+cu128"
 source = { registry = "https://download.pytorch.org/whl/cu128" }
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
-    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-15-edge-perception-cu128') or (extra == 'extra-15-edge-perception-cpu' and extra == 'extra-15-edge-perception-cu128')" },
+    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-24-adaptive-edge-perception-cu128') or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },

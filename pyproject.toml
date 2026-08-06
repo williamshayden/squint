@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "edge-perception"
+name = "adaptive-edge-perception"
 version = "0.1.0"
 description = "Adaptive edge-perception checkpoint tooling."
 readme = "README.md"

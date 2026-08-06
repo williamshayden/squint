@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -75,3 +76,39 @@ def test_detector_identity_serializes_all_provenance_fields() -> None:
         "device": "cpu",
         "dtype": "float32",
     }
+
+
+def test_contracts_normalize_decimal_values_for_json_serialization() -> None:
+    box = Box(Decimal("1.25"), Decimal("2.5"), Decimal("10.75"), Decimal("20.0"))
+    region = Region("top-left", 0, 0, 1920, 1080)
+    detection = Detection(box, 3, Decimal("0.875"), "car")
+    timing = StageTiming(Decimal("1.0"), Decimal("2.0"), Decimal("3.0"), Decimal("6.0"))
+    prediction = BatchPrediction(((detection,),), timing)
+    identity = DetectorIdentity(
+        adapter="transformers",
+        model_id="dfine-n",
+        revision="abc123",
+        weights_sha256="a" * 64,
+        backend="torch",
+        backend_version="2.11.0",
+        device="cpu",
+        dtype="float32",
+    )
+
+    for contract in (box, region, detection, timing, prediction, identity):
+        json.dumps(contract.to_dict())
+
+
+def test_contracts_reject_arbitrary_objects_at_serialization_boundaries() -> None:
+    opaque = object()
+
+    with pytest.raises(TypeError):
+        Region(opaque, 0, 0, 1, 1)
+    with pytest.raises(TypeError):
+        Detection(Box(0.0, 0.0, 1.0, 1.0), opaque, 0.5)
+    with pytest.raises(TypeError):
+        Detection(Box(0.0, 0.0, 1.0, 1.0), 1, 0.5, opaque)
+    with pytest.raises(TypeError):
+        BatchPrediction(((opaque,),), StageTiming(0.0, 0.0, 0.0, 0.0))
+    with pytest.raises(TypeError):
+        DetectorIdentity(opaque, "model", "revision", "checksum", "backend", "1", "cpu", "float32")

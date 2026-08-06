@@ -4,14 +4,21 @@ from dataclasses import dataclass
 from math import isfinite
 
 
-def _require_finite(value: float, field_name: str) -> None:
+def _normalize_finite_float(value: float, field_name: str) -> float:
     try:
-        finite = isfinite(value)
-    except TypeError as error:
+        normalized = float(value)
+    except (TypeError, ValueError) as error:
         message = f"{field_name} must be a finite number"
-        raise ValueError(message) from error
-    if not finite:
+        raise TypeError(message) from error
+    if not isfinite(normalized):
         raise ValueError(f"{field_name} must be a finite number")
+    return normalized
+
+
+def _require_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    return str(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +29,10 @@ class Box:
     y2: float
 
     def __post_init__(self) -> None:
-        _require_finite(self.x1, "x1")
-        _require_finite(self.y1, "y1")
-        _require_finite(self.x2, "x2")
-        _require_finite(self.y2, "y2")
+        object.__setattr__(self, "x1", _normalize_finite_float(self.x1, "x1"))
+        object.__setattr__(self, "y1", _normalize_finite_float(self.y1, "y1"))
+        object.__setattr__(self, "x2", _normalize_finite_float(self.x2, "x2"))
+        object.__setattr__(self, "y2", _normalize_finite_float(self.y2, "y2"))
         if self.x2 <= self.x1:
             raise ValueError("x2 must be greater than x1")
         if self.y2 <= self.y1:
@@ -47,9 +54,11 @@ class Region:
     height: int
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "region_id", _require_string(self.region_id, "region_id"))
         for field_name, value in (("x", self.x), ("y", self.y), ("width", self.width), ("height", self.height)):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{field_name} must be an integer")
+            object.__setattr__(self, field_name, int(value))
         if self.width <= 0 or self.height <= 0:
             raise ValueError("region width and height must be positive")
 
@@ -71,7 +80,14 @@ class Detection:
     label: str | None = None
 
     def __post_init__(self) -> None:
-        _require_finite(self.score, "score")
+        if not isinstance(self.box, Box):
+            raise TypeError("box must be a Box")
+        if not isinstance(self.class_id, int) or isinstance(self.class_id, bool):
+            raise TypeError("class_id must be an integer")
+        object.__setattr__(self, "class_id", int(self.class_id))
+        object.__setattr__(self, "score", _normalize_finite_float(self.score, "score"))
+        if self.label is not None:
+            object.__setattr__(self, "label", _require_string(self.label, "label"))
         if not 0.0 <= self.score <= 1.0:
             raise ValueError("score must be between 0.0 and 1.0")
 
@@ -98,8 +114,9 @@ class StageTiming:
             ("postprocess_ms", self.postprocess_ms),
             ("total_ms", self.total_ms),
         ):
-            _require_finite(value, field_name)
-            if value < 0.0:
+            normalized = _normalize_finite_float(value, field_name)
+            object.__setattr__(self, field_name, normalized)
+            if normalized < 0.0:
                 raise ValueError(f"{field_name} must not be negative")
 
     def to_dict(self) -> dict[str, float]:
@@ -115,6 +132,17 @@ class StageTiming:
 class BatchPrediction:
     detections: tuple[tuple[Detection, ...], ...]
     timing: StageTiming
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.detections, tuple):
+            raise TypeError("detections must be a tuple of detection tuples")
+        for image_detections in self.detections:
+            if not isinstance(image_detections, tuple):
+                raise TypeError("detections must be a tuple of detection tuples")
+            if not all(isinstance(detection, Detection) for detection in image_detections):
+                raise TypeError("detections must contain Detection values")
+        if not isinstance(self.timing, StageTiming):
+            raise TypeError("timing must be a StageTiming")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -136,6 +164,19 @@ class DetectorIdentity:
     backend_version: str
     device: str
     dtype: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "adapter",
+            "model_id",
+            "revision",
+            "weights_sha256",
+            "backend",
+            "backend_version",
+            "device",
+            "dtype",
+        ):
+            object.__setattr__(self, field_name, _require_string(getattr(self, field_name), field_name))
 
     def to_dict(self) -> dict[str, str]:
         return {
