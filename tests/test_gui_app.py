@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QGraphicsRectItem,
@@ -33,6 +34,23 @@ def _preview_frame(width: int = 200, height: int = 100) -> DecodedFrame:
 
 def _stub_first_frame(monkeypatch: pytest.MonkeyPatch, frame: DecodedFrame) -> None:
     monkeypatch.setattr(main_window, "first_video_frame", lambda _path: frame)
+
+
+def _draw_on_viewport(
+    qtbot: QtBot,
+    view: RegionView,
+    start: QPointF,
+    finish: QPointF,
+) -> None:
+    view.resetTransform()
+    start_pos = view.mapFromScene(start)
+    midpoint = view.mapFromScene(
+        QPointF((start.x() + finish.x()) / 2.0, (start.y() + finish.y()) / 2.0)
+    )
+    finish_pos = view.mapFromScene(finish)
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(view.viewport(), pos=midpoint)
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=finish_pos)
 
 
 def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
@@ -73,6 +91,63 @@ def test_load_video_replaces_stale_regions_and_shows_source_metadata(
     assert view.regions() == ()
 
 
+def test_load_video_replaces_selected_region_without_qt_exception(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    view = window.findChild(RegionView, "source-view")
+    assert view is not None
+    window.load_video(tmp_path / "first.mp4")
+    view.add_region(Region("selected", 10, 20, 40, 30))
+    view.select_region("selected")
+
+    with qtbot.captureExceptions() as exceptions:
+        window.load_video(tmp_path / "second.mp4")
+
+    assert exceptions == []
+    assert view.regions() == ()
+
+
+def test_new_region_button_draws_clipped_region_through_viewport_mouse_events(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(900, 600)
+    window.show()
+    window.load_video(Path("source.mp4"))
+    view = window.findChild(RegionView, "source-view")
+    region_id = window.findChild(QLineEdit, "region-id")
+    new_region = window.findChild(QPushButton, "new-region-button")
+    assert view is not None
+    assert region_id is not None
+    assert new_region is not None
+    view.resetTransform()
+    region_id.setText("roi")
+
+    qtbot.mouseClick(new_region, Qt.MouseButton.LeftButton)
+
+    assert view.regions() == ()
+    assert view.viewport().cursor().shape() == Qt.CursorShape.CrossCursor
+    press = view.mapFromScene(QPointF(50.0, 40.0))
+    move = view.mapFromScene(QPointF(20.0, 20.0))
+    release = view.mapFromScene(QPointF(-10.0, 10.0))
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=press)
+    qtbot.mouseMove(view.viewport(), pos=move)
+    assert sum(isinstance(item, QGraphicsRectItem) for item in view.scene().items()) == 1
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=release)
+
+    assert view.regions() == (Region("roi", 0, 10, 50, 30),)
+    assert view.selected_region() == Region("roi", 0, 10, 50, 30)
+    assert view.viewport().cursor().shape() == Qt.CursorShape.ArrowCursor
+
+
 def test_numeric_resize_updates_scene_and_contract(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,
@@ -80,6 +155,8 @@ def test_numeric_resize_updates_scene_and_contract(
     _stub_first_frame(monkeypatch, _preview_frame())
     window = MainWindow()
     qtbot.addWidget(window)
+    window.resize(900, 600)
+    window.show()
     window.load_video(Path("source.mp4"))
     view = window.findChild(RegionView, "source-view")
     region_id = window.findChild(QLineEdit, "region-id")
@@ -97,11 +174,8 @@ def test_numeric_resize_updates_scene_and_contract(
     assert height is not None
     assert new_region is not None
     region_id.setText("roi")
-    x.setValue(10)
-    y.setValue(20)
-    width.setValue(40)
-    height.setValue(30)
-    new_region.click()
+    qtbot.mouseClick(new_region, Qt.MouseButton.LeftButton)
+    _draw_on_viewport(qtbot, view, QPointF(10.0, 20.0), QPointF(50.0, 50.0))
 
     x.setValue(25)
     y.setValue(15)
@@ -127,6 +201,8 @@ def test_region_controls_add_and_delete_selected_region(
     _stub_first_frame(monkeypatch, _preview_frame())
     window = MainWindow()
     qtbot.addWidget(window)
+    window.resize(900, 600)
+    window.show()
     window.load_video(Path("source.mp4"))
     region_id = window.findChild(QLineEdit, "region-id")
     new_region = window.findChild(QPushButton, "new-region-button")
@@ -138,11 +214,82 @@ def test_region_controls_add_and_delete_selected_region(
     assert view is not None
     region_id.setText("roi")
 
-    new_region.click()
-    delete_region.click()
+    qtbot.mouseClick(new_region, Qt.MouseButton.LeftButton)
+    _draw_on_viewport(qtbot, view, QPointF(10.0, 20.0), QPointF(50.0, 50.0))
+    qtbot.mouseClick(delete_region, Qt.MouseButton.LeftButton)
 
     assert view.regions() == ()
     assert all(item.data(0) != "roi" for item in view.scene().items())
+
+
+def test_deselect_clears_and_disables_geometry_controls(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(900, 600)
+    window.show()
+    window.load_video(Path("source.mp4"))
+    view = window.findChild(RegionView, "source-view")
+    region_id = window.findChild(QLineEdit, "region-id")
+    new_region = window.findChild(QPushButton, "new-region-button")
+    spins = [
+        window.findChild(QSpinBox, object_name)
+        for object_name in ("region-x", "region-y", "region-width", "region-height")
+    ]
+    assert view is not None
+    assert region_id is not None
+    assert new_region is not None
+    assert all(spin is not None for spin in spins)
+    region_id.setText("roi")
+    qtbot.mouseClick(new_region, Qt.MouseButton.LeftButton)
+    _draw_on_viewport(qtbot, view, QPointF(10.0, 20.0), QPointF(50.0, 50.0))
+
+    qtbot.mouseClick(
+        view.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=view.mapFromScene(QPointF(180.0, 90.0)),
+    )
+
+    assert view.selected_region() is None
+    assert all(spin is not None and not spin.isEnabled() and spin.text() == "" for spin in spins)
+    assert region_id.isEnabled() is True
+    assert region_id.text() == "roi"
+
+
+def test_delete_clears_and_disables_geometry_controls(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(900, 600)
+    window.show()
+    window.load_video(Path("source.mp4"))
+    view = window.findChild(RegionView, "source-view")
+    region_id = window.findChild(QLineEdit, "region-id")
+    new_region = window.findChild(QPushButton, "new-region-button")
+    delete_region = window.findChild(QPushButton, "delete-region-button")
+    spins = [
+        window.findChild(QSpinBox, object_name)
+        for object_name in ("region-x", "region-y", "region-width", "region-height")
+    ]
+    assert view is not None
+    assert region_id is not None
+    assert new_region is not None
+    assert delete_region is not None
+    assert all(spin is not None for spin in spins)
+    region_id.setText("roi")
+    qtbot.mouseClick(new_region, Qt.MouseButton.LeftButton)
+    _draw_on_viewport(qtbot, view, QPointF(10.0, 20.0), QPointF(50.0, 50.0))
+
+    qtbot.mouseClick(delete_region, Qt.MouseButton.LeftButton)
+
+    assert view.regions() == ()
+    assert all(spin is not None and not spin.isEnabled() and spin.text() == "" for spin in spins)
 
 
 def test_run_enables_only_with_source_and_output(
@@ -164,6 +311,90 @@ def test_run_enables_only_with_source_and_output(
     assert run.isEnabled() is True
     output.clear()
     assert run.isEnabled() is False
+
+
+def test_run_rejects_source_path_as_output(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    source = tmp_path / "source.mp4"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_video(source)
+    run = window.findChild(QPushButton, "run-button")
+    output = window.findChild(QLineEdit, "output")
+    assert run is not None
+    assert output is not None
+
+    output.setText(str(source))
+
+    assert run.isEnabled() is False
+
+
+def test_run_rejects_existing_non_directory_output(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    output_file = tmp_path / "output.txt"
+    output_file.write_text("occupied", encoding="utf-8")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    run = window.findChild(QPushButton, "run-button")
+    output = window.findChild(QLineEdit, "output")
+    assert run is not None
+    assert output is not None
+
+    output.setText(str(output_file))
+
+    assert run.isEnabled() is False
+
+
+def test_run_rejects_nonempty_output_directory(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    output_dir = tmp_path / "occupied"
+    output_dir.mkdir()
+    (output_dir / "existing.json").write_text("{}", encoding="utf-8")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    run = window.findChild(QPushButton, "run-button")
+    output = window.findChild(QLineEdit, "output")
+    assert run is not None
+    assert output is not None
+
+    output.setText(str(output_dir))
+
+    assert run.isEnabled() is False
+
+
+def test_run_accepts_existing_empty_output_directory(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    output_dir = tmp_path / "empty"
+    output_dir.mkdir()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    run = window.findChild(QPushButton, "run-button")
+    output = window.findChild(QLineEdit, "output")
+    assert run is not None
+    assert output is not None
+
+    output.setText(str(output_dir))
+
+    assert run.isEnabled() is True
 
 
 def test_file_menu_opens_selected_video(

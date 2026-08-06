@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from edge_perception.config import RunConfig
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import detector_descriptors
 from edge_perception.gui.region_view import RegionView
+from edge_perception.runner import validate_output_directory
 from edge_perception.video import first_video_frame
 
 
@@ -60,9 +62,12 @@ class MainWindow(QMainWindow):
         self._source_dimensions_label = QLabel("—")
         self._source_dimensions_label.setObjectName("source-dimensions")
         form.addRow("Dimensions", self._source_dimensions_label)
-        form.addRow("Detector", self._detector())
-        form.addRow("Device", self._device())
-        form.addRow("Threshold", self._threshold())
+        self._detector_combo = self._detector()
+        self._device_combo = self._device()
+        self._threshold_spin = self._threshold()
+        form.addRow("Detector", self._detector_combo)
+        form.addRow("Device", self._device_combo)
+        form.addRow("Threshold", self._threshold_spin)
         self._output_line = self._output(run_dir)
         form.addRow("Output", self._output_line)
         controls_layout.addLayout(form)
@@ -83,12 +88,14 @@ class MainWindow(QMainWindow):
 
         self._output_line.textChanged.connect(self._update_control_state)
         self._region_id.textChanged.connect(self._update_control_state)
-        self._new_region_button.clicked.connect(self._add_region_from_controls)
+        self._new_region_button.clicked.connect(self._begin_region_draw)
         self._delete_region_button.clicked.connect(self._delete_selected_region)
         for spin_box in self._region_spin_boxes:
             spin_box.valueChanged.connect(self._apply_numeric_region)
         self._source_view.scene().selectionChanged.connect(self._sync_selected_region)
         self._source_view.regionsChanged.connect(self._regions_changed)
+        self._source_view.regionDrawn.connect(self._region_drawn)
+        self._clear_region_values()
         self._update_control_state()
         self.statusBar().showMessage("Ready")
 
@@ -184,30 +191,27 @@ class MainWindow(QMainWindow):
         self._region_y.setRange(0, self._source_height - 1)
         self._region_width.setRange(1, self._source_width)
         self._region_height.setRange(1, self._source_height)
-        self._region_x.setValue(0)
-        self._region_y.setValue(0)
-        self._region_width.setValue(self._source_width)
-        self._region_height.setValue(self._source_height)
         self._updating_region_controls = False
+        self._clear_region_values()
 
-    def _add_region_from_controls(self) -> None:
+    def _begin_region_draw(self) -> None:
         region_id = self._region_id.text().strip()
         if not region_id:
             return
-        region = Region(
-            region_id,
-            self._region_x.value(),
-            self._region_y.value(),
-            self._region_width.value(),
-            self._region_height.value(),
-        )
         try:
-            self._source_view.add_region(region)
+            self._source_view.begin_region_draw(region_id)
         except ValueError as error:
             self.statusBar().showMessage(str(error))
             return
-        self._source_view.select_region(region_id)
-        self.statusBar().showMessage(f"Added region {region_id}")
+        self._update_control_state()
+        self.statusBar().showMessage(f"Draw region {region_id} on the preview")
+
+    def _region_drawn(self, region: object) -> None:
+        if isinstance(region, Region):
+            self.statusBar().showMessage(f"Added region {region.region_id}")
+        else:
+            self.statusBar().showMessage("Region draw had zero area")
+        self._update_control_state()
 
     def _delete_selected_region(self) -> None:
         selected = self._source_view.selected_region()
@@ -240,6 +244,8 @@ class MainWindow(QMainWindow):
         if selected is not None:
             self._region_id.setText(selected.region_id)
             self._set_region_values(selected)
+        else:
+            self._clear_region_values()
         self._update_control_state()
 
     def _set_region_values(self, region: Region) -> None:
@@ -250,15 +256,47 @@ class MainWindow(QMainWindow):
         self._region_height.setValue(region.height)
         self._updating_region_controls = False
 
+    def _clear_region_values(self) -> None:
+        self._updating_region_controls = True
+        for spin_box in self._region_spin_boxes:
+            spin_box.clear()
+            spin_box.setEnabled(False)
+        self._updating_region_controls = False
+
     def _update_control_state(self) -> None:
         has_source = self._source_path is not None
+        selected = self._source_view.selected_region()
         for spin_box in self._region_spin_boxes:
-            spin_box.setEnabled(has_source)
-        self._new_region_button.setEnabled(has_source and bool(self._region_id.text().strip()))
-        self._delete_region_button.setEnabled(
-            has_source and self._source_view.selected_region() is not None
+            spin_box.setEnabled(selected is not None)
+        self._new_region_button.setEnabled(
+            has_source
+            and bool(self._region_id.text().strip())
+            and not self._source_view.is_drawing_region()
         )
-        self._run_button.setEnabled(has_source and bool(self._output_line.text().strip()))
+        self._delete_region_button.setEnabled(
+            has_source and selected is not None
+        )
+        self._run_button.setEnabled(self._current_run_config() is not None)
+
+    def _current_run_config(self) -> RunConfig | None:
+        if self._source_path is None or not self._output_line.text().strip():
+            return None
+        try:
+            config = RunConfig(
+                input_path=self._source_path,
+                output_dir=Path(self._output_line.text().strip()),
+                regions=self._source_view.regions(),
+                threshold=self._threshold_spin.value(),
+                max_frames=None,
+                warmup_runs=0,
+                annotate_every=0,
+                detector_id=str(self._detector_combo.currentData()),
+                device=self._device_combo.currentText().lower(),
+            )
+            validate_output_directory(config.output_dir)
+        except (OSError, TypeError, ValueError):
+            return None
+        return config
 
     @staticmethod
     def _source_mode() -> QComboBox:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem
 from pytestqt.qtbot import QtBot
 
@@ -86,6 +86,25 @@ def test_moving_region_clamps_to_source_bounds(qtbot: QtBot) -> None:
     assert _source_rect(item) == QRectF(160.0, 80.0, 40.0, 20.0)
     assert view.regions() == (Region("roi", 160, 80, 40, 20),)
     assert changed.args == [(Region("roi", 160, 80, 40, 20),)]
+
+
+def test_viewport_mouse_selects_and_moves_region(qtbot: QtBot) -> None:
+    view = RegionView()
+    qtbot.addWidget(view)
+    view.resize(300, 200)
+    view.show()
+    view.set_rgb_frame(np.zeros((100, 200, 3), dtype=np.uint8))
+    view.resetTransform()
+    view.add_region(Region("roi", 10, 20, 40, 20))
+    start = view.mapFromScene(QPointF(30.0, 30.0))
+    finish = view.mapFromScene(QPointF(190.0, 95.0))
+
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(view.viewport(), pos=finish)
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=finish)
+
+    assert view.selected_region() == Region("roi", 160, 80, 40, 20)
+    assert _source_rect(_region_item(view, "roi")) == QRectF(160.0, 80.0, 40.0, 20.0)
 
 
 def test_delete_removes_selected_region(qtbot: QtBot) -> None:

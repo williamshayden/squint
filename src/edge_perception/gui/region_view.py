@@ -7,7 +7,7 @@ from typing import Any, override
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap, QResizeEvent
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPixmapItem,
@@ -66,6 +66,7 @@ class RegionView(QGraphicsView):
     """Display one RGB frame and editable overlays in source-pixel coordinates."""
 
     regionsChanged = Signal(object)
+    regionDrawn = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -75,6 +76,9 @@ class RegionView(QGraphicsView):
         self._image: QImage | None = None
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._region_items: list[_RegionItem] = []
+        self._drawing_region_id: str | None = None
+        self._draw_origin: QPointF | None = None
+        self._draw_item: QGraphicsRectItem | None = None
 
     def set_rgb_frame(self, image: np.ndarray) -> None:
         """Display an RGB array after copying its pixel storage into Qt."""
@@ -84,27 +88,31 @@ class RegionView(QGraphicsView):
             raise ValueError("RGB frame must have shape (height, width, 3) and dtype uint8")
 
         rgb = np.ascontiguousarray(image)
-        self._image = QImage(
+        owned_image = QImage(
             rgb.data,
             width,
             height,
             int(rgb.strides[0]),
             QImage.Format.Format_RGB888,
         ).copy()
-        self._source_scene.clear()
         self._region_items.clear()
+        self._pixmap_item = None
+        self._reset_draw_state(remove_item=False)
+        previous_signal_state = self._source_scene.blockSignals(True)
+        try:
+            self._source_scene.clear()
+        finally:
+            self._source_scene.blockSignals(previous_signal_state)
+        self._image = owned_image
         self._pixmap_item = self._source_scene.addPixmap(QPixmap.fromImage(self._image))
         self._source_scene.setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
         self._fit_source()
+        self.regionsChanged.emit(())
 
     def add_region(self, region: Region) -> None:
         """Add a named source-pixel rectangle in insertion order."""
 
-        region_ids = {existing.region_id for existing in self.regions()}
-        if region.region_id == "full-frame":
-            raise ValueError("full-frame is a reserved region ID")
-        if region.region_id in region_ids:
-            raise ValueError("region IDs must be unique")
+        self._validate_region_id(region.region_id)
         bounds = self._source_scene.sceneRect()
         if (
             bounds.isEmpty()
@@ -119,6 +127,22 @@ class RegionView(QGraphicsView):
         self._source_scene.addItem(item)
         self._region_items.append(item)
         self.regionsChanged.emit(self.regions())
+
+    def begin_region_draw(self, region_id: str) -> None:
+        """Enter crosshair draw mode for one validated region ID."""
+
+        self._validate_region_id(region_id)
+        if self._source_scene.sceneRect().isEmpty():
+            raise ValueError("a source frame must be loaded before drawing a region")
+        self._reset_draw_state(remove_item=True)
+        self._drawing_region_id = region_id
+        self._source_scene.clearSelection()
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+    def is_drawing_region(self) -> bool:
+        """Return whether the next viewport drag will create a region."""
+
+        return self._drawing_region_id is not None
 
     def regions(self) -> tuple[Region, ...]:
         """Return immutable source-pixel regions in insertion order."""
@@ -205,6 +229,48 @@ class RegionView(QGraphicsView):
         )
 
     @override
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._drawing_region_id is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._draw_origin = self.mapToScene(event.position().toPoint())
+            self._draw_item = self._source_scene.addRect(
+                QRectF(self._draw_origin, self._draw_origin)
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    @override
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._draw_origin is not None and self._draw_item is not None:
+            current = self.mapToScene(event.position().toPoint())
+            self._draw_item.setRect(QRectF(self._draw_origin, current).normalized())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    @override
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._drawing_region_id is not None
+            and self._draw_origin is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            region_id = self._drawing_region_id
+            current = self.mapToScene(event.position().toPoint())
+            region = self.region_from_scene_rect(region_id, QRectF(self._draw_origin, current))
+            self._reset_draw_state(remove_item=True)
+            if region is not None:
+                self.add_region(region)
+                self.select_region(region.region_id)
+            self.regionDrawn.emit(region)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    @override
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._fit_source()
@@ -231,3 +297,18 @@ class RegionView(QGraphicsView):
             return next(item for item in self._region_items if item.data(0) == region_id)
         except StopIteration as error:
             raise KeyError(region_id) from error
+
+    def _validate_region_id(self, region_id: str) -> None:
+        if region_id == "full-frame":
+            raise ValueError("full-frame is a reserved region ID")
+        if any(existing.region_id == region_id for existing in self.regions()):
+            raise ValueError("region IDs must be unique")
+
+    def _reset_draw_state(self, *, remove_item: bool) -> None:
+        draw_item = self._draw_item
+        self._draw_item = None
+        self._draw_origin = None
+        self._drawing_region_id = None
+        self.viewport().unsetCursor()
+        if remove_item and draw_item is not None and draw_item.scene() is self._source_scene:
+            self._source_scene.removeItem(draw_item)
