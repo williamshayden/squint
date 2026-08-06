@@ -1,6 +1,7 @@
 .venv/
 .tools/
 .worktrees/
+.superpowers/brainstorm/
 .superpowers/sdd/
 __pycache__/
 *.py[cod]
