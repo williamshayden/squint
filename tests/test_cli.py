@@ -41,6 +41,7 @@ def test_run_command_parses_declared_crops_and_passes_threshold_once(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     output_dir = tmp_path / "run"
+    output_dir.mkdir()
     load_calls = _install_fake_dfine(monkeypatch, fake_detector)
     runner_calls: list[tuple[object, object]] = []
 
@@ -152,6 +153,41 @@ def test_run_command_rejects_output_equal_to_input(
 
     assert exit_code != 0
     assert capsys.readouterr().err.strip().splitlines() == ["error: output must differ from input"]
+
+
+def test_run_command_rejects_nonempty_output_before_loading_detector(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_dir = tmp_path / "existing-run"
+    output_dir.mkdir()
+    marker = output_dir / "keep-me.txt"
+    marker.write_text("user data", encoding="utf-8")
+    load_calls = _install_fake_dfine(monkeypatch, fake_detector)
+
+    exit_code = cli.main(
+        [
+            "run",
+            str(video_path),
+            "--output",
+            str(output_dir),
+            "--warmup-runs",
+            "0",
+            "--max-frames",
+            "0",
+        ]
+    )
+
+    assert exit_code != 0
+    assert load_calls == []
+    assert capsys.readouterr().err.strip().splitlines() == [
+        f"error: output directory must be empty: {output_dir.resolve()}"
+    ]
+    assert marker.read_text(encoding="utf-8") == "user data"
+    assert list(output_dir.iterdir()) == [marker]
 
 
 def test_run_command_reports_unavailable_requested_cuda_without_traceback(

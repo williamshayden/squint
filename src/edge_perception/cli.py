@@ -11,7 +11,7 @@ from typing import NoReturn, cast
 
 from edge_perception.compare import compare_runs
 from edge_perception.contracts import Region
-from edge_perception.runner import RunConfig, run_checkpoint
+from edge_perception.runner import RunConfig, run_checkpoint, validate_output_directory
 
 
 class _CliError(ValueError):
@@ -114,8 +114,7 @@ def _run_command(args: argparse.Namespace) -> int:
         raise _CliError(f"input video does not exist: {input_path}")
     if output_dir == input_path:
         raise _CliError("output must differ from input")
-    if output_dir.exists() and not output_dir.is_dir():
-        raise _CliError(f"output is not a directory: {output_dir}")
+    validate_output_directory(output_dir)
     region_ids = [region.region_id for region in regions]
     duplicates = sorted({region_id for region_id in region_ids if region_ids.count(region_id) > 1})
     if duplicates:

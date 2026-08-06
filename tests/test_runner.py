@@ -21,6 +21,7 @@ def test_run_checkpoint_processes_full_frame_then_declared_crops(
     fake_detector: FakeDetector,
 ) -> None:
     run_dir = tmp_path / "run"
+    run_dir.mkdir()
     config = RunConfig(
         input_path=video_path,
         output_dir=run_dir,
@@ -116,6 +117,70 @@ def test_run_checkpoint_finalizes_outputs_and_telemetry_when_detector_fails(
     for stream_name in ("inferences.jsonl", "detections.jsonl", "hardware.jsonl"):
         with (run_dir / stream_name).open("a", encoding="utf-8") as stream:
             stream.write("")
+
+
+def test_run_checkpoint_finalizes_failed_artifacts_when_warmup_fails(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    run_dir = tmp_path / "failed-warmup"
+
+    def fail_warmup(_image: object, _runs: int) -> None:
+        raise RuntimeError("warmup failed")
+
+    fake_detector.warmup = fail_warmup  # type: ignore[method-assign]
+    config = RunConfig(
+        input_path=video_path,
+        output_dir=run_dir,
+        regions=(Region("right", 100, 20, 80, 60),),
+        threshold=0.3,
+        max_frames=1,
+        warmup_runs=1,
+        annotate_every=0,
+    )
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        run_checkpoint(config, fake_detector)
+
+    assert (run_dir / "manifest.json").is_file()
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert summary["error"] == "RuntimeError: warmup failed"
+    assert summary["frames_processed"] == 0
+    assert summary["inference_count"] == 0
+    assert _json_lines(run_dir / "inferences.jsonl") == []
+    assert _json_lines(run_dir / "detections.jsonl") == []
+    assert _json_lines(run_dir / "hardware.jsonl") == []
+    video_path.rename(tmp_path / "preview-was-closed.mp4")
+
+
+def test_run_checkpoint_rejects_nonempty_output_before_detector_work(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    run_dir = tmp_path / "existing-run"
+    run_dir.mkdir()
+    marker = run_dir / "keep-me.txt"
+    marker.write_text("user data", encoding="utf-8")
+    config = RunConfig(
+        input_path=video_path,
+        output_dir=run_dir,
+        regions=(),
+        threshold=0.3,
+        max_frames=0,
+        warmup_runs=0,
+        annotate_every=0,
+    )
+
+    with pytest.raises(ValueError, match="output directory must be empty"):
+        run_checkpoint(config, fake_detector)
+
+    assert fake_detector.warmup_calls == []
+    assert fake_detector.predict_batch_sizes == []
+    assert marker.read_text(encoding="utf-8") == "user data"
+    assert list(run_dir.iterdir()) == [marker]
 
 
 @pytest.mark.parametrize("threshold", [-0.01, 1.01, float("nan")])

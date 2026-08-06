@@ -5,9 +5,14 @@ from __future__ import annotations
 import json
 from math import isfinite
 from pathlib import Path
+from re import fullmatch
 from typing import cast
 
 type SemanticKey = tuple[str, str, int, int, str | None]
+
+
+class ComparisonError(ValueError):
+    """A controlled validation failure for malformed comparison artifacts."""
 
 
 def _json_object(path: Path) -> dict[str, object]:
@@ -16,7 +21,7 @@ def _json_object(path: Path) -> dict[str, object]:
     except FileNotFoundError:
         raise FileNotFoundError(f"run artifact does not exist: {path}") from None
     if not isinstance(value, dict):
-        raise TypeError(f"run artifact must contain a JSON object: {path}")
+        raise ComparisonError(f"run artifact must contain a JSON object: {path}")
     return cast(dict[str, object], value)
 
 
@@ -37,23 +42,93 @@ def _json_lines(path: Path) -> list[dict[str, object]]:
 
 
 def _mapping(record: dict[str, object], field: str) -> dict[str, object]:
-    value = record.get(field)
+    if field not in record:
+        raise ValueError(f"manifest is missing required field {field}")
+    value = record[field]
     if not isinstance(value, dict):
-        raise TypeError(f"manifest field {field!r} must be an object")
+        raise ComparisonError(f"manifest field {field!r} must be an object")
     return cast(dict[str, object], value)
+
+
+def _required_string(record: dict[str, object], field: str, context: str) -> str:
+    if field not in record:
+        raise ValueError(f"{context} is missing required field {field}")
+    value = record[field]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context}.{field} must be a non-empty string")
+    return value
+
+
+def _required_integer(record: dict[str, object], field: str, context: str) -> int:
+    if field not in record:
+        raise ValueError(f"{context} is missing required field {field}")
+    value = record[field]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ComparisonError(f"{context}.{field} must be an integer")
+    return value
+
+
+def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
+    if "regions" not in configuration:
+        raise ValueError("configuration is missing required field regions")
+    value = configuration["regions"]
+    if not isinstance(value, list):
+        raise ComparisonError("configuration.regions must be a list")
+    normalized: list[dict[str, str | int]] = []
+    region_ids: set[str] = set()
+    required_fields = {"region_id", "x", "y", "width", "height"}
+    for index, item in enumerate(value):
+        context = f"configuration.regions[{index}]"
+        if not isinstance(item, dict):
+            raise ComparisonError(f"{context} must be an object")
+        region = cast(dict[str, object], item)
+        if set(region) != required_fields:
+            raise ValueError(f"{context} must contain exactly {sorted(required_fields)}")
+        region_id = _required_string(region, "region_id", context)
+        x = _required_integer(region, "x", context)
+        y = _required_integer(region, "y", context)
+        width = _required_integer(region, "width", context)
+        height = _required_integer(region, "height", context)
+        if x < 0 or y < 0:
+            raise ValueError(f"{context} origin must not be negative")
+        if width <= 0 or height <= 0:
+            raise ValueError(f"{context} width and height must be positive")
+        if region_id in region_ids:
+            raise ValueError(f"configuration.regions has duplicate region_id {region_id!r}")
+        region_ids.add(region_id)
+        normalized.append(
+            {"region_id": region_id, "x": x, "y": y, "width": width, "height": height}
+        )
+    return normalized
 
 
 def _manifest_fields(manifest: dict[str, object]) -> tuple[tuple[str, object], ...]:
     configuration = _mapping(manifest, "configuration")
     source_video = _mapping(manifest, "source_video")
     detector = _mapping(manifest, "detector")
+    schema_version = _required_string(manifest, "schema_version", "manifest")
+    model_id = _required_string(detector, "model_id", "detector")
+    revision = _required_string(detector, "revision", "detector")
+
+    if "threshold" not in configuration:
+        raise ValueError("configuration is missing required field threshold")
+    raw_threshold = configuration["threshold"]
+    if not isinstance(raw_threshold, (int, float)) or isinstance(raw_threshold, bool):
+        raise ComparisonError("configuration.threshold must be a number")
+    threshold = float(raw_threshold)
+    if not isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("configuration.threshold must be between 0 and 1")
+
+    source_sha256 = _required_string(source_video, "sha256", "source_video")
+    if fullmatch(r"[0-9a-fA-F]{64}", source_sha256) is None:
+        raise ValueError("source_video.sha256 must be 64 hexadecimal characters")
     return (
-        ("schema_version", manifest.get("schema_version")),
-        ("model_id", detector.get("model_id")),
-        ("revision", detector.get("revision")),
-        ("threshold", configuration.get("threshold")),
-        ("source_video_sha256", source_video.get("sha256")),
-        ("regions", configuration.get("regions")),
+        ("schema_version", schema_version),
+        ("model_id", model_id),
+        ("revision", revision),
+        ("threshold", threshold),
+        ("source_video_sha256", source_sha256),
+        ("regions", _regions(configuration)),
     )
 
 
@@ -164,20 +239,21 @@ def compare_runs(
                     "right": right_value,
                 }
 
-    shared_keys = set(left_index) & set(right_index)
-    unmatched_keys = set(left_index) ^ set(right_index)
-    mismatch_count += len(unmatched_keys)
-    if first_mismatch is None and unmatched_keys:
-        key = min(unmatched_keys, key=_sort_key)
-        first_mismatch = {
-            "kind": "semantic_key",
-            "key": _key_json(key),
-            "left_present": key in left_index,
-            "right_present": key in right_index,
-        }
-
     matched_detection_count = 0
-    for key in sorted(shared_keys, key=_sort_key):
+    all_keys = sorted(set(left_index) | set(right_index), key=_sort_key)
+    for key in all_keys:
+        left_present = key in left_index
+        right_present = key in right_index
+        if not left_present or not right_present:
+            mismatch_count += 1
+            if first_mismatch is None:
+                first_mismatch = {
+                    "kind": "semantic_key",
+                    "key": _key_json(key),
+                    "left_present": left_present,
+                    "right_present": right_present,
+                }
+            continue
         left_record = left_index[key]
         right_record = right_index[key]
         left_box = _box(left_record)

@@ -94,10 +94,21 @@ def _video_iterator(path: Path) -> Generator[DecodedFrame, None, None]:
     return cast(Generator[DecodedFrame, None, None], iter_video(path))
 
 
-def _preview_and_warm_up(
+def validate_output_directory(output_dir: Path) -> None:
+    """Allow absent or empty run directories while preserving existing contents."""
+
+    resolved = Path(output_dir).resolve()
+    if not resolved.exists():
+        return
+    if not resolved.is_dir():
+        raise ValueError(f"output is not a directory: {resolved}")
+    if any(resolved.iterdir()):
+        raise ValueError(f"output directory must be empty: {resolved}")
+
+
+def _preview_and_validate(
     config: RunConfig,
-    detector: Detector,
-) -> tuple[DecodedFrame, Region]:
+) -> tuple[DecodedFrame, Region, Generator[DecodedFrame, None, None]]:
     preview = _video_iterator(config.input_path)
     try:
         try:
@@ -109,19 +120,22 @@ def _preview_and_warm_up(
         full_region = full_frame_region(frame_width, frame_height)
         for region in config.regions:
             validate_region(region, frame_width, frame_height)
-
-        warmed_shapes: set[tuple[int, int]] = set()
-        warmup_images = [first_frame.image]
-        warmup_images.extend(crop_region(first_frame.image, region) for region in config.regions)
-        for image in warmup_images:
-            shape = (int(image.shape[0]), int(image.shape[1]))
-            if shape in warmed_shapes:
-                continue
-            warmed_shapes.add(shape)
-            detector.warmup(image, config.warmup_runs)
-        return first_frame, full_region
-    finally:
+        return first_frame, full_region, preview
+    except BaseException:
         preview.close()
+        raise
+
+
+def _warm_up(config: RunConfig, detector: Detector, first_frame: DecodedFrame) -> None:
+    warmed_shapes: set[tuple[int, int]] = set()
+    warmup_images = [first_frame.image]
+    warmup_images.extend(crop_region(first_frame.image, region) for region in config.regions)
+    for image in warmup_images:
+        shape = (int(image.shape[0]), int(image.shape[1]))
+        if shape in warmed_shapes:
+            continue
+        warmed_shapes.add(shape)
+        detector.warmup(image, config.warmup_runs)
 
 
 def _timing_definitions() -> dict[str, str]:
@@ -224,9 +238,8 @@ def run_checkpoint(config: RunConfig, detector: Detector) -> dict[str, object]:
 
     if not config.input_path.is_file():
         raise FileNotFoundError(f"input video does not exist: {config.input_path}")
-    first_frame, full_region = _preview_and_warm_up(config, detector)
-    manifest = _manifest(config, detector, first_frame, full_region)
-    run_id = uuid4().hex
+    validate_output_directory(config.output_dir)
+    first_frame, full_region, preview = _preview_and_validate(config)
 
     frames_processed = 0
     inference_count = 0
@@ -239,170 +252,183 @@ def run_checkpoint(config: RunConfig, detector: Detector) -> dict[str, object]:
     summary: dict[str, object] = {}
     monitor: TelemetryMonitor | None = None
 
-    with RunOutputs(config.output_dir, run_id=run_id, manifest=manifest) as outputs:
-        try:
-            monitor = TelemetryMonitor()
-            with monitor:
-                measured = _video_iterator(config.input_path)
+    try:
+        manifest = _manifest(config, detector, first_frame, full_region)
+        run_id = uuid4().hex
+        with RunOutputs(config.output_dir, run_id=run_id, manifest=manifest) as outputs:
+            try:
                 try:
-                    while config.max_frames is None or frames_processed < config.max_frames:
-                        frame_pipeline_start_ns = perf_counter_ns()
-                        decode_start_ns = frame_pipeline_start_ns
-                        try:
-                            frame = next(measured)
-                        except StopIteration:
-                            break
-                        decode_end_ns = perf_counter_ns()
-                        stage_values["decode"].append(_milliseconds(decode_start_ns, decode_end_ns))
-
-                        frame_height, frame_width, _channels = frame.image.shape
-                        if (
-                            frame_width != full_region.width
-                            or frame_height != full_region.height
-                        ):
-                            raise ValueError("video frame dimensions changed during checkpoint")
-
-                        frame_id = f"frame-{frame.frame_index:06d}"
-                        frame_detections: list[Detection] = []
-                        serialization_ns = 0
-                        execution_regions = (full_region, *config.regions)
-
-                        for region_index, region in enumerate(execution_regions):
-                            region_pipeline_start_ns = perf_counter_ns()
-                            if region_index == 0:
-                                image = frame.image
-                            else:
-                                crop_start_ns = perf_counter_ns()
-                                image = crop_region(frame.image, region)
-                                crop_end_ns = perf_counter_ns()
-                                stage_values["crop"].append(
-                                    _milliseconds(crop_start_ns, crop_end_ns)
-                                )
-
-                            prediction = detector.predict((image,))
-                            if len(prediction.detections) != 1:
-                                raise RuntimeError(
-                                    "detector prediction cardinality mismatch: "
-                                    f"expected 1, got {len(prediction.detections)}"
-                                )
-                            stage_values["detector"].append(prediction.timing.total_ms)
-
-                            mapping_start_ns = perf_counter_ns()
-                            mapped = tuple(
-                                map_detection_to_source(
-                                    detection,
-                                    region,
-                                    frame_width,
-                                    frame_height,
-                                )
-                                for detection in prediction.detections[0]
-                            )
-                            mapping_end_ns = perf_counter_ns()
-                            stage_values["coordinate_mapping"].append(
-                                _milliseconds(mapping_start_ns, mapping_end_ns)
-                            )
-                            region_latency = _milliseconds(
-                                region_pipeline_start_ns,
-                                mapping_end_ns,
-                            )
-                            if region_index == 0:
-                                full_frame_latencies.append(region_latency)
-                            else:
-                                crop_latencies.append(region_latency)
-
-                            inference_id = (
-                                f"inference-{frame.frame_index:06d}-{region_index:03d}"
-                            )
-                            serialize_start_ns = perf_counter_ns()
-                            outputs.write_inference(
-                                {
-                                    "frame_id": frame_id,
-                                    "frame_index": frame.frame_index,
-                                    "source_time_ms": frame.source_time_ms,
-                                    "inference_id": inference_id,
-                                    "region_id": region.region_id,
-                                    "region": region.to_dict(),
-                                    "input_shape": [int(value) for value in image.shape],
-                                    "frame_decode_ms": _milliseconds(
-                                        decode_start_ns,
-                                        decode_end_ns,
-                                    ),
-                                    "crop_ms": (
-                                        0.0
-                                        if region_index == 0
-                                        else stage_values["crop"][-1]
-                                    ),
-                                    "coordinate_mapping_ms": _milliseconds(
-                                        mapping_start_ns,
-                                        mapping_end_ns,
-                                    ),
-                                    "region_pipeline_ms": region_latency,
-                                    "detector_timing": prediction.timing.to_dict(),
-                                }
-                            )
-                            outputs.write_detections(
-                                frame_id=frame_id,
-                                inference_id=inference_id,
-                                region_id=region.region_id,
-                                detections=mapped,
-                            )
-                            serialization_ns += perf_counter_ns() - serialize_start_ns
-                            inference_count += 1
-                            frame_detections.extend(mapped)
-
-                        if (
-                            config.annotate_every > 0
-                            and frame.frame_index % config.annotate_every == 0
-                        ):
-                            annotation_start_ns = perf_counter_ns()
-                            outputs.annotate(
-                                frame.frame_index,
-                                frame.image,
-                                regions=execution_regions,
-                                detections=frame_detections,
-                            )
-                            annotation_end_ns = perf_counter_ns()
-                            stage_values["annotation"].append(
-                                _milliseconds(annotation_start_ns, annotation_end_ns)
-                            )
-                            annotated_frame_count += 1
-
-                        flush_start_ns = perf_counter_ns()
-                        outputs.flush_frame()
-                        serialization_ns += perf_counter_ns() - flush_start_ns
-                        stage_values["serialization"].append(serialization_ns / 1_000_000.0)
-                        frame_pipeline_end_ns = perf_counter_ns()
-                        complete_frame_latency = _milliseconds(
-                            frame_pipeline_start_ns,
-                            frame_pipeline_end_ns,
-                        )
-                        stage_values["frame_pipeline"].append(complete_frame_latency)
-                        complete_frame_latencies.append(complete_frame_latency)
-                        frames_processed += 1
+                    _warm_up(config, detector, first_frame)
                 finally:
-                    measured.close()
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            if monitor is None:
-                hardware_peaks = _empty_hardware_peaks()
-            else:
-                for sample in monitor.samples:
-                    outputs.write_hardware(sample.to_dict())
-                hardware_peaks = monitor.peaks()
-            summary = _summary(
-                failure=failure,
-                frames_processed=frames_processed,
-                inference_count=inference_count,
-                annotated_frame_count=annotated_frame_count,
-                full_frame_latencies=full_frame_latencies,
-                crop_latencies=crop_latencies,
-                complete_frame_latencies=complete_frame_latencies,
-                stage_values=stage_values,
-                hardware_peaks=hardware_peaks,
-                peak_device_memory_bytes=detector.peak_device_memory_bytes(),
-            )
-            outputs.write_summary(summary)
+                    preview.close()
+                monitor = TelemetryMonitor()
+                with monitor:
+                    measured = _video_iterator(config.input_path)
+                    try:
+                        while config.max_frames is None or frames_processed < config.max_frames:
+                            frame_pipeline_start_ns = perf_counter_ns()
+                            decode_start_ns = frame_pipeline_start_ns
+                            try:
+                                frame = next(measured)
+                            except StopIteration:
+                                break
+                            decode_end_ns = perf_counter_ns()
+                            stage_values["decode"].append(
+                                _milliseconds(decode_start_ns, decode_end_ns)
+                            )
+
+                            frame_height, frame_width, _channels = frame.image.shape
+                            if (
+                                frame_width != full_region.width
+                                or frame_height != full_region.height
+                            ):
+                                raise ValueError("video frame dimensions changed during checkpoint")
+
+                            frame_id = f"frame-{frame.frame_index:06d}"
+                            frame_detections: list[Detection] = []
+                            serialization_ns = 0
+                            execution_regions = (full_region, *config.regions)
+
+                            for region_index, region in enumerate(execution_regions):
+                                region_pipeline_start_ns = perf_counter_ns()
+                                if region_index == 0:
+                                    image = frame.image
+                                else:
+                                    crop_start_ns = perf_counter_ns()
+                                    image = crop_region(frame.image, region)
+                                    crop_end_ns = perf_counter_ns()
+                                    stage_values["crop"].append(
+                                        _milliseconds(crop_start_ns, crop_end_ns)
+                                    )
+
+                                prediction = detector.predict((image,))
+                                if len(prediction.detections) != 1:
+                                    raise RuntimeError(
+                                        "detector prediction cardinality mismatch: "
+                                        f"expected 1, got {len(prediction.detections)}"
+                                    )
+                                stage_values["detector"].append(prediction.timing.total_ms)
+
+                                mapping_start_ns = perf_counter_ns()
+                                mapped = tuple(
+                                    map_detection_to_source(
+                                        detection,
+                                        region,
+                                        frame_width,
+                                        frame_height,
+                                    )
+                                    for detection in prediction.detections[0]
+                                )
+                                mapping_end_ns = perf_counter_ns()
+                                stage_values["coordinate_mapping"].append(
+                                    _milliseconds(mapping_start_ns, mapping_end_ns)
+                                )
+                                region_latency = _milliseconds(
+                                    region_pipeline_start_ns,
+                                    mapping_end_ns,
+                                )
+                                if region_index == 0:
+                                    full_frame_latencies.append(region_latency)
+                                else:
+                                    crop_latencies.append(region_latency)
+
+                                inference_id = (
+                                    f"inference-{frame.frame_index:06d}-{region_index:03d}"
+                                )
+                                serialize_start_ns = perf_counter_ns()
+                                outputs.write_inference(
+                                    {
+                                        "frame_id": frame_id,
+                                        "frame_index": frame.frame_index,
+                                        "source_time_ms": frame.source_time_ms,
+                                        "inference_id": inference_id,
+                                        "region_id": region.region_id,
+                                        "region": region.to_dict(),
+                                        "input_shape": [int(value) for value in image.shape],
+                                        "frame_decode_ms": _milliseconds(
+                                            decode_start_ns,
+                                            decode_end_ns,
+                                        ),
+                                        "crop_ms": (
+                                            0.0
+                                            if region_index == 0
+                                            else stage_values["crop"][-1]
+                                        ),
+                                        "coordinate_mapping_ms": _milliseconds(
+                                            mapping_start_ns,
+                                            mapping_end_ns,
+                                        ),
+                                        "region_pipeline_ms": region_latency,
+                                        "detector_timing": prediction.timing.to_dict(),
+                                    }
+                                )
+                                outputs.write_detections(
+                                    frame_id=frame_id,
+                                    inference_id=inference_id,
+                                    region_id=region.region_id,
+                                    detections=mapped,
+                                )
+                                serialization_ns += perf_counter_ns() - serialize_start_ns
+                                inference_count += 1
+                                frame_detections.extend(mapped)
+
+                            if (
+                                config.annotate_every > 0
+                                and frame.frame_index % config.annotate_every == 0
+                            ):
+                                annotation_start_ns = perf_counter_ns()
+                                outputs.annotate(
+                                    frame.frame_index,
+                                    frame.image,
+                                    regions=execution_regions,
+                                    detections=frame_detections,
+                                )
+                                annotation_end_ns = perf_counter_ns()
+                                stage_values["annotation"].append(
+                                    _milliseconds(annotation_start_ns, annotation_end_ns)
+                                )
+                                annotated_frame_count += 1
+
+                            flush_start_ns = perf_counter_ns()
+                            outputs.flush_frame()
+                            serialization_ns += perf_counter_ns() - flush_start_ns
+                            stage_values["serialization"].append(
+                                serialization_ns / 1_000_000.0
+                            )
+                            frame_pipeline_end_ns = perf_counter_ns()
+                            complete_frame_latency = _milliseconds(
+                                frame_pipeline_start_ns,
+                                frame_pipeline_end_ns,
+                            )
+                            stage_values["frame_pipeline"].append(complete_frame_latency)
+                            complete_frame_latencies.append(complete_frame_latency)
+                            frames_processed += 1
+                    finally:
+                        measured.close()
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                if monitor is None:
+                    hardware_peaks = _empty_hardware_peaks()
+                else:
+                    for sample in monitor.samples:
+                        outputs.write_hardware(sample.to_dict())
+                    hardware_peaks = monitor.peaks()
+                summary = _summary(
+                    failure=failure,
+                    frames_processed=frames_processed,
+                    inference_count=inference_count,
+                    annotated_frame_count=annotated_frame_count,
+                    full_frame_latencies=full_frame_latencies,
+                    crop_latencies=crop_latencies,
+                    complete_frame_latencies=complete_frame_latencies,
+                    stage_values=stage_values,
+                    hardware_peaks=hardware_peaks,
+                    peak_device_memory_bytes=detector.peak_device_memory_bytes(),
+                )
+                outputs.write_summary(summary)
+    finally:
+        preview.close()
 
     return summary
