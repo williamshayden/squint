@@ -93,8 +93,14 @@ class MainWindow(QMainWindow):
         self._run_state = RunState.NOT_STARTED
         self._preview_source_snapshot: _SourceSnapshot | None = None
         self._preview_attempt_pending = False
+        self._preview_attempt_current = False
+        self._preview_attempt_committed = False
         self._preview_start_call_active = False
         self._preview_cleanup_active = False
+        self._cleanup_signal_messages: list[str] = []
+        self._backend_cleanup_pending = False
+        self._backend_cleanup_message: str | None = None
+        self._recording_attempt_current = False
         self._updating_region_controls = False
         self._close_decision = close_decision
         self._exit_after_run = False
@@ -218,12 +224,18 @@ class MainWindow(QMainWindow):
 
         if self.runController.is_active:
             raise RuntimeError("cannot replace source while a run is active")
+        if self._backend_cleanup_pending:
+            raise RuntimeError("cannot replace source while camera cleanup is pending")
         if self._camera_recording_in_progress():
             raise RuntimeError("cannot replace source while camera recording is active")
         source_path = Path(path)
         frame = first_video_frame(source_path)
         if self._preview_active and self._capture_controller is not None:
-            self._capture_controller.stop_preview()
+            try:
+                self._capture_controller.stop_preview()
+            except (OSError, RuntimeError) as error:
+                message = self._mark_backend_cleanup_pending(str(error))
+                raise RuntimeError(message) from error
         self._source_mode_combo.setCurrentText("Video file")
         self._apply_video_frame(source_path, frame, capture=None)
 
@@ -367,6 +379,15 @@ class MainWindow(QMainWindow):
 
     def _source_mode_changed(self, source_mode: str) -> None:
         camera_mode = source_mode == "Camera"
+        if not camera_mode and self._backend_cleanup_pending:
+            self._source_mode_combo.blockSignals(True)
+            self._source_mode_combo.setCurrentText("Camera")
+            self._source_mode_combo.blockSignals(False)
+            self.statusBar().showMessage(
+                "Camera cleanup must complete before replacing the source"
+            )
+            self._update_control_state()
+            return
         if not camera_mode and self._camera_recording_in_progress():
             self._source_mode_combo.blockSignals(True)
             self._source_mode_combo.setCurrentText("Camera")
@@ -381,7 +402,14 @@ class MainWindow(QMainWindow):
             self._populate_camera_devices()
         elif self._capture_controller is not None:
             if self._preview_active:
-                self._capture_controller.stop_preview()
+                try:
+                    self._capture_controller.stop_preview()
+                except (OSError, RuntimeError) as error:
+                    self._source_mode_combo.blockSignals(True)
+                    self._source_mode_combo.setCurrentText("Camera")
+                    self._source_mode_combo.blockSignals(False)
+                    self._mark_backend_cleanup_pending(str(error))
+                    return
         self._update_control_state()
 
     def _camera_recording_in_progress(self) -> bool:
@@ -461,12 +489,18 @@ class MainWindow(QMainWindow):
         )
 
     def _start_camera_preview(self) -> None:
+        if self._backend_cleanup_pending:
+            return
         controller = self._connect_capture_controller()
         request = self._current_capture_request()
         device = self._camera_combo.currentData()
         if request is None or not isinstance(device, CameraDeviceInfo):
             return
         self._acquisition_terminal = None
+        self._recording_attempt_current = False
+        self._record_start_requested = False
+        self._recording_active = False
+        self._recording_stop_requested = False
         if self._source_path is None or self._source_frame is None:
             self._preview_source_snapshot = None
         else:
@@ -477,6 +511,8 @@ class MainWindow(QMainWindow):
                 regions=self._source_view.regions(),
             )
         self._preview_attempt_pending = True
+        self._preview_attempt_current = True
+        self._preview_attempt_committed = False
         self._update_control_state()
         controller_call_attempted = False
         try:
@@ -517,6 +553,7 @@ class MainWindow(QMainWindow):
     def _fail_preview_startup(self, message: str, *, stop_controller: bool) -> None:
         if self._preview_cleanup_active:
             return
+        self._cleanup_signal_messages.clear()
         self._preview_cleanup_active = True
         context: list[str] = []
         cleanup_succeeded = True
@@ -530,6 +567,10 @@ class MainWindow(QMainWindow):
                     except Exception as error:  # noqa: BLE001 - preserve primary error
                         context.append(f"cleanup failed: {error}")
                         cleanup_succeeded = False
+            context.extend(
+                f"cleanup failed: {cleanup_message}"
+                for cleanup_message in self._cleanup_signal_messages
+            )
             if cleanup_succeeded:
                 try:
                     self._restore_preview_source()
@@ -547,10 +588,16 @@ class MainWindow(QMainWindow):
         finally:
             self._preview_source_snapshot = None
             self._preview_attempt_pending = False
+            self._preview_attempt_current = False
+            self._preview_attempt_committed = False
             self._preview_start_call_active = False
             self._preview_cleanup_active = False
+            self._cleanup_signal_messages.clear()
         if context:
             message += "; " + "; ".join(context)
+        if not cleanup_succeeded:
+            self._backend_cleanup_pending = True
+            self._backend_cleanup_message = message
         self._camera_error(message)
 
     def _clear_active_source(self) -> None:
@@ -565,10 +612,25 @@ class MainWindow(QMainWindow):
         self._clear_capture_metadata()
         self._clear_region_values()
 
+    def _mark_backend_cleanup_pending(self, message: str) -> str:
+        try:
+            self._clear_active_source()
+        except Exception as error:  # noqa: BLE001 - liveness failure must fail closed
+            message += f"; fail-closed cleanup failed: {error}"
+        self._backend_cleanup_pending = True
+        self._backend_cleanup_message = message
+        self._camera_error(message)
+        return message
+
     def _camera_preview_started(self, selected: object) -> None:
-        if not self._preview_attempt_pending or self._acquisition_terminal is not None:
-            self._source_view.cancel_video_preview()
+        if (
+            not self._preview_attempt_current
+            or not self._preview_attempt_pending
+            or self._preview_attempt_committed
+            or self._acquisition_terminal is not None
+        ):
             return
+        self._preview_attempt_committed = True
         if not isinstance(selected, CameraFormatInfo):
             self._fail_preview_startup(
                 "camera returned an invalid selected format",
@@ -604,6 +666,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Camera preview started")
 
     def _camera_preview_stopped(self) -> None:
+        if self._preview_cleanup_active:
+            self._backend_cleanup_pending = False
+            self._preview_active = False
+            self._recording_active = False
+            self._record_start_requested = False
+            self._recording_stop_requested = False
+            if self._source_path is None:
+                self._source_view.end_video_preview()
+            self._update_control_state()
+            return
+        if self._preview_attempt_pending and self._preview_attempt_current:
+            self._preview_active = False
+            self._backend_cleanup_pending = False
+            self._fail_preview_startup(
+                "camera preview stopped before startup completed",
+                stop_controller=False,
+            )
+            return
+        self._backend_cleanup_pending = False
+        self._backend_cleanup_message = None
+        self._preview_attempt_current = False
+        self._preview_attempt_committed = False
         self._preview_active = False
         self._recording_active = False
         self._record_start_requested = False
@@ -618,18 +702,60 @@ class MainWindow(QMainWindow):
         self._update_control_state()
 
     def _start_camera_recording(self) -> None:
+        if self._backend_cleanup_pending:
+            return
         controller = self._connect_capture_controller()
         self._acquisition_terminal = None
+        self._recording_attempt_current = True
         self._record_start_requested = True
         self._update_control_state()
         try:
             controller.start_recording()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            self._record_start_requested = False
-            self._camera_error(str(error))
+            if self._acquisition_terminal is not None:
+                return
+            self._fail_recording_startup(str(error))
+
+    def _fail_recording_startup(self, message: str) -> None:
+        self._recording_attempt_current = False
+        self._record_start_requested = False
+        cleanup_succeeded = True
+        context: list[str] = []
+        self._cleanup_signal_messages.clear()
+        self._preview_cleanup_active = True
+        try:
+            controller = self._capture_controller
+            if controller is not None:
+                try:
+                    controller.stop_preview()
+                except Exception as error:  # noqa: BLE001 - preserve primary error
+                    cleanup_succeeded = False
+                    context.append(f"cleanup failed: {error}")
+            context.extend(
+                f"cleanup failed: {cleanup_message}"
+                for cleanup_message in self._cleanup_signal_messages
+            )
+            if not cleanup_succeeded:
+                try:
+                    self._clear_active_source()
+                except Exception as error:  # noqa: BLE001 - fail closed
+                    context.append(f"fail-closed cleanup failed: {error}")
+        finally:
+            self._preview_cleanup_active = False
+            self._cleanup_signal_messages.clear()
+        if context:
+            message += "; " + "; ".join(context)
+        if not cleanup_succeeded:
+            self._backend_cleanup_pending = True
+            self._backend_cleanup_message = message
+        self._camera_error(message)
 
     def _camera_recording_started(self) -> None:
-        if self._acquisition_terminal is not None:
+        if (
+            not self._recording_attempt_current
+            or not self._record_start_requested
+            or self._acquisition_terminal is not None
+        ):
             return
         self._record_start_requested = False
         self._recording_active = True
@@ -652,8 +778,13 @@ class MainWindow(QMainWindow):
             self._camera_error(str(error))
 
     def _camera_recording_finished(self, result: object) -> None:
+        if not self._recording_attempt_current:
+            return
+        self._recording_attempt_current = False
         if self._acquisition_terminal is not None:
             return
+        self._preview_attempt_current = False
+        self._preview_attempt_committed = False
         self._preview_active = False
         self._recording_active = False
         self._record_start_requested = False
@@ -702,13 +833,19 @@ class MainWindow(QMainWindow):
         self._capture_sha256_label.setText("—")
 
     def _camera_error(self, message: str) -> None:
-        if self._preview_attempt_pending:
+        if self._preview_cleanup_active:
+            self._cleanup_signal_messages.append(message)
+            return
+        if self._preview_attempt_pending and self._preview_attempt_current:
             self._fail_preview_startup(message, stop_controller=True)
             return
         if self._acquisition_terminal is not None:
             self.statusBar().showMessage(message)
             return
         self._preview_active = False
+        self._preview_attempt_current = False
+        self._preview_attempt_committed = False
+        self._recording_attempt_current = False
         self._record_start_requested = False
         self._recording_active = False
         self._recording_stop_requested = False
@@ -855,7 +992,11 @@ class MainWindow(QMainWindow):
         has_camera = isinstance(self._camera_combo.currentData(), CameraDeviceInfo)
         selected = self._source_view.selected_region()
         run_readiness = self._run_readiness()
-        source_mutation_enabled = not run_active and not self._preview_attempt_pending
+        source_mutation_enabled = (
+            not run_active
+            and not self._preview_attempt_pending
+            and not self._backend_cleanup_pending
+        )
         self._source_status_label.setText(f"Source status: {source_state}")
         self._acquisition_status_label.setText(
             f"Acquisition status: {self._acquisition_state}"
@@ -895,6 +1036,7 @@ class MainWindow(QMainWindow):
             and camera_mode
             and has_camera
             and not self._preview_attempt_pending
+            and not self._backend_cleanup_pending
             and not self._preview_active
             and not self._record_start_requested
             and not self._recording_active
@@ -902,6 +1044,7 @@ class MainWindow(QMainWindow):
         self._record_button.setEnabled(
             not run_active
             and camera_mode
+            and not self._backend_cleanup_pending
             and self._preview_active
             and not self._record_start_requested
             and not self._recording_active
@@ -909,6 +1052,7 @@ class MainWindow(QMainWindow):
         self._stop_recording_button.setEnabled(
             not run_active
             and camera_mode
+            and not self._backend_cleanup_pending
             and self._recording_active
             and not self._recording_stop_requested
         )
@@ -1049,9 +1193,30 @@ class MainWindow(QMainWindow):
     def _kill_active_run(self) -> None:
         self.runController.kill()
 
+    def _retry_backend_cleanup(self) -> bool:
+        if not self._backend_cleanup_pending:
+            return True
+        controller = self._capture_controller
+        if controller is None:
+            return False
+        try:
+            controller.stop_preview()
+        except Exception as error:  # noqa: BLE001 - close must preserve liveness lock
+            primary = self._backend_cleanup_message or "Camera cleanup is incomplete"
+            self.statusBar().showMessage(f"{primary}; cleanup retry failed: {error}")
+            return False
+        if self._backend_cleanup_pending:
+            self._backend_cleanup_pending = False
+            self._backend_cleanup_message = None
+            self._update_control_state()
+        return True
+
     def closeEvent(self, event: QCloseEvent) -> None:
         """Make recording discard and inference cancellation explicit."""
 
+        if self._backend_cleanup_pending and not self._retry_backend_cleanup():
+            event.ignore()
+            return
         if self._allow_close:
             event.accept()
             return

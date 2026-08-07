@@ -105,10 +105,13 @@ class FakeWindowCaptureController(QObject):
         self.recording_active = False
         self.devices_calls = 0
         self.defer_preview_started = False
+        self.duplicate_preview_started = False
         self.preview_start_error: Exception | None = None
         self.preview_start_error_after_signal: Exception | None = None
         self.invalid_preview_started_value = False
         self.stop_preview_error: Exception | None = None
+        self.stop_preview_signal_error: str | None = None
+        self.record_start_error: Exception | None = None
 
     @property
     def is_recording(self) -> bool:
@@ -132,6 +135,8 @@ class FakeWindowCaptureController(QObject):
         selected = select_camera_format(self.formats, request)
         if not self.defer_preview_started:
             self.previewStarted.emit(object() if self.invalid_preview_started_value else selected)
+            if self.duplicate_preview_started:
+                self.previewStarted.emit(selected)
         if self.preview_start_error_after_signal is not None:
             raise self.preview_start_error_after_signal
         return selected
@@ -146,11 +151,16 @@ class FakeWindowCaptureController(QObject):
             raise self.stop_preview_error
         if self.preview_active:
             self.preview_active = False
+            self.recording_active = False
             self.previewStopped.emit()
+            if self.stop_preview_signal_error is not None:
+                self.errorOccurred.emit(self.stop_preview_signal_error)
 
     def start_recording(self, _final_path: Path | None = None) -> None:
         self.record_calls += 1
         self.recording_active = True
+        if self.record_start_error is not None:
+            raise self.record_start_error
         self.recordingStarted.emit()
 
     def stop_recording(self) -> None:
@@ -1101,9 +1111,11 @@ def test_preview_cleanup_failure_is_context_without_replacing_primary_error(
     source_mode = window.findChild(QComboBox, "source-mode")
     preview = window.findChild(QPushButton, "start-preview-button")
     source_status = window.findChild(QLabel, "source-status")
+    open_action = window.findChild(QAction, "open-video-action")
     assert source_mode is not None
     assert preview is not None
     assert source_status is not None
+    assert open_action is not None
     source = tmp_path / "source.mp4"
     window.load_video(source)
     source_mode.setCurrentText("Camera")
@@ -1111,13 +1123,198 @@ def test_preview_cleanup_failure_is_context_without_replacing_primary_error(
     with qtbot.captureExceptions() as exceptions:
         qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
 
-    controller.preview_active = False
     assert exceptions == []
     assert source_status.text() == "Source status: No source"
     assert window.findChild(QLabel, "source-path").text() == "—"
+    assert controller.preview_active is True
+    assert preview.isEnabled() is False
+    assert source_mode.isEnabled() is False
+    assert open_action.isEnabled() is False
     assert window.statusBar().currentMessage() == (
         "graph startup failed; cleanup failed: stop failed"
     )
+
+    controller.stop_preview_error = None
+    controller.stop_preview()
+
+    assert controller.preview_active is False
+    assert preview.isEnabled() is True
+    assert source_mode.isEnabled() is True
+    assert open_action.isEnabled() is True
+
+
+def test_pending_preview_stop_fails_startup_and_ignores_late_start(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    controller.defer_preview_started = True
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    view = window.findChild(RegionView, "source-view")
+    assert source_mode is not None
+    assert preview is not None
+    assert acquisition_status is not None
+    assert view is not None
+    source = tmp_path / "source.mp4"
+    window.load_video(source)
+    region = Region("roi", 1, 2, 10, 11)
+    view.add_region(region)
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    controller.emit_late_preview_stopped()
+    controller.emit_preview_started()
+
+    assert acquisition_status.text() == "Acquisition status: Failed"
+    assert window.findChild(QLabel, "source-path").text() == str(source)
+    assert view.regions() == (region,)
+    assert preview.isEnabled() is True
+    assert window.statusBar().currentMessage() == (
+        "camera preview stopped before startup completed"
+    )
+
+
+def test_close_retries_unknown_backend_cleanup_before_accepting(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    controller.preview_start_error = RuntimeError("graph startup failed")
+    controller.stop_preview_error = RuntimeError("stop failed")
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    assert source_mode is not None
+    assert preview is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    controller.stop_preview_error = None
+    event = QCloseEvent()
+    event.ignore()
+
+    window.closeEvent(event)
+
+    assert event.isAccepted() is True
+    assert controller.stop_preview_calls == 2
+    assert controller.preview_active is False
+
+
+def test_cleanup_signal_context_is_appended_to_primary_startup_error(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    controller.preview_start_error = RuntimeError("graph startup failed")
+    controller.stop_preview_signal_error = "discard cleanup failed"
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    assert source_mode is not None
+    assert preview is not None
+    source_mode.setCurrentText("Camera")
+
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert window.statusBar().currentMessage() == (
+        "graph startup failed; cleanup failed: discard cleanup failed"
+    )
+    assert preview.isEnabled() is True
+
+
+def test_duplicate_synchronous_preview_started_is_idempotent(qtbot: QtBot) -> None:
+    controller = FakeWindowCaptureController()
+    controller.duplicate_preview_started = True
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    view = window.findChild(RegionView, "source-view")
+    assert source_mode is not None
+    assert preview is not None
+    assert acquisition_status is not None
+    assert view is not None
+    source_mode.setCurrentText("Camera")
+
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert acquisition_status.text() == "Acquisition status: Previewing"
+    assert controller.stop_preview_calls == 0
+    assert sum(isinstance(item, QGraphicsVideoItem) for item in view.scene().items()) == 1
+
+
+def test_partial_recording_start_failure_stops_owned_graph(qtbot: QtBot) -> None:
+    controller = FakeWindowCaptureController()
+    controller.record_start_error = RuntimeError("record startup failed")
+    window = MainWindow(
+        capture_controller=controller,
+        close_decision=lambda _activity: "Stop and Discard",
+    )
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert acquisition_status is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    assert controller.stop_preview_calls == 1
+    assert controller.preview_active is False
+    assert controller.recording_active is False
+    assert acquisition_status.text() == "Acquisition status: Failed"
+    assert window.statusBar().currentMessage() == "record startup failed"
+
+
+def test_partial_recording_cleanup_failure_keeps_controls_locked_until_stop(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    controller.record_start_error = RuntimeError("record startup failed")
+    controller.stop_preview_error = RuntimeError("stop failed")
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    open_action = window.findChild(QAction, "open-video-action")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert open_action is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    assert controller.preview_active is True
+    assert controller.recording_active is True
+    assert preview.isEnabled() is False
+    assert source_mode.isEnabled() is False
+    assert open_action.isEnabled() is False
+    assert window.statusBar().currentMessage() == (
+        "record startup failed; cleanup failed: stop failed"
+    )
+
+    controller.stop_preview_error = None
+    controller.stop_preview()
+
+    assert controller.preview_active is False
+    assert controller.recording_active is False
+    assert preview.isEnabled() is True
+    assert source_mode.isEnabled() is True
+    assert open_action.isEnabled() is True
 
 
 def test_stop_recording_reports_finalizing_until_capture_finishes(qtbot: QtBot) -> None:
@@ -1483,6 +1680,60 @@ def test_production_preview_stopped_then_finish_reaches_finalized(
     assert acquisition_status.text() == "Acquisition status: Finalized"
 
 
+def test_late_recording_signals_cannot_replace_a_new_preview_attempt(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    first = _finish_fake_capture(qtbot, window, controller, tmp_path / "first.mp4")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    source_status = window.findChild(QLabel, "source-status")
+    assert preview is not None
+    assert acquisition_status is not None
+    assert source_status is not None
+    controller.defer_preview_started = True
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    replacement = _capture_result(first.request, tmp_path / "late-old.mp4")
+
+    controller.recordingStarted.emit()
+    controller.recordingFinished.emit(replacement)
+
+    assert acquisition_status.text() == "Acquisition status: Finalized"
+    assert source_status.text() == "Source status: Ready"
+    assert window.findChild(QLabel, "source-path").text() == str(first.path.resolve())
+    assert _capture_metadata_values(window)[3] == first.sha256
+    controller.emit_preview_started()
+    assert acquisition_status.text() == "Acquisition status: Previewing"
+    assert source_status.text() == "Source status: No source"
+
+
+def test_late_recording_signals_after_terminal_are_ignored(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    first = _finish_fake_capture(qtbot, window, controller, tmp_path / "first.mp4")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    assert acquisition_status is not None
+    replacement = _capture_result(first.request, tmp_path / "late.mp4")
+
+    controller.recordingStarted.emit()
+    controller.recordingFinished.emit(replacement)
+
+    assert acquisition_status.text() == "Acquisition status: Finalized"
+    assert window.findChild(QLabel, "source-path").text() == str(first.path.resolve())
+    assert _capture_metadata_values(window)[3] == first.sha256
+
+
 def test_mode_change_stopping_an_ordinary_preview_returns_acquisition_to_idle(
     qtbot: QtBot,
 ) -> None:
@@ -1531,6 +1782,46 @@ def test_loading_file_stops_preview_before_replacing_source(
     assert controller.preview_active is False
     assert source_mode.currentText() == "Video file"
     assert window.findChild(QLabel, "source-path").text() == str(video_path)
+
+
+def test_loading_file_stop_failure_locks_replacement_until_shutdown_confirmation(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    open_action = window.findChild(QAction, "open-video-action")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert open_action is not None
+    assert acquisition_status is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    controller.stop_preview_error = RuntimeError("stop failed")
+
+    with pytest.raises(RuntimeError, match="^stop failed$"):
+        window.load_video(tmp_path / "replacement.mp4")
+
+    assert controller.preview_active is True
+    assert acquisition_status.text() == "Acquisition status: Failed"
+    assert source_mode.isEnabled() is False
+    assert preview.isEnabled() is False
+    assert open_action.isEnabled() is False
+    assert _capture_metadata_values(window) == ("—", "—", "—", "—")
+
+    controller.stop_preview_error = None
+    controller.stop_preview()
+
+    assert controller.preview_active is False
+    assert source_mode.isEnabled() is True
+    assert preview.isEnabled() is True
+    assert open_action.isEnabled() is True
 
 
 def test_loading_file_while_recording_is_rejected_without_discard(

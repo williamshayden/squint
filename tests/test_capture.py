@@ -548,6 +548,32 @@ def test_synchronous_camera_error_does_not_emit_preview_success(tmp_path: Path) 
     assert harness.controller.is_previewing is False
 
 
+def test_replaced_graph_callbacks_cannot_escape_as_high_level_signals(
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    old_camera = harness.camera
+    old_recorder = harness.recorder
+    harness.controller.stop_preview()
+    harness.start_preview()
+    errors: list[str] = []
+    recording_starts: list[None] = []
+    harness.controller.errorOccurred.connect(errors.append)
+    harness.controller.recordingStarted.connect(lambda: recording_starts.append(None))
+
+    old_camera.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "late camera error")
+    old_recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "late recorder error")
+    old_recorder.recorderStateChanged.emit(
+        QMediaRecorder.RecorderState.RecordingState
+    )
+
+    assert errors == []
+    assert recording_starts == []
+    assert harness.controller.is_previewing is True
+    assert harness.controller.is_recording is False
+
+
 @pytest.mark.parametrize(
     ("error_stage", "message"),
     [

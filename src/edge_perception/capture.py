@@ -264,7 +264,12 @@ DecodeValidator = Callable[[Path], object]
 
 
 class QtCaptureController(QObject):
-    """Own one injected Qt camera graph and atomically publish validated video."""
+    """Own one injected Qt camera graph and atomically publish validated video.
+
+    Internal Qt callbacks are generation-gated before these same-thread, direct
+    high-level signals are emitted. Signal payloads therefore do not duplicate
+    graph identity; consumers own only the operations they requested.
+    """
 
     devicesChanged = Signal()
     previewStarted = Signal(object)
