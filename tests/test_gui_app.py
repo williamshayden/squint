@@ -1237,10 +1237,18 @@ def test_close_while_inference_cancels_restarts_kill_timer_and_waits_for_finishe
     assert window.isVisible() is True
 
     process.emit_stdout(_progress_record(ProgressEvent("cancelled", 1, 1, 2.0, None)))
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
     process.finish()
 
     assert timer.stop_count == 1
     assert not cancel_path.exists()
+    assert critical_messages == []
+    assert window.resultsWidget.isHidden()
     assert window.isVisible() is False
 
 

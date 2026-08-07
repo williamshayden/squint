@@ -750,10 +750,13 @@ class MainWindow(QMainWindow):
         )
 
     def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
+        phase = payload.get("phase")
+        if self._exit_after_run:
+            self.statusBar().showMessage(f"Run {phase}: {Path(run_dir).resolve()}")
+            return
         path = self._load_completed_run_or_report(run_dir)
         if path is None:
             return
-        phase = payload.get("phase")
         self.statusBar().showMessage(f"Run {phase}: {path}")
         self._update_control_state()
 
