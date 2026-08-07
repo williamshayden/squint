@@ -14,7 +14,6 @@ from PySide6.QtCore import QObject, QSize, QUrl, Signal
 from PySide6.QtMultimedia import QMediaRecorder, QVideoFrameFormat
 from pytestqt.qtbot import QtBot
 
-from edge_perception import capture
 from edge_perception.capture import (
     CameraDeviceInfo,
     CameraFormatInfo,
@@ -652,7 +651,7 @@ def test_cleanup_permission_error_preserves_primary_failure_and_owned_file(
     def deny_unlink(_path: Path) -> None:
         raise PermissionError("access denied")
 
-    monkeypatch.setattr(capture, "_unlink_file", deny_unlink, raising=False)
+    monkeypatch.setattr("edge_perception.capture._unlink_file", deny_unlink)
     with qtbot.captureExceptions() as exceptions:
         harness.recorder.errorOccurred.emit(
             QMediaRecorder.Error.ResourceError,
@@ -666,7 +665,7 @@ def test_cleanup_permission_error_preserves_primary_failure_and_owned_file(
     assert staged_path.read_bytes() == b"partial"
     assert harness.controller.is_previewing is False
 
-    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+    monkeypatch.setattr("edge_perception.capture._unlink_file", lambda path: path.unlink())
     harness.controller.discard()
 
     assert not staged_path.parent.exists()
@@ -686,7 +685,7 @@ def test_cleanup_retains_owned_staging_directory_until_rmdir_succeeds(
     def deny_rmdir(_path: Path) -> None:
         raise PermissionError("directory busy")
 
-    monkeypatch.setattr(capture, "_remove_directory", deny_rmdir, raising=False)
+    monkeypatch.setattr("edge_perception.capture._remove_directory", deny_rmdir)
     harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
 
     assert not staged_path.exists()
@@ -698,7 +697,9 @@ def test_cleanup_retains_owned_staging_directory_until_rmdir_succeeds(
         )
     ]
 
-    monkeypatch.setattr(capture, "_remove_directory", lambda path: path.rmdir())
+    monkeypatch.setattr(
+        "edge_perception.capture._remove_directory", lambda path: path.rmdir()
+    )
     harness.controller.discard()
 
     assert not staged_path.parent.exists()
@@ -716,7 +717,7 @@ def test_retained_cleanup_failure_blocks_reuse_without_losing_ownership(
     def deny_unlink(_path: Path) -> None:
         raise PermissionError("still locked")
 
-    monkeypatch.setattr(capture, "_unlink_file", deny_unlink)
+    monkeypatch.setattr("edge_perception.capture._unlink_file", deny_unlink)
     harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
     harness.start_preview()
     replacement_recorder = harness.recorder
@@ -733,7 +734,7 @@ def test_retained_cleanup_failure_blocks_reuse_without_losing_ownership(
     assert replacement_recorder.record_count == 0
     assert replacement_recorder.output_location.isEmpty()
 
-    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+    monkeypatch.setattr("edge_perception.capture._unlink_file", lambda path: path.unlink())
     harness.controller.discard()
 
     assert not old_staged_path.parent.exists()
@@ -751,10 +752,10 @@ def test_reuse_proceeds_after_retained_cleanup_retry_succeeds(
     def deny_unlink(_path: Path) -> None:
         raise PermissionError("temporarily locked")
 
-    monkeypatch.setattr(capture, "_unlink_file", deny_unlink)
+    monkeypatch.setattr("edge_perception.capture._unlink_file", deny_unlink)
     harness.recorder.errorOccurred.emit(QMediaRecorder.Error.ResourceError, "camera failed")
     harness.start_preview()
-    monkeypatch.setattr(capture, "_unlink_file", lambda path: path.unlink())
+    monkeypatch.setattr("edge_perception.capture._unlink_file", lambda path: path.unlink())
 
     new_staged_path = harness.start_recording(tmp_path / "second.mp4")
 
