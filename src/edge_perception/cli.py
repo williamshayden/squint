@@ -373,8 +373,10 @@ def _is_pyside6_import_error(error: ImportError) -> bool:
     return (
         module_name == "PySide6"
         or module_name.startswith("PySide6.")
-        or "No module named 'PySide6" in message
-        or "from 'PySide6" in message
+        or "No module named 'PySide6'" in message
+        or "No module named 'PySide6." in message
+        or "from 'PySide6'" in message
+        or "from 'PySide6." in message
     )
 
 

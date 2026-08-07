@@ -257,6 +257,34 @@ def test_camera_command_preserves_unrelated_import_error(
         cli.main(["camera", "list"])
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            ModuleNotFoundError("No module named 'PySide6Tools'", name="PySide6Tools"),
+            False,
+        ),
+        (
+            ImportError("cannot import name 'camera' from 'PySide6Shim'", name="PySide6Shim"),
+            False,
+        ),
+        (ModuleNotFoundError("No module named 'PySide6'", name="PySide6"), True),
+        (
+            ImportError(
+                "cannot import name 'QTimer' from 'PySide6.QtCore'",
+                name="PySide6.QtCore",
+            ),
+            True,
+        ),
+    ],
+)
+def test_pyside6_import_classifier_requires_exact_module_boundary(
+    error: ImportError,
+    expected: bool,
+) -> None:
+    assert cli._is_pyside6_import_error(error) is expected
+
+
 def test_gui_command_lazily_launches_native_app(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
