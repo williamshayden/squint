@@ -28,6 +28,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from edge_perception.capture import (
+    CameraDeviceInfo,
+    CameraFormatInfo,
+    QtCaptureController,
+    select_camera_format,
+)
 from edge_perception.config import (
     CaptureRequest,
     CaptureResult,
@@ -36,12 +42,6 @@ from edge_perception.config import (
 )
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import detector_descriptors
-from edge_perception.gui.capture import (
-    CameraDeviceInfo,
-    CameraFormatInfo,
-    QtCaptureController,
-    select_camera_format,
-)
 from edge_perception.gui.region_view import RegionView
 from edge_perception.gui.results import ResultsWidget
 from edge_perception.gui.run_controller import RunController

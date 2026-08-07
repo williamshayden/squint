@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import errno
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from enum import IntEnum
 from hashlib import sha256
@@ -12,9 +14,8 @@ from PySide6.QtCore import QObject, QSize, QUrl, Signal
 from PySide6.QtMultimedia import QMediaRecorder, QVideoFrameFormat
 from pytestqt.qtbot import QtBot
 
-from edge_perception.config import CaptureRequest, CaptureResult
-from edge_perception.gui import capture
-from edge_perception.gui.capture import (
+from edge_perception import capture
+from edge_perception.capture import (
     CameraDeviceInfo,
     CameraFormatInfo,
     QtCaptureController,
@@ -23,7 +24,26 @@ from edge_perception.gui.capture import (
     select_recording_profile,
     validate_capture_result,
 )
+from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.video import VideoMetadata
+
+
+def test_shared_capture_import_does_not_load_qtwidgets() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import edge_perception.capture; "
+                "print('PySide6.QtWidgets' in sys.modules)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
 
 
 class FakeFileFormat(IntEnum):
@@ -806,7 +826,7 @@ def test_collision_race_preserves_existing_completed_capture(
         destination.write_bytes(b"completed capture")
         real_link(source, destination)
 
-    monkeypatch.setattr(capture.os, "link", collide_then_link)
+    monkeypatch.setattr(os, "link", collide_then_link)
     errors: list[str] = []
     harness.controller.errorOccurred.connect(errors.append)
 
@@ -830,7 +850,7 @@ def test_unsupported_hard_links_fail_without_copy_or_replace_fallback(
     def unsupported_link(_source: Path, _destination: Path) -> None:
         raise OSError(errno.EPERM, "hard links unsupported")
 
-    monkeypatch.setattr(capture.os, "link", unsupported_link)
+    monkeypatch.setattr(os, "link", unsupported_link)
     errors: list[str] = []
     harness.controller.errorOccurred.connect(errors.append)
 

@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+camera = [
+    "PySide6>=6.8,<7",
+]
 cpu = [
     "torch==2.11.0",
     "transformers==4.57.6",

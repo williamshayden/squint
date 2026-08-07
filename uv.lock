@@ -24,6 +24,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+camera = [
+    { name = "pyside6" },
+]
 cpu = [
     { name = "safetensors" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-24-adaptive-edge-perception-cpu') or (extra == 'extra-24-adaptive-edge-perception-cpu' and extra == 'extra-24-adaptive-edge-perception-cu128')" },
@@ -56,6 +59,7 @@ requires-dist = [
     { name = "nvidia-ml-py", marker = "extra == 'cu128'", specifier = ">=13,<14" },
     { name = "pillow", specifier = ">=11,<13" },
     { name = "psutil", specifier = ">=7,<8" },
+    { name = "pyside6", marker = "extra == 'camera'", specifier = ">=6.8,<7" },
     { name = "pyside6", marker = "extra == 'gui'", specifier = ">=6.8,<7" },
     { name = "safetensors", marker = "extra == 'cpu'", specifier = ">=0.6,<1" },
     { name = "safetensors", marker = "extra == 'cu128'", specifier = ">=0.6,<1" },
@@ -64,7 +68,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'cpu'", specifier = "==4.57.6" },
     { name = "transformers", marker = "extra == 'cu128'", specifier = "==4.57.6" },
 ]
-provides-extras = ["cpu", "cu128", "gui"]
+provides-extras = ["camera", "cpu", "cu128", "gui"]
 
 [package.metadata.requires-dev]
 dev = [
