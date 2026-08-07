@@ -111,13 +111,13 @@ def _region_json(region: RegionKey) -> dict[str, str | int]:
     return {"region_id": region_id, "x": x, "y": y, "width": width, "height": height}
 
 
-def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
+def _region_keys(configuration: dict[str, object]) -> tuple[RegionKey, ...]:
     if "regions" not in configuration:
         raise ValueError("configuration is missing required field regions")
     value = configuration["regions"]
     if not isinstance(value, list):
         raise ComparisonError("configuration.regions must be a list")
-    normalized: list[dict[str, str | int]] = []
+    normalized: list[RegionKey] = []
     region_ids: set[str] = set()
     for index, item in enumerate(value):
         context = f"configuration.regions[{index}]"
@@ -128,8 +128,17 @@ def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
         if region_id in region_ids:
             raise ValueError(f"configuration.regions has duplicate region_id {region_id!r}")
         region_ids.add(region_id)
-        normalized.append(_region_json(region))
-    return normalized
+        normalized.append(region)
+    return tuple(normalized)
+
+
+def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
+    return [_region_json(region) for region in _region_keys(configuration)]
+
+
+def _region_catalog(manifest: dict[str, object]) -> dict[str, RegionKey]:
+    configuration = _mapping(manifest, "configuration")
+    return {region[0]: region for region in _region_keys(configuration)}
 
 
 def _manifest_fields(manifest: dict[str, object]) -> tuple[tuple[str, object], ...]:
@@ -255,9 +264,14 @@ def _inference_index(
     records: list[dict[str, object]],
     *,
     run_id: str,
+    summary: dict[str, object],
+    region_catalog: dict[str, RegionKey],
 ) -> tuple[dict[InferenceKey, dict[str, object]], dict[str, tuple[str, str]]]:
     indexed: dict[InferenceKey, dict[str, object]] = {}
     links: dict[str, tuple[str, str]] = {}
+    logical_regions: set[tuple[int, str]] = set()
+    frame_groups: dict[int, tuple[str, float | None]] = {}
+    frame_ids: dict[str, int] = {}
     for row_number, record in enumerate(records, start=1):
         context = f"inferences.jsonl row {row_number}"
         _artifact_identity(record, context, expected_run_id=run_id)
@@ -265,10 +279,57 @@ def _inference_index(
         if inference_id in links:
             raise ValueError(f"duplicate inference_id: {inference_id!r}")
         key = _inference_key(record, context)
+        frame_index, frame_id, region_id, region, input_shape, source_time_ms = key
+        logical_region = (frame_index, region_id)
+        if logical_region in logical_regions:
+            raise ComparisonError(
+                f"{context} has duplicate logical frame-region {logical_region!r}"
+            )
+        logical_regions.add(logical_region)
+
+        if frame_index in frame_groups:
+            expected_frame_id, expected_source_time_ms = frame_groups[frame_index]
+            if frame_id != expected_frame_id:
+                raise ComparisonError(
+                    f"inferences.jsonl frame_index {frame_index} must use one frame_id"
+                )
+            if source_time_ms != expected_source_time_ms:
+                raise ComparisonError(
+                    f"inferences.jsonl frame_index {frame_index} must use one source_time_ms"
+                )
+        else:
+            frame_groups[frame_index] = (frame_id, source_time_ms)
+
+        if frame_id in frame_ids and frame_ids[frame_id] != frame_index:
+            raise ComparisonError(
+                f"inferences.jsonl frame_id {frame_id!r} must not reference multiple frame indices"
+            )
+        frame_ids[frame_id] = frame_index
+
+        if region_id != "full-frame" and region_catalog.get(region_id) != region:
+            raise ComparisonError(
+                f"{context}.region must match a member of configuration.regions"
+            )
+        expected_input_shape = (region[4], region[3], 3)
+        if input_shape != expected_input_shape:
+            raise ComparisonError(
+                f"{context}.input_shape must match region height, width, and RGB channels"
+            )
         if key in indexed:
             raise ValueError(f"duplicate inference schedule key: {_inference_key_json(key)}")
         indexed[key] = record
         links[inference_id] = (key[1], key[2])
+
+    inference_count = _required_integer(summary, "inference_count", "summary.json")
+    if inference_count != len(records):
+        raise ComparisonError(
+            "summary.json.inference_count must equal the number of inferences.jsonl rows"
+        )
+    frames_processed = _required_integer(summary, "frames_processed", "summary.json")
+    if frames_processed != len(frame_groups):
+        raise ComparisonError(
+            "summary.json.frames_processed must equal the number of distinct inference frame groups"
+        )
     return indexed, links
 
 
@@ -278,17 +339,16 @@ def _semantic_key(record: dict[str, object]) -> SemanticKey:
     detection_index = record.get("detection_index")
     class_id = record.get("class_id")
     label = record.get("label")
-    if not isinstance(frame_id, str) or not isinstance(region_id, str):
-        raise TypeError("detection frame_id and region_id must be strings")
-    if (
-        not isinstance(detection_index, int)
-        or isinstance(detection_index, bool)
-        or not isinstance(class_id, int)
-        or isinstance(class_id, bool)
-    ):
-        raise TypeError("detection_index and class_id must be integers")
+    if not isinstance(frame_id, str):
+        raise ComparisonError("detection frame_id must be a string")
+    if not isinstance(region_id, str):
+        raise ComparisonError("detection region_id must be a string")
+    if not isinstance(detection_index, int) or isinstance(detection_index, bool):
+        raise ComparisonError("detection_index must be an integer")
+    if not isinstance(class_id, int) or isinstance(class_id, bool):
+        raise ComparisonError("detection class_id must be an integer")
     if label is not None and not isinstance(label, str):
-        raise ValueError("detection label must be a string or null")
+        raise ComparisonError("detection label must be a string or null")
     return (frame_id, region_id, detection_index, class_id, label)
 
 
@@ -338,13 +398,13 @@ def _box(record: dict[str, object]) -> tuple[float, float, float, float]:
 def _score(record: dict[str, object]) -> float:
     value = record.get("score")
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        raise TypeError("detection score must be a finite number")
+        raise ComparisonError("detection score must be a finite number")
     try:
         score = float(value)
     except (TypeError, ValueError) as error:
-        raise ValueError("detection score must be a finite number") from error
+        raise ComparisonError("detection score must be a finite number") from error
     if not isfinite(score):
-        raise ValueError("detection score must be a finite number")
+        raise ComparisonError("detection score must be a finite number")
     return score
 
 
@@ -377,6 +437,8 @@ def compare_runs(
     right_run_id = _artifact_identity(right_manifest, "manifest.json")
     left_manifest_fields = _manifest_fields(left_manifest)
     right_manifest_fields = _manifest_fields(right_manifest)
+    left_region_catalog = _region_catalog(left_manifest)
+    right_region_catalog = _region_catalog(right_manifest)
 
     left_summary = _json_object(left_path / "summary.json")
     right_summary = _json_object(right_path / "summary.json")
@@ -390,10 +452,14 @@ def compare_runs(
     left_inference_index, left_inference_links = _inference_index(
         left_inference_records,
         run_id=left_run_id,
+        summary=left_summary,
+        region_catalog=left_region_catalog,
     )
     right_inference_index, right_inference_links = _inference_index(
         right_inference_records,
         run_id=right_run_id,
+        summary=right_summary,
+        region_catalog=right_region_catalog,
     )
 
     left_records = _json_lines(left_path / "detections.jsonl")

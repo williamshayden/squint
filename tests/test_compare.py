@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from edge_perception import cli
 from edge_perception.compare import compare_runs
 
 
@@ -19,6 +20,7 @@ def _manifest(run_id: str) -> dict[str, Any]:
             "regions": [
                 {"region_id": "right", "x": 100, "y": 20, "width": 80, "height": 60},
                 {"region_id": "empty", "x": 0, "y": 0, "width": 50, "height": 50},
+                {"region_id": "alternate", "x": 50, "y": 0, "width": 40, "height": 25},
             ],
         },
         "source_video": {"sha256": "b" * 64},
@@ -259,7 +261,25 @@ def test_compare_runs_reports_terminal_count_mismatch(
 ) -> None:
     left_summary = _summary("left-run")
     right_summary = _summary("right-run")
+    right_inferences = _inferences("right-run")
     right_summary[field] = right_value
+    if field == "frames_processed":
+        right_inferences[2]["frame_index"] = 1
+        right_inferences[2]["frame_id"] = "frame-000001"
+        right_inferences[2]["source_time_ms"] = 33.333
+    elif field == "inference_count":
+        alternate = deepcopy(right_inferences[2])
+        alternate["inference_id"] = "inference-000000-003"
+        alternate["region_id"] = "alternate"
+        alternate["region"] = {
+            "region_id": "alternate",
+            "x": 50,
+            "y": 0,
+            "width": 40,
+            "height": 25,
+        }
+        alternate["input_shape"] = [25, 40, 3]
+        right_inferences.append(alternate)
     _write_run(
         tmp_path / "left",
         _manifest("left-run"),
@@ -271,14 +291,14 @@ def test_compare_runs_reports_terminal_count_mismatch(
         tmp_path / "right",
         _manifest("right-run"),
         right_summary,
-        _inferences("right-run"),
+        right_inferences,
         _detections("right-run"),
     )
 
     report = compare_runs(tmp_path / "left", tmp_path / "right")
 
     assert report["equivalent"] is False
-    assert report["mismatch_count"] == 1
+    assert report["mismatch_count"] == (3 if field == "frames_processed" else 2)
     assert report["first_mismatch"] == {
         "kind": "summary",
         "field": field,
@@ -287,9 +307,18 @@ def test_compare_runs_reports_terminal_count_mismatch(
     }
 
 
-def test_compare_runs_reports_missing_zero_detection_inference(tmp_path: Path) -> None:
+def test_compare_runs_reports_different_valid_zero_detection_inference(tmp_path: Path) -> None:
     right_inferences = _inferences("right-run")
-    right_inferences.pop()
+    right_inferences[2]["inference_id"] = "inference-000000-003"
+    right_inferences[2]["region_id"] = "alternate"
+    right_inferences[2]["region"] = {
+        "region_id": "alternate",
+        "x": 50,
+        "y": 0,
+        "width": 40,
+        "height": 25,
+    }
+    right_inferences[2]["input_shape"] = [25, 40, 3]
     _write_run(
         tmp_path / "left",
         _manifest("left-run"),
@@ -308,19 +337,65 @@ def test_compare_runs_reports_missing_zero_detection_inference(tmp_path: Path) -
     report = compare_runs(tmp_path / "left", tmp_path / "right")
 
     assert report["equivalent"] is False
-    assert report["mismatch_count"] == 1
+    assert report["mismatch_count"] == 2
     assert report["first_mismatch"] == {
         "kind": "inference_schedule",
         "key": [
             0,
             "frame-000000",
-            "empty",
-            {"region_id": "empty", "x": 0, "y": 0, "width": 50, "height": 50},
-            [50, 50, 3],
+            "alternate",
+            {"region_id": "alternate", "x": 50, "y": 0, "width": 40, "height": 25},
+            [25, 40, 3],
             0.0,
         ],
-        "left_present": True,
-        "right_present": False,
+        "left_present": False,
+        "right_present": True,
+    }
+
+
+def test_compare_runs_accepts_sparse_catalog_schedule_without_full_frame(tmp_path: Path) -> None:
+    left_summary = _summary("left-run")
+    right_summary = _summary("right-run")
+    left_summary["inference_count"] = 1
+    right_summary["inference_count"] = 1
+    left_inference = deepcopy(_inferences("left-run")[1])
+    right_inference = deepcopy(_inferences("right-run")[1])
+    left_detection = deepcopy(_detections("left-run")[1])
+    right_detection = deepcopy(_detections("right-run")[1])
+    for inference, detection in (
+        (left_inference, left_detection),
+        (right_inference, right_detection),
+    ):
+        inference["frame_index"] = 5
+        inference["frame_id"] = "frame-000005"
+        inference["source_time_ms"] = 166.667
+        detection["frame_id"] = "frame-000005"
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        left_summary,
+        [left_inference],
+        [left_detection],
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        right_summary,
+        [right_inference],
+        [right_detection],
+    )
+
+    report = compare_runs(tmp_path / "left", tmp_path / "right")
+
+    assert report == {
+        "equivalent": True,
+        "box_atol": 0.01,
+        "score_atol": 0.0001,
+        "left_detection_count": 1,
+        "right_detection_count": 1,
+        "matched_detection_count": 1,
+        "mismatch_count": 0,
+        "first_mismatch": None,
     }
 
 
@@ -545,6 +620,224 @@ def test_compare_runs_reports_non_object_manifest_as_controlled_error(tmp_path: 
     (tmp_path / "left" / "manifest.json").write_text("[]", encoding="utf-8")
 
     with pytest.raises(ValueError, match="manifest.json"):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("inference_count", "inference_count"),
+        ("frames_processed", "frames_processed"),
+        ("zero_rows_frames", "frames_processed"),
+        ("frame_id_within_index", "one frame_id"),
+        ("source_time_within_index", "one source_time_ms"),
+        ("frame_id_alias", "multiple frame indices"),
+        ("unknown_catalog_region", "configuration.regions"),
+        ("catalog_geometry", "configuration.regions"),
+        ("input_shape", "input_shape must match"),
+        ("duplicate_logical_region", "duplicate logical frame-region"),
+    ],
+)
+def test_compare_runs_rejects_identically_malformed_run_coherence(
+    mutation: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    left_summary = _summary("left-run")
+    right_summary = _summary("right-run")
+    left_inferences = _inferences("left-run")
+    right_inferences = _inferences("right-run")
+    left_detections = _detections("left-run")
+    right_detections = _detections("right-run")
+    for summary, inferences, detections in (
+        (left_summary, left_inferences, left_detections),
+        (right_summary, right_inferences, right_detections),
+    ):
+        if mutation == "inference_count":
+            summary["inference_count"] = 4
+        elif mutation == "frames_processed":
+            summary["frames_processed"] = 2
+        elif mutation == "zero_rows_frames":
+            summary["inference_count"] = 0
+            inferences.clear()
+            detections.clear()
+        elif mutation == "frame_id_within_index":
+            inferences[2]["frame_id"] = "frame-other"
+        elif mutation == "source_time_within_index":
+            inferences[2]["source_time_ms"] = 1.0
+        elif mutation == "frame_id_alias":
+            summary["frames_processed"] = 2
+            inferences[2]["frame_index"] = 1
+        elif mutation == "unknown_catalog_region":
+            inferences[2]["region_id"] = "unknown"
+            inferences[2]["region"] = {
+                "region_id": "unknown",
+                "x": 0,
+                "y": 0,
+                "width": 50,
+                "height": 50,
+            }
+        elif mutation == "catalog_geometry":
+            inferences[2]["region"]["width"] = 51
+            inferences[2]["input_shape"] = [50, 51, 3]
+        elif mutation == "input_shape":
+            inferences[2]["input_shape"] = [49, 50, 3]
+        elif mutation == "duplicate_logical_region":
+            summary["inference_count"] = 4
+            duplicate = deepcopy(inferences[0])
+            duplicate["inference_id"] = "inference-000000-duplicate"
+            duplicate["region"]["width"] = 199
+            duplicate["input_shape"] = [100, 199, 3]
+            inferences.append(duplicate)
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        left_summary,
+        left_inferences,
+        left_detections,
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        right_summary,
+        right_inferences,
+        right_detections,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("frame_id", 123, "frame_id"),
+        ("region_id", 123, "region_id"),
+        ("detection_index", "zero", "detection_index"),
+        ("class_id", "one", "class_id"),
+        ("score", {"invalid": True}, "score"),
+    ],
+)
+def test_compare_runs_rejects_malformed_detection_values_as_controlled_errors(
+    field: str,
+    value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    left_detections = _detections("left-run")
+    left_detections[0][field] = value
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        _summary("left-run"),
+        _inferences("left-run"),
+        left_detections,
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        _summary("right-run"),
+        _inferences("right-run"),
+        _detections("right-run"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+def test_compare_cli_reports_malformed_detection_as_one_controlled_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    left_detections = _detections("left-run")
+    left_detections[0]["score"] = {"invalid": True}
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        _summary("left-run"),
+        _inferences("left-run"),
+        left_detections,
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        _summary("right-run"),
+        _inferences("right-run"),
+        _detections("right-run"),
+    )
+
+    exit_code = cli.main(["compare", str(tmp_path / "left"), str(tmp_path / "right")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err == "error: detection score must be a finite number\n"
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "missing required field inference_id"),
+        ("unknown", "must reference inferences.jsonl"),
+    ],
+)
+def test_compare_runs_rejects_missing_or_unknown_detection_inference_link(
+    mutation: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    left_detections = _detections("left-run")
+    if mutation == "missing":
+        left_detections[0].pop("inference_id")
+    elif mutation == "unknown":
+        left_detections[0]["inference_id"] = "inference-unknown"
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        _summary("left-run"),
+        _inferences("left-run"),
+        left_detections,
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        _summary("right-run"),
+        _inferences("right-run"),
+        _detections("right-run"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("frame_id", "frame-999999"), ("region_id", "empty")],
+)
+def test_compare_runs_rejects_detection_frame_or_region_link_disagreement(
+    field: str,
+    value: str,
+    tmp_path: Path,
+) -> None:
+    left_detections = _detections("left-run")
+    left_detections[0][field] = value
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        _summary("left-run"),
+        _inferences("left-run"),
+        left_detections,
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        _summary("right-run"),
+        _inferences("right-run"),
+        _detections("right-run"),
+    )
+
+    with pytest.raises(ValueError, match="frame_id and region_id must match"):
         compare_runs(tmp_path / "left", tmp_path / "right")
 
 
