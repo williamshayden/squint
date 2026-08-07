@@ -124,19 +124,30 @@ def test_camera_capture_parses_constraints_uses_discovered_description_and_rende
     rendered = capsys.readouterr().out
     assert f"Capture: {output.resolve()}" in rendered
     assert "SHA-256: " + "b" * 64 in rendered
-    assert "Capture request: camera-1 (Desk camera)" in rendered
+    assert (
+        "Capture request: device=camera-1 description=Desk camera "
+        "width=1920 px height=1080 px fps=30 fps strict=true"
+    ) in rendered
     assert "Applied camera format: 1920x1080 30-30 fps YUYV" in rendered
-    assert "Recorded format: 1920x1080 30 fps mp4/h264" in rendered
+    assert (
+        "Recorded format: width=1920 px height=1080 px fps=30 fps "
+        "container=mp4 codec=h264 duration=0.05 s audio=false size=7 bytes"
+    ) in rendered
 
 
 def test_camera_capture_omits_output_for_shared_backend_selection(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls = _install_camera_boundary(monkeypatch)
 
     assert cli.main(["camera", "capture", "--device", "camera-1", "--duration", "0.05"]) == 0
 
     assert calls[0][2] is None
+    assert (
+        "Capture request: device=camera-1 description=Desk camera "
+        "width=None height=None fps=None strict=false"
+    ) in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -218,6 +229,32 @@ def test_camera_command_reports_missing_optional_extra(
     assert capsys.readouterr().err == (
         "error: camera support is unavailable; install adaptive-edge-perception[camera]\n"
     )
+
+
+def test_camera_command_preserves_unrelated_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_perception
+
+    original_import = __import__
+    monkeypatch.delitem(sys.modules, "edge_perception.camera_cli", raising=False)
+    monkeypatch.delattr(edge_perception, "camera_cli", raising=False)
+
+    def import_with_unrelated_failure(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "edge_perception.camera_cli":
+            raise ImportError("camera adapter has a broken dependency")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", import_with_unrelated_failure)
+
+    with pytest.raises(ImportError, match="camera adapter has a broken dependency"):
+        cli.main(["camera", "list"])
 
 
 def test_gui_command_lazily_launches_native_app(

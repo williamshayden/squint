@@ -14,6 +14,8 @@ from PySide6.QtMultimedia import QVideoSink
 from edge_perception.capture import CameraDeviceInfo, QtCaptureController
 from edge_perception.config import CaptureRequest, CaptureResult
 
+_MAX_TIMER_INTERVAL_MS = 2_147_483_647
+
 
 class _SignalLike(Protocol):
     def connect(self, slot: object) -> object: ...
@@ -82,6 +84,8 @@ def capture_camera(
     runtime = _runtime or _production_runtime()
     output_path = None if output is None else Path(output).resolve()
     interval_ms = round(duration_seconds * 1000)
+    if not 1 <= interval_ms <= _MAX_TIMER_INTERVAL_MS:
+        raise ValueError("duration must be finite and positive")
     result: CaptureResult | None = None
     error_message: str | None = None
 
@@ -106,6 +110,12 @@ def capture_camera(
         except Exception as error:  # noqa: BLE001 - terminal adapter boundary
             fail(error)
 
+    def start_timer() -> None:
+        try:
+            runtime.timer.start(interval_ms)
+        except Exception as error:  # noqa: BLE001 - terminal adapter boundary
+            fail(error)
+
     def start_capture() -> None:
         try:
             runtime.controller.start_preview(request, runtime.video_sink)
@@ -114,21 +124,35 @@ def capture_camera(
             fail(error)
 
     runtime.timer.setSingleShot(True)
-    runtime.controller.recordingStarted.connect(lambda: runtime.timer.start(interval_ms))
+    runtime.controller.recordingStarted.connect(start_timer)
     runtime.timer.timeout.connect(stop_recording)
     runtime.controller.recordingFinished.connect(complete)
     runtime.controller.errorOccurred.connect(fail)
+    primary_error: Exception | None = None
+    cleanup_error: Exception | None = None
     try:
         runtime.schedule(start_capture)
         runtime.loop.exec()
+    except Exception as error:  # noqa: BLE001 - preserve external runtime failures
+        primary_error = error
     finally:
-        runtime.timer.stop()
+        try:
+            runtime.timer.stop()
+        except Exception as error:  # noqa: BLE001 - cleanup must not skip preview release
+            cleanup_error = error
+        if result is None:
+            try:
+                runtime.controller.stop_preview()
+            except Exception as error:  # noqa: BLE001 - cleanup must preserve the terminal cause
+                cleanup_error = error if cleanup_error is None else cleanup_error
 
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise RuntimeError(f"{primary_error}; cleanup failed: {cleanup_error}") from primary_error
+        raise primary_error
     if result is not None:
         return result
-    try:
-        runtime.controller.stop_preview()
-    except Exception as cleanup_error:  # noqa: BLE001 - preserve terminal failure
+    if cleanup_error is not None:
         if error_message is None:
             error_message = str(cleanup_error) or "camera preview cleanup failed"
         else:

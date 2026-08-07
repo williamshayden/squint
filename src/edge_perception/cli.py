@@ -282,6 +282,8 @@ def _camera_command(args: argparse.Namespace) -> int:
     try:
         from edge_perception.camera_cli import capture_camera, list_cameras
     except ImportError as error:
+        if not _is_pyside6_import_error(error):
+            raise
         raise _CliError(
             "camera support is unavailable; install adaptive-edge-perception[camera]"
         ) from error
@@ -330,7 +332,15 @@ def _camera_command(args: argparse.Namespace) -> int:
 def _render_capture_result(result: CaptureResult) -> None:
     print(f"Capture: {result.path}")
     print(f"SHA-256: {result.sha256}")
-    print(f"Capture request: {result.request.device_id} ({result.request.device_description})")
+    print(
+        "Capture request: "
+        f"device={result.request.device_id} "
+        f"description={result.request.device_description} "
+        f"width={_format_optional_measure(result.request.requested_width, 'px')} "
+        f"height={_format_optional_measure(result.request.requested_height, 'px')} "
+        f"fps={_format_optional_measure(result.request.requested_fps, 'fps')} "
+        f"strict={str(result.request.strict).lower()}"
+    )
     print(
         "Applied camera format: "
         f"{result.selected_width}x{result.selected_height} "
@@ -339,13 +349,33 @@ def _render_capture_result(result: CaptureResult) -> None:
     )
     print(
         "Recorded format: "
-        f"{result.actual_width}x{result.actual_height} "
-        f"{_format_number(result.actual_fps)} fps {result.container}/{result.codec}"
+        f"width={result.actual_width} px height={result.actual_height} px "
+        f"fps={_format_number(result.actual_fps)} fps "
+        f"container={result.container} codec={result.codec} "
+        f"duration={_format_number(result.duration_seconds)} s "
+        f"audio={str(result.has_audio).lower()} size={result.file_size_bytes} bytes"
     )
 
 
 def _format_number(value: float) -> str:
     return f"{value:g}"
+
+
+def _format_optional_measure(value: float | None, unit: str) -> str:
+    if value is None:
+        return "None"
+    return f"{_format_number(float(value))} {unit}"
+
+
+def _is_pyside6_import_error(error: ImportError) -> bool:
+    module_name = error.name or ""
+    message = str(error)
+    return (
+        module_name == "PySide6"
+        or module_name.startswith("PySide6.")
+        or "No module named 'PySide6" in message
+        or "from 'PySide6" in message
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
