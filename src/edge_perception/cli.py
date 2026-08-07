@@ -21,6 +21,8 @@ from edge_perception.config import (
 )
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import detector_descriptors, load_detector
+from edge_perception.inspection import render_run_inspection
+from edge_perception.run_view import load_run_view
 from edge_perception.runner import run_checkpoint, validate_output_directory
 
 
@@ -151,6 +153,9 @@ def _build_parser() -> _Parser:
         type=_nonnegative_tolerance("score-atol"),
         default=1e-4,
     )
+
+    inspect = subparsers.add_parser("inspect", help="inspect one canonical run")
+    inspect.add_argument("run_directory", type=Path)
 
     gui = subparsers.add_parser("gui", help="open the native research GUI")
     gui.add_argument("--run", type=Path)
@@ -284,6 +289,12 @@ def _compare_command(args: argparse.Namespace) -> int:
     return 0 if equivalent else 1
 
 
+def _inspect_command(args: argparse.Namespace) -> int:
+    view = load_run_view(cast(Path, args.run_directory))
+    print(render_run_inspection(view))
+    return 0
+
+
 def _gui_command(args: argparse.Namespace) -> int:
     run_dir = cast(Path | None, args.run)
     if run_dir is not None:
@@ -411,6 +422,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_command(args)
         if args.command == "compare":
             return _compare_command(args)
+        if args.command == "inspect":
+            return _inspect_command(args)
         if args.command == "gui":
             return _gui_command(args)
         if args.command == "camera":

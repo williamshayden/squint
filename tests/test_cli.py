@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import signal
 import sys
 from dataclasses import replace
@@ -19,6 +20,191 @@ from edge_perception.config import (
     write_run_config,
 )
 from edge_perception.detectors.registry import DetectorDescriptor
+
+
+def _write_inspect_run_fixture(tmp_path: Path) -> Path:
+    run_dir = tmp_path / "canonical-run"
+    annotated = run_dir / "annotated"
+    annotated.mkdir(parents=True)
+    for name in ("000000.png", "000002.png"):
+        (annotated / name).write_bytes(b"not decoded by canonical inspection")
+    capture_path = tmp_path / "capture.mp4"
+    manifest = {
+        "schema_version": "0.1.0",
+        "run_id": "canonical-run-id",
+        "configuration": {
+            "input_path": str((tmp_path / "source.mp4").resolve()),
+            "output_dir": str(run_dir.resolve()),
+            "regions": [{"region_id": "focus", "x": 10, "y": 20, "width": 300, "height": 200}],
+            "execution_regions": [],
+            "threshold": 0.35,
+            "max_frames": None,
+            "warmup_runs": 1,
+            "annotate_every": 2,
+            "detector_id": "fake",
+            "device": "cuda",
+            "batch_size": 1,
+        },
+        "source_video": {
+            "path": str((tmp_path / "source.mp4").resolve()),
+            "sha256": "a" * 64,
+            "frame_width": 640,
+            "frame_height": 480,
+            "capture": {
+                "request": {
+                    "device_id": "camera-1",
+                    "device_description": "Desk camera",
+                    "requested_width": 1920,
+                    "requested_height": None,
+                    "requested_fps": 30.0,
+                    "strict": True,
+                },
+                "selected_width": 1920,
+                "selected_height": 1080,
+                "selected_min_fps": 24.0,
+                "selected_max_fps": 60.0,
+                "selected_pixel_format": "NV12",
+                "actual_width": 1920,
+                "actual_height": 1080,
+                "actual_fps": 29.97,
+                "container": "mp4",
+                "codec": "h264",
+                "duration_seconds": 0.1,
+                "has_audio": False,
+                "file_size_bytes": 1234,
+                "path": str(capture_path.resolve()),
+                "sha256": "b" * 64,
+            },
+        },
+        "host": {},
+        "detector": {
+            "adapter": "tests.fake",
+            "model_id": "tests/fake-detector",
+            "revision": "test-revision",
+            "weights_sha256": "c" * 64,
+            "backend": "fake",
+            "backend_version": "1.0",
+            "device": "cuda:1",
+            "dtype": "float32",
+        },
+        "dependencies": {},
+        "timing_definitions": {},
+    }
+    summary = {
+        "schema_version": "0.1.0",
+        "run_id": "canonical-run-id",
+        "status": "complete",
+        "frames_processed": 3,
+        "inference_count": 6,
+        "annotated_frame_count": 2,
+        "latency_ms": {
+            "full_frame": {"count": 3, "p50_ms": 4.0, "p95_ms": 5.0, "p99_ms": 6.0},
+            "crop": {"count": 3, "p50_ms": 2.0, "p95_ms": 3.0, "p99_ms": 4.0},
+            "complete_frame": {"count": 3, "p50_ms": 0.5, "p95_ms": 1.5, "p99_ms": 2.5},
+        },
+        "stage_latency_ms": {},
+        "hardware_peaks": {
+            "process_rss_bytes": 4096,
+            "system_memory_used_bytes": None,
+            "gpu_utilization_percent": None,
+            "gpu_memory_used_bytes": None,
+            "gpu_power_watts": None,
+            "gpu_temperature_c": None,
+        },
+        "detector_peak_device_memory_bytes": 8192,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return run_dir
+
+
+def test_inspect_command_renders_a_real_canonical_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir = _write_inspect_run_fixture(tmp_path)
+    capture_path = tmp_path / "capture.mp4"
+
+    assert cli.main(["inspect", str(run_dir)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == f"""Run
+  status: Completed
+  directory: {run_dir.resolve()}
+
+Metrics
+  frames processed: 3
+  inference count: 6
+  frame latency p50: 0.500 ms
+  frame latency p95: 1.500 ms
+  frame latency p99: 2.500 ms
+  peak process RSS: 4096 bytes
+  peak device memory: 8192 bytes
+
+Run configuration
+  detector: tests/fake-detector
+  detector revision: test-revision
+  device: cuda:1
+  threshold: 0.350
+  regions:
+    focus: x=10 px y=20 px width=300 px height=200 px
+
+Source provenance
+  path: {tmp_path / "source.mp4"}
+  dimensions: 640 x 480 px
+
+Capture provenance
+  request:
+    device: camera-1
+    device description: Desk camera
+    requested width: 1920 px
+    requested height: N/A
+    requested FPS: 30.000 fps
+    strict: true
+  selected format:
+    dimensions: 1920 x 1080 px
+    FPS range: 24.000-60.000 fps
+    pixel format: NV12
+  recorded format:
+    dimensions: 1920 x 1080 px
+    FPS: 29.970 fps
+    container: mp4
+    codec: h264
+    duration: 0.100 s
+    audio: false
+    file size: 1234 bytes
+    path: {capture_path}
+  SHA-256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+Annotations
+  count: 2
+  paths:
+    {run_dir / "annotated" / "000000.png"}
+    {run_dir / "annotated" / "000002.png"}
+"""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(("artifact", "contents"), [("manifest.json", None), ("summary.json", "{")])
+def test_inspect_command_reports_missing_or_malformed_canonical_artifacts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    artifact: str,
+    contents: str | None,
+) -> None:
+    run_dir = _write_inspect_run_fixture(tmp_path)
+    artifact_path = run_dir / artifact
+    if contents is None:
+        artifact_path.unlink()
+    else:
+        artifact_path.write_text(contents, encoding="utf-8")
+
+    assert cli.main(["inspect", str(run_dir)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith(f"error: {artifact}")
+    assert captured.err.count("\n") == 1
 
 
 def _camera_device() -> CameraDeviceInfo:
