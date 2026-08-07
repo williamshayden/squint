@@ -47,7 +47,14 @@ with av.open("three-frames.mp4", mode="w") as container:
         container.mux(packet)
 ```
 
-This fixes the encoded dimensions at 200×100, the stream rate and time base at 30 FPS, and the submitted frame sequence at exactly three frames.
+This fixes the encoded dimensions at 200×100, the stream rate and time base at 30 FPS, and the submitted frame sequence at exactly three frames. The acceptance oracle then uses production `probe_video` to assert 200×100 and approximately 30 FPS, fully consumes production `iter_video`, and asserts decoded indices `[0, 1, 2]` with three `(100, 200, 3)` RGB images. The `--max-frames 3` run limit therefore cannot hide a fourth decoded frame.
+
+The first focused run after adding these characterization assertions passed honestly without a fabricated RED:
+
+```text
+./.tools/uv.exe run pytest tests/test_cli_workflow_acceptance.py -q
+1 passed in 0.92s
+```
 
 ## Exact acceptance workflow
 
@@ -147,10 +154,10 @@ The required commands and observed results were:
 
 ```text
 ./.tools/uv.exe run pytest tests/test_cli_workflow_acceptance.py -q
-1 passed in 0.94s (final rerun; the first Task 7 run is recorded above)
+1 passed in 0.58s (Fix Round 1 final rerun; the first Task 7 run is recorded above)
 
 ./.tools/uv.exe run pytest -m "not model" -q
-396 passed, 1 skipped, 1 deselected in 10.29s
+396 passed, 1 skipped, 1 deselected in 11.55s
 
 ./.tools/uv.exe run ruff check src tests
 All checks passed!
@@ -233,7 +240,7 @@ No CPU real-model lane was run because the already-cached CUDA lane was sufficie
 - The one-frame real D-FINE/CUDA run is a functional smoke check only.
 - The short strict EMEET sample did not meet the requested recorded FPS; the successful non-strict sample reported 20.0008 FPS rather than 30 FPS.
 - No public provider, network downloader, public dataset, ground truth, tracking, policy, or reinforcement-learning environment was evaluated.
-- Windows and Linux are supported; macOS remains unvalidated.
+- Windows was exercised by this checkpoint. Linux compatibility is supported by design but was not exercised in this checkpoint. macOS remains unvalidated.
 
 ## Next scientific question
 

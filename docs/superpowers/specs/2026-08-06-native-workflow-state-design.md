@@ -6,6 +6,8 @@
 
 **Project:** Adaptive Edge Perception (working title)
 
+**Platform evidence:** Windows was exercised by this checkpoint. Linux compatibility is supported by design but was not exercised in this checkpoint. macOS remains unvalidated.
+
 ## 1. Outcome
 
 The product is a CLI-first research tool with an optional native GUI. A researcher can supply an existing video, materialize a public video, or optionally capture a camera source; then configure a run, execute it, inspect its results, and compare runs without opening a window. The native application presents the same workflow visually:

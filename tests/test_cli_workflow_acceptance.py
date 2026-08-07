@@ -9,6 +9,7 @@ import pytest
 from conftest import FakeDetector
 
 from edge_perception import cli
+from edge_perception.video import iter_video, probe_video
 
 
 def _write_three_frame_video(path: Path) -> None:
@@ -40,6 +41,17 @@ def test_local_video_run_inspect_rerun_compare_workflow(
     run_a = tmp_path / "run-a"
     run_b = tmp_path / "run-b"
     _write_three_frame_video(video_path)
+    metadata = probe_video(video_path)
+    assert metadata.width == 200
+    assert metadata.height == 100
+    assert metadata.average_fps == pytest.approx(30.0)
+    decoded_frames = list(iter_video(video_path))
+    assert [frame.frame_index for frame in decoded_frames] == [0, 1, 2]
+    assert [frame.image.shape for frame in decoded_frames] == [
+        (100, 200, 3),
+        (100, 200, 3),
+        (100, 200, 3),
+    ]
     monkeypatch.setattr(
         cli,
         "load_detector",
