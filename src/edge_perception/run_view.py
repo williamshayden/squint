@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -140,6 +141,33 @@ def _integer(
     if not positive and value < 0:
         raise ValueError(f"{field_path} must not be negative")
     return value
+
+
+def _sha256(parent: dict[str, object], key: str, path: str) -> str:
+    field_path = f"{path}.{key}"
+    value = _string(parent, key, path)
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            f"{field_path} must contain 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
+def _resolved_path(
+    parent: dict[str, object],
+    key: str,
+    path: str,
+    *,
+    base_dir: Path,
+) -> Path:
+    field_path = f"{path}.{key}"
+    value = Path(_string(parent, key, path))
+    if not value.is_absolute():
+        value = base_dir / value
+    try:
+        return value.resolve()
+    except OSError as error:
+        raise ValueError(f"{field_path}: {error}") from error
 
 
 def _number(parent: dict[str, object], key: str, path: str) -> float:
@@ -295,6 +323,25 @@ def load_run_view(run_dir: Path) -> RunViewData:
     hardware = _mapping(summary, "hardware_peaks", "summary.json")
     source_width = _integer(source, "frame_width", "manifest.json.source_video", positive=True)
     source_height = _integer(source, "frame_height", "manifest.json.source_video", positive=True)
+    source_path = _resolved_path(
+        source,
+        "path",
+        "manifest.json.source_video",
+        base_dir=resolved_run_dir,
+    )
+    source_sha256 = _sha256(source, "sha256", "manifest.json.source_video")
+    capture = _capture(source, resolved_run_dir)
+    if capture is not None:
+        if capture.path.resolve() != source_path:
+            raise ValueError(
+                "manifest.json.source_video.capture.path must resolve to "
+                "manifest.json.source_video.path"
+            )
+        if capture.sha256 != source_sha256:
+            raise ValueError(
+                "manifest.json.source_video.capture.sha256 must match "
+                "manifest.json.source_video.sha256"
+            )
     threshold = _number(configuration, "threshold", "manifest.json.configuration")
     if threshold > 1.0:
         raise ValueError("manifest.json.configuration.threshold must not exceed 1.0")
@@ -325,10 +372,10 @@ def load_run_view(run_dir: Path) -> RunViewData:
         detector_revision=_string(detector, "revision", "manifest.json.detector", nonempty=False),
         device=_string(detector, "device", "manifest.json.detector", nonempty=False),
         threshold=threshold,
-        source_path=Path(_string(source, "path", "manifest.json.source_video")),
+        source_path=source_path,
         source_width=source_width,
         source_height=source_height,
-        capture=_capture(source, resolved_run_dir),
+        capture=capture,
         regions=_regions(configuration, source_width, source_height),
         annotation_paths=annotation_paths,
         error=error_value,

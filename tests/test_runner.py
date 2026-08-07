@@ -142,6 +142,49 @@ def test_run_checkpoint_records_capture_provenance_and_requested_overrides(
     assert manifest["configuration"]["device"] == "cuda"
 
 
+def test_run_checkpoint_preflight_rejects_capture_sha_before_output_claim(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    capture = CaptureResult(
+        request=CaptureRequest("camera-1", "EMEET", 200, 100, 30.0, True),
+        selected_width=200,
+        selected_height=100,
+        selected_min_fps=30.0,
+        selected_max_fps=30.0,
+        selected_pixel_format="NV12",
+        actual_width=200,
+        actual_height=100,
+        actual_fps=30.0,
+        container="mp4",
+        codec="h264",
+        duration_seconds=0.1,
+        has_audio=False,
+        file_size_bytes=video_path.stat().st_size,
+        path=video_path,
+        sha256="0" * 64,
+    )
+    output_dir = tmp_path / "captured-run"
+    config = RunConfig(
+        input_path=video_path,
+        output_dir=output_dir,
+        regions=(),
+        threshold=0.3,
+        max_frames=0,
+        warmup_runs=0,
+        annotate_every=0,
+        capture=capture,
+    )
+
+    with pytest.raises(ValueError, match="capture SHA-256"):
+        run_checkpoint(config, fake_detector)
+
+    assert not output_dir.exists()
+    assert fake_detector.warmup_calls == []
+    assert fake_detector.predict_batch_sizes == []
+
+
 def test_run_checkpoint_finalizes_outputs_and_telemetry_when_detector_fails(
     video_path: Path,
     tmp_path: Path,

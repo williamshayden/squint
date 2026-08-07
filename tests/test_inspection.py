@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,15 @@ import pytest
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
 from edge_perception.inspection import render_run_inspection
-from edge_perception.run_view import RunViewData
+from edge_perception.run_view import RunViewData, load_run_view
 
 
-def _capture(tmp_path: Path) -> CaptureResult:
+def _capture(
+    tmp_path: Path,
+    *,
+    path: Path | None = None,
+    sha256: str = "b" * 64,
+) -> CaptureResult:
     return CaptureResult(
         request=CaptureRequest("camera-1", "Desk camera", 1920, None, 30.0, True),
         selected_width=1920,
@@ -26,9 +32,112 @@ def _capture(tmp_path: Path) -> CaptureResult:
         duration_seconds=0.1,
         has_audio=False,
         file_size_bytes=1234,
-        path=tmp_path / "capture.mp4",
-        sha256="b" * 64,
+        path=tmp_path / "capture.mp4" if path is None else path,
+        sha256=sha256,
     )
+
+
+def _write_run_view_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    run_dir = tmp_path / "run"
+    (run_dir / "annotated").mkdir(parents=True)
+    source_path = (tmp_path / "historical-source.mp4").resolve()
+    source_sha256 = "b" * 64
+    manifest = {
+        "schema_version": "0.1.0",
+        "run_id": "inspection-run-id",
+        "configuration": {
+            "threshold": 0.35,
+            "regions": [],
+        },
+        "source_video": {
+            "path": str(source_path),
+            "sha256": source_sha256,
+            "frame_width": 640,
+            "frame_height": 480,
+            "capture": _capture(
+                tmp_path,
+                path=source_path,
+                sha256=source_sha256,
+            ).to_dict(),
+        },
+        "detector": {
+            "model_id": "tests/fake-detector",
+            "revision": "test-revision",
+            "device": "cpu",
+        },
+    }
+    summary = {
+        "schema_version": "0.1.0",
+        "run_id": "inspection-run-id",
+        "status": "complete",
+        "frames_processed": 0,
+        "inference_count": 0,
+        "annotated_frame_count": 0,
+        "latency_ms": {
+            "complete_frame": {
+                "count": 0,
+                "p50_ms": None,
+                "p95_ms": None,
+                "p99_ms": None,
+            }
+        },
+        "hardware_peaks": {"process_rss_bytes": None},
+        "detector_peak_device_memory_bytes": None,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return run_dir, source_path
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("capture_sha", r"manifest\.json\.source_video\.capture\.sha256"),
+        ("capture_path", r"manifest\.json\.source_video\.capture\.path"),
+    ],
+)
+def test_load_run_view_rejects_inconsistent_capture_provenance(
+    mutation: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    run_dir, _source_path = _write_run_view_fixture(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    capture = manifest["source_video"]["capture"]
+    if mutation == "capture_sha":
+        capture["sha256"] = "c" * 64
+    else:
+        capture["path"] = str((tmp_path / "different-source.mp4").resolve())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_run_view(run_dir)
+
+
+def test_load_run_view_rejects_invalid_source_sha256(tmp_path: Path) -> None:
+    run_dir, _source_path = _write_run_view_fixture(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_video"]["sha256"] = "not-a-sha256"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"manifest\.json\.source_video\.sha256"):
+        load_run_view(run_dir)
+
+
+def test_load_run_view_accepts_consistent_capture_without_original_media(
+    tmp_path: Path,
+) -> None:
+    run_dir, source_path = _write_run_view_fixture(tmp_path)
+
+    view = load_run_view(run_dir)
+
+    assert not source_path.exists()
+    assert view.source_path == source_path
+    assert view.capture is not None
+    assert view.capture.path == source_path
+    assert view.capture.sha256 == "b" * 64
 
 
 def _view(

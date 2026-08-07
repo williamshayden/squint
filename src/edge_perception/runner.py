@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -22,6 +21,10 @@ from edge_perception.geometry import (
     validate_region,
 )
 from edge_perception.outputs import RunOutputs, summarize_latencies
+from edge_perception.preflight import RunPreflight, preflight_run
+from edge_perception.preflight import (
+    validate_output_directory as _validate_output_directory,
+)
 from edge_perception.progress import (
     CancelCheck,
     ProgressCallback,
@@ -39,14 +42,6 @@ def _milliseconds(start_ns: int, end_ns: int) -> float:
     return (end_ns - start_ns) / 1_000_000.0
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _dependency_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
     for distribution in ("adaptive-edge-perception", "av", "numpy", "pillow", "psutil"):
@@ -62,15 +57,9 @@ def _video_iterator(path: Path) -> Generator[DecodedFrame, None, None]:
 
 
 def validate_output_directory(output_dir: Path) -> None:
-    """Allow absent or empty run directories while preserving existing contents."""
+    """Preserve the established runner-level output validation API."""
 
-    resolved = Path(output_dir).resolve()
-    if not resolved.exists():
-        return
-    if not resolved.is_dir():
-        raise ValueError(f"output is not a directory: {resolved}")
-    if any(resolved.iterdir()):
-        raise ValueError(f"output directory must be empty: {resolved}")
+    _validate_output_directory(output_dir)
 
 
 def _preview_and_validate(
@@ -120,8 +109,8 @@ def _timing_definitions() -> dict[str, str]:
 def _manifest(
     config: RunConfig,
     detector: Detector,
-    first_frame: DecodedFrame,
     full_region: Region,
+    preflight: RunPreflight,
 ) -> dict[str, object]:
     return {
         "configuration": {
@@ -142,9 +131,9 @@ def _manifest(
         },
         "source_video": {
             "path": str(config.input_path.resolve()),
-            "sha256": _sha256_file(config.input_path),
-            "frame_width": int(first_frame.image.shape[1]),
-            "frame_height": int(first_frame.image.shape[0]),
+            "sha256": preflight.source_sha256,
+            "frame_width": preflight.frame_width,
+            "frame_height": preflight.frame_height,
             "capture": None if config.capture is None else config.capture.to_dict(),
         },
         "host": collect_host_report(),
@@ -268,13 +257,11 @@ def run_checkpoint(
 
     emit("validating")
     try:
-        if not config.input_path.is_file():
-            raise FileNotFoundError(f"input video does not exist: {config.input_path}")
-        validate_output_directory(config.output_dir)
+        preflight = preflight_run(config)
         first_frame, full_region, preview = _preview_and_validate(config)
 
         try:
-            manifest = _manifest(config, detector, first_frame, full_region)
+            manifest = _manifest(config, detector, full_region, preflight)
             run_id = uuid4().hex
             with RunOutputs(config.output_dir, run_id=run_id, manifest=manifest) as outputs:
                 try:
