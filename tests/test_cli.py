@@ -826,6 +826,39 @@ def test_sigint_requests_cooperative_cancellation_and_restores_handler(
     assert signal.getsignal(signal.SIGINT) == previous_handler
 
 
+def test_reentrant_sigint_uses_default_handler_and_restores_previous_handler(
+    tmp_path: Path,
+    video_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReentrantEvent:
+        def __init__(self) -> None:
+            self.set_calls = 0
+
+        def is_set(self) -> bool:
+            return False
+
+        def set(self) -> None:
+            self.set_calls += 1
+            signal.raise_signal(signal.SIGINT)
+
+    cancel_event = ReentrantEvent()
+    monkeypatch.setattr(cli.threading, "Event", lambda: cancel_event)
+    monkeypatch.setattr(cli, "load_detector", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "run_checkpoint",
+        lambda *_args, **_kwargs: signal.raise_signal(signal.SIGINT),
+    )
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["run", str(video_path), "--output", str(tmp_path / "run")])
+
+    assert cancel_event.set_calls == 1
+    assert signal.getsignal(signal.SIGINT) == previous_handler
+
+
 @pytest.mark.parametrize("failure_point", ["detector", "runner"], ids=["load", "run"])
 def test_sigint_handler_is_restored_when_direct_run_errors(
     failure_point: str,

@@ -178,8 +178,7 @@ def _run_command(args: argparse.Namespace) -> int:
     previous_handler = signal.getsignal(signal.SIGINT)
 
     def request_cancel(signum: int, frame: FrameType | None) -> None:
-        if cancel_event.is_set():
-            signal.default_int_handler(signum, frame)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         cancel_event.set()
 
     signal.signal(signal.SIGINT, request_cancel)
