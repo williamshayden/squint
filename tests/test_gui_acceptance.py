@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -183,22 +184,37 @@ def test_native_gui_vertical_slice_is_config_reproducible(
     assert run_button is not None
     assert run_cli is not None
 
-    source_view.add_region(Region("roi", 10, 10, 40, 30))
+    regions = (
+        Region("z-first", 10, 10, 40, 30),
+        Region("a-second", 80, 50, 20, 25),
+    )
+    for region in regions:
+        source_view.add_region(region)
     output.setText(str(tmp_path / "run"))
     assert run_button.isEnabled()
     progress_events: list[ProgressEvent] = []
     window.runController.progressChanged.connect(progress_events.append)
+    config_path = (tmp_path / "run.experiment.json").resolve()
 
     with qtbot.waitSignal(window.runController.runFinished, timeout=1_000):
         qtbot.mouseClick(run_button, Qt.MouseButton.LeftButton)
-        config_path = window.runController.config_path
-        assert config_path == (tmp_path / "run.experiment.json").resolve()
+        assert process.start_count == 1
+        assert process.program == sys.executable
+        assert process.arguments == [
+            "-m",
+            "edge_perception.worker",
+            "--config",
+            str(config_path),
+            "--cancel-file",
+            str((tmp_path / ".run.cancel").resolve()),
+        ]
+        assert window.runController.config_path == config_path
         published_bytes = config_path.read_bytes()
 
     config = load_run_config(config_path)
     assert config.input_path == video_path.resolve()
     assert config.output_dir == (tmp_path / "run").resolve()
-    assert config.regions == (Region("roi", 10, 10, 40, 30),)
+    assert config.regions == regions
     assert config.capture is None
     assert window.runController.last_config == config
     assert config_path.read_bytes() == published_bytes
@@ -217,13 +233,13 @@ def test_native_gui_vertical_slice_is_config_reproducible(
     assert not window.resultsWidget.isHidden()
     assert window.resultsWidget.statusLabel.text() == "complete"
     assert window.resultsWidget.sourceLabel.text() == str(video_path.resolve())
-    assert window.resultsWidget.regionsTable.rowCount() == 1
-    assert [window.resultsWidget.regionsTable.item(0, column).text() for column in range(5)] == [
-        "roi",
-        "10",
-        "10",
-        "40",
-        "30",
+    assert window.resultsWidget.regionsTable.rowCount() == len(regions)
+    assert [
+        [window.resultsWidget.regionsTable.item(row, column).text() for column in range(5)]
+        for row in range(window.resultsWidget.regionsTable.rowCount())
+    ] == [
+        ["z-first", "10", "10", "40", "30"],
+        ["a-second", "80", "50", "20", "25"],
     ]
     assert window.resultsWidget.annotationList.count() == 1
     assert window.resultsWidget.annotationList.item(0).text() == "000000.png"
