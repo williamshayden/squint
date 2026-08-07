@@ -20,11 +20,19 @@ FPS_RELATIVE_TOLERANCE = 0.005
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedConfigTemporary:
+    """Creation-time identity of a config publication temporary."""
+
+    path: Path
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class ConfigPublicationResult:
     """Outcome of an exclusive config link and its owned-temp cleanup."""
 
     config_path: Path
-    retained_temporary: Path | None
+    retained_temporary: OwnedConfigTemporary | None
     error: OSError | None
     cleanup_diagnostic: str | None
 
@@ -370,6 +378,11 @@ def publish_run_config(path: Path, config: RunConfig) -> ConfigPublicationResult
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
+    temporary_stat = os.fstat(descriptor)
+    owned_temporary = OwnedConfigTemporary(
+        temporary,
+        (temporary_stat.st_dev, temporary_stat.st_ino),
+    )
     stream_open = False
     publication_error: OSError | None = None
     try:
@@ -398,12 +411,12 @@ def publish_run_config(path: Path, config: RunConfig) -> ConfigPublicationResult
             )
             publication_error.__cause__ = error
 
-    retained_temporary: Path | None = None
+    retained_temporary: OwnedConfigTemporary | None = None
     cleanup_diagnostic: str | None = None
     try:
         temporary.unlink(missing_ok=True)
     except OSError as error:
-        retained_temporary = temporary
+        retained_temporary = owned_temporary
         cleanup_diagnostic = (
             f"config publication cleanup failed while removing {temporary}: {error}"
         )

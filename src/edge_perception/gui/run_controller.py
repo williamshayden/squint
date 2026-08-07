@@ -14,7 +14,7 @@ from typing import cast
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
-from edge_perception.config import RunConfig, publish_run_config
+from edge_perception.config import OwnedConfigTemporary, RunConfig, publish_run_config
 from edge_perception.progress import ProgressEvent, ProgressPhase
 from edge_perception.runner import validate_output_directory
 
@@ -52,7 +52,7 @@ class RunController(QObject):
         self._process = QProcess(self) if process is None else process
         self._active = False
         self._config_path: Path | None = None
-        self._retained_config_temporary: Path | None = None
+        self._retained_config_temporary: OwnedConfigTemporary | None = None
         self._cancel_path: Path | None = None
         self._owned_cancel: _OwnedCancellation | None = None
         self._last_config: RunConfig | None = None
@@ -518,16 +518,35 @@ class RunController(QObject):
         return None
 
     def _cleanup_retained_config_temporary(self) -> str | None:
-        temporary = self._retained_config_temporary
-        if temporary is None:
+        owned = self._retained_config_temporary
+        if owned is None:
             return None
         try:
-            temporary.unlink()
+            current = os.stat(owned.path, follow_symlinks=False)
         except FileNotFoundError:
             self._retained_config_temporary = None
             return None
         except OSError as error:
-            return f"config publication cleanup failed while removing {temporary}: {error}"
+            return (
+                f"config publication cleanup failed while inspecting {owned.path}: {error}"
+            )
+        if not stat.S_ISREG(current.st_mode):
+            return (
+                "config publication cleanup refused to remove non-regular retained "
+                f"temporary: {owned.path}"
+            )
+        if _file_identity(current) != owned.identity:
+            return (
+                "config publication cleanup refused to remove changed retained temporary: "
+                f"{owned.path}"
+            )
+        try:
+            owned.path.unlink()
+        except FileNotFoundError:
+            self._retained_config_temporary = None
+            return None
+        except OSError as error:
+            return f"config publication cleanup failed while removing {owned.path}: {error}"
         self._retained_config_temporary = None
         return None
 

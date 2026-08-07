@@ -597,6 +597,152 @@ def test_successful_config_reservation_survives_owned_temp_cleanup_failure(
     assert fake_process.start_count == 2
 
 
+def test_terminal_cleanup_preserves_replaced_retained_config_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    finished: list[tuple[Path, dict[str, object]]] = []
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFinished.connect(lambda path, payload: finished.append((path, payload)))
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    first = make_config(tmp_path, output="terminal-replacement")
+    second = make_config(tmp_path, output="after-terminal-replacement")
+    config_path = tmp_path / "terminal-replacement.experiment.json"
+    actual_link = os.link
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def capture_link(source: str | bytes, destination: str | bytes) -> None:
+        link_sources.append(Path(source))
+        actual_link(source, destination)
+
+    def fail_initial_cleanup(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as context:
+        context.setattr(config_module.os, "link", capture_link)
+        context.setattr(Path, "unlink", fail_initial_cleanup)
+        controller.start(first)
+
+    retained = link_sources[0]
+    replacement = tmp_path / "terminal-replacement.foreign"
+    replacement.write_bytes(b"replacement")
+    os.replace(replacement, retained)
+    terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+    cleanup_error = (
+        "config publication cleanup refused to remove changed retained temporary: "
+        f"{retained}"
+    )
+
+    fake_process.emit_stdout(event_json(terminal) + "\n")
+    fake_process.finish()
+
+    assert finished == []
+    assert failures == [cleanup_error]
+    assert terminated == [None]
+    assert controller.is_active is False
+    assert controller.config_path == config_path
+    assert controller.last_config == first
+    assert load_run_config(config_path) == first
+    assert retained.read_bytes() == b"replacement"
+    assert fake_process.start_count == 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="previous config publication cleanup is unresolved",
+    ):
+        controller.start(second)
+
+    assert retained.read_bytes() == b"replacement"
+    assert not (tmp_path / "after-terminal-replacement.experiment.json").exists()
+    assert fake_process.start_count == 1
+
+    retained.unlink()
+    os.link(config_path, retained)
+    controller.start(second)
+
+    assert not retained.exists()
+    assert load_run_config(config_path) == first
+    assert controller.last_config == second
+    assert fake_process.start_count == 2
+
+
+def test_pre_reuse_cleanup_preserves_replaced_retained_config_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    first = make_config(tmp_path, output="failed-publication-replacement")
+    second = make_config(tmp_path, output="after-failed-publication-replacement")
+    first_config_path = tmp_path / "failed-publication-replacement.experiment.json"
+    second_config_path = tmp_path / "after-failed-publication-replacement.experiment.json"
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def reject_link(source: str | bytes, _destination: str | bytes) -> None:
+        link_sources.append(Path(source))
+        raise OSError("hard links disabled")
+
+    def fail_initial_cleanup(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as context:
+        context.setattr(config_module.os, "link", reject_link)
+        context.setattr(Path, "unlink", fail_initial_cleanup)
+
+        with pytest.raises(OSError) as error:
+            controller.start(first)
+
+        retained = link_sources[0]
+        assert str(error.value) == (
+            "exclusive config publication requires hard-link support: "
+            f"{first_config_path}\n"
+            f"config publication cleanup failed while removing {retained}: temp locked"
+        )
+        owned_backup = tmp_path / "owned-config-temporary"
+        os.replace(retained, owned_backup)
+        retained.write_bytes(b"replacement")
+
+    cleanup_error = (
+        "config publication cleanup refused to remove changed retained temporary: "
+        f"{retained}"
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError) as error:
+            controller.start(second)
+        assert str(error.value) == (
+            f"previous config publication cleanup is unresolved: {cleanup_error}"
+        )
+        assert retained.read_bytes() == b"replacement"
+
+    assert load_run_config(owned_backup) == first
+    assert not first_config_path.exists()
+    assert not second_config_path.exists()
+    assert controller.config_path is None
+    assert controller.last_config is None
+    assert fake_process.start_count == 0
+
+    retained.unlink()
+    os.replace(owned_backup, retained)
+    controller.start(second)
+
+    assert not retained.exists()
+    assert not owned_backup.exists()
+    assert load_run_config(second_config_path) == second
+    assert controller.config_path == second_config_path
+    assert controller.last_config == second
+    assert fake_process.start_count == 1
+
+
 def test_protocol_failure_appends_retained_config_cleanup_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
