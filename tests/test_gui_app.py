@@ -365,6 +365,7 @@ def _write_completed_run(run_dir: Path) -> Path:
         },
         "source_video": {
             "path": str((run_dir.parent / "historical-source.mp4").resolve()),
+            "sha256": "a" * 64,
             "frame_width": 640,
             "frame_height": 480,
             "capture": None,

@@ -186,6 +186,19 @@ def test_write_run_config_remains_an_explicit_replacing_write(tmp_path: Path) ->
     assert load_run_config(config_path) == second
 
 
+def test_run_config_rejects_reserved_full_frame_region_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="full-frame is a reserved region ID"):
+        RunConfig(
+            tmp_path / "source.mp4",
+            tmp_path / "run",
+            (Region("full-frame", 0, 0, 200, 100),),
+            0.3,
+            1,
+            0,
+            0,
+        )
+
+
 def _capture_result_payload() -> dict[str, object]:
     return {
         "request": {

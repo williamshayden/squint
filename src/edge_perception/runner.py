@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import sys
+import tempfile
 from collections.abc import Generator
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from time import perf_counter_ns
@@ -20,6 +23,10 @@ from edge_perception.geometry import (
     validate_region,
 )
 from edge_perception.outputs import RunOutputs, summarize_latencies
+from edge_perception.preflight import RunPreflight, preflight_run
+from edge_perception.preflight import (
+    validate_output_directory as _validate_output_directory,
+)
 from edge_perception.progress import (
     CancelCheck,
     ProgressCallback,
@@ -37,14 +44,6 @@ def _milliseconds(start_ns: int, end_ns: int) -> float:
     return (end_ns - start_ns) / 1_000_000.0
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _dependency_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
     for distribution in ("adaptive-edge-perception", "av", "numpy", "pillow", "psutil"):
@@ -60,21 +59,56 @@ def _video_iterator(path: Path) -> Generator[DecodedFrame, None, None]:
 
 
 def validate_output_directory(output_dir: Path) -> None:
-    """Allow absent or empty run directories while preserving existing contents."""
+    """Preserve the established runner-level output validation API."""
 
-    resolved = Path(output_dir).resolve()
-    if not resolved.exists():
+    _validate_output_directory(output_dir)
+
+
+def _cleanup_capture_snapshot(snapshot_path: Path | None) -> None:
+    if snapshot_path is None:
         return
-    if not resolved.is_dir():
-        raise ValueError(f"output is not a directory: {resolved}")
-    if any(resolved.iterdir()):
-        raise ValueError(f"output directory must be empty: {resolved}")
+    try:
+        snapshot_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _capture_snapshot(config: RunConfig, preflight: RunPreflight) -> Path | None:
+    capture = config.capture
+    if capture is None:
+        return None
+
+    snapshot_path: Path | None = None
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="edge-perception-capture-",
+            suffix=config.input_path.suffix,
+            delete=False,
+        ) as temporary:
+            snapshot_path = Path(temporary.name)
+            with config.input_path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    temporary.write(chunk)
+                    digest.update(chunk)
+        snapshot_sha256 = digest.hexdigest()
+        if (
+            snapshot_sha256 != preflight.source_sha256
+            or snapshot_sha256 != capture.sha256
+        ):
+            raise ValueError("capture source changed after preflight")
+        return snapshot_path
+    except BaseException:
+        _cleanup_capture_snapshot(snapshot_path)
+        raise
 
 
 def _preview_and_validate(
     config: RunConfig,
+    source_path: Path,
 ) -> tuple[DecodedFrame, Region, Generator[DecodedFrame, None, None]]:
-    preview = _video_iterator(config.input_path)
+    preview = _video_iterator(source_path)
     try:
         try:
             first_frame = next(preview)
@@ -118,8 +152,8 @@ def _timing_definitions() -> dict[str, str]:
 def _manifest(
     config: RunConfig,
     detector: Detector,
-    first_frame: DecodedFrame,
     full_region: Region,
+    preflight: RunPreflight,
 ) -> dict[str, object]:
     return {
         "configuration": {
@@ -140,9 +174,9 @@ def _manifest(
         },
         "source_video": {
             "path": str(config.input_path.resolve()),
-            "sha256": _sha256_file(config.input_path),
-            "frame_width": int(first_frame.image.shape[1]),
-            "frame_height": int(first_frame.image.shape[0]),
+            "sha256": preflight.source_sha256,
+            "frame_width": preflight.frame_width,
+            "frame_height": preflight.frame_height,
             "capture": None if config.capture is None else config.capture.to_dict(),
         },
         "host": collect_host_report(),
@@ -165,6 +199,33 @@ def _empty_hardware_peaks() -> dict[str, int | float | None]:
         "gpu_power_watts": None,
         "gpu_temperature_c": None,
     }
+
+
+@contextmanager
+def _optional_telemetry_monitor() -> Generator[TelemetryMonitor | None, None, None]:
+    try:
+        monitor = TelemetryMonitor()
+    except Exception:  # noqa: BLE001 - telemetry construction is optional
+        yield None
+        return
+
+    try:
+        monitor.__enter__()
+    except Exception:  # noqa: BLE001 - telemetry startup is optional
+        try:
+            monitor.__exit__(*sys.exc_info())
+        except Exception:  # noqa: BLE001, S110 - telemetry shutdown is optional
+            pass
+        yield None
+        return
+
+    try:
+        yield monitor
+    finally:
+        try:
+            monitor.__exit__(*sys.exc_info())
+        except Exception:  # noqa: BLE001, S110 - telemetry shutdown is optional
+            pass
 
 
 def _summary(
@@ -223,6 +284,7 @@ def run_checkpoint(
     status: RunStatus = "complete"
     summary: dict[str, object] = {}
     monitor: TelemetryMonitor | None = None
+    capture_snapshot: Path | None = None
 
     def emit(phase: ProgressPhase, error: str | None = None) -> None:
         if progress is None:
@@ -239,13 +301,13 @@ def run_checkpoint(
 
     emit("validating")
     try:
-        if not config.input_path.is_file():
-            raise FileNotFoundError(f"input video does not exist: {config.input_path}")
-        validate_output_directory(config.output_dir)
-        first_frame, full_region, preview = _preview_and_validate(config)
+        preflight = preflight_run(config)
+        capture_snapshot = _capture_snapshot(config, preflight)
+        source_path = capture_snapshot or config.input_path
+        first_frame, full_region, preview = _preview_and_validate(config, source_path)
 
         try:
-            manifest = _manifest(config, detector, first_frame, full_region)
+            manifest = _manifest(config, detector, full_region, preflight)
             run_id = uuid4().hex
             with RunOutputs(config.output_dir, run_id=run_id, manifest=manifest) as outputs:
                 try:
@@ -258,9 +320,8 @@ def run_checkpoint(
                     if cancel_requested is not None and cancel_requested():
                         status = "cancelled"
                     else:
-                        monitor = TelemetryMonitor()
-                        with monitor:
-                            measured = _video_iterator(config.input_path)
+                        with _optional_telemetry_monitor() as monitor:
+                            measured = _video_iterator(source_path)
                             try:
                                 while (
                                     config.max_frames is None
@@ -273,7 +334,8 @@ def run_checkpoint(
                                     except StopIteration:
                                         break
                                     decode_end_ns = perf_counter_ns()
-                                    stage_values["decode"].append(
+                                    frame_stage_values = _empty_stage_values()
+                                    frame_stage_values["decode"].append(
                                         _milliseconds(decode_start_ns, decode_end_ns)
                                     )
 
@@ -288,20 +350,27 @@ def run_checkpoint(
 
                                     frame_id = f"frame-{frame.frame_index:06d}"
                                     frame_detections: list[Detection] = []
-                                    serialization_ns = 0
+                                    inference_records: list[dict[str, object]] = []
+                                    detection_batches: list[
+                                        tuple[str, str, str, tuple[Detection, ...]]
+                                    ] = []
+                                    frame_full_frame_latencies: list[float] = []
+                                    frame_crop_latencies: list[float] = []
                                     execution_regions = (full_region, *config.regions)
 
                                     for region_index, region in enumerate(execution_regions):
                                         region_pipeline_start_ns = perf_counter_ns()
+                                        crop_ms = 0.0
                                         if region_index == 0:
                                             image = frame.image
                                         else:
                                             crop_start_ns = perf_counter_ns()
                                             image = crop_region(frame.image, region)
                                             crop_end_ns = perf_counter_ns()
-                                            stage_values["crop"].append(
-                                                _milliseconds(crop_start_ns, crop_end_ns)
+                                            crop_ms = _milliseconds(
+                                                crop_start_ns, crop_end_ns
                                             )
+                                            frame_stage_values["crop"].append(crop_ms)
 
                                         prediction = detector.predict((image,))
                                         if len(prediction.detections) != 1:
@@ -309,7 +378,7 @@ def run_checkpoint(
                                                 "detector prediction cardinality mismatch: "
                                                 f"expected 1, got {len(prediction.detections)}"
                                             )
-                                        stage_values["detector"].append(
+                                        frame_stage_values["detector"].append(
                                             prediction.timing.total_ms
                                         )
 
@@ -324,7 +393,7 @@ def run_checkpoint(
                                             for detection in prediction.detections[0]
                                         )
                                         mapping_end_ns = perf_counter_ns()
-                                        stage_values["coordinate_mapping"].append(
+                                        frame_stage_values["coordinate_mapping"].append(
                                             _milliseconds(mapping_start_ns, mapping_end_ns)
                                         )
                                         region_latency = _milliseconds(
@@ -332,15 +401,14 @@ def run_checkpoint(
                                             mapping_end_ns,
                                         )
                                         if region_index == 0:
-                                            full_frame_latencies.append(region_latency)
+                                            frame_full_frame_latencies.append(region_latency)
                                         else:
-                                            crop_latencies.append(region_latency)
+                                            frame_crop_latencies.append(region_latency)
 
                                         inference_id = (
                                             f"inference-{frame.frame_index:06d}-{region_index:03d}"
                                         )
-                                        serialize_start_ns = perf_counter_ns()
-                                        outputs.write_inference(
+                                        inference_records.append(
                                             {
                                                 "frame_id": frame_id,
                                                 "frame_index": frame.frame_index,
@@ -355,11 +423,7 @@ def run_checkpoint(
                                                     decode_start_ns,
                                                     decode_end_ns,
                                                 ),
-                                                "crop_ms": (
-                                                    0.0
-                                                    if region_index == 0
-                                                    else stage_values["crop"][-1]
-                                                ),
+                                                "crop_ms": crop_ms,
                                                 "coordinate_mapping_ms": _milliseconds(
                                                     mapping_start_ns,
                                                     mapping_end_ns,
@@ -368,53 +432,57 @@ def run_checkpoint(
                                                 "detector_timing": prediction.timing.to_dict(),
                                             }
                                         )
-                                        outputs.write_detections(
-                                            frame_id=frame_id,
-                                            inference_id=inference_id,
-                                            region_id=region.region_id,
-                                            detections=mapped,
+                                        detection_batches.append(
+                                            (
+                                                frame_id,
+                                                inference_id,
+                                                region.region_id,
+                                                mapped,
+                                            )
                                         )
-                                        serialization_ns += (
-                                            perf_counter_ns() - serialize_start_ns
-                                        )
-                                        inference_count += 1
                                         frame_detections.extend(mapped)
 
+                                    annotation = None
                                     if (
                                         config.annotate_every > 0
                                         and frame.frame_index % config.annotate_every == 0
                                     ):
-                                        annotation_start_ns = perf_counter_ns()
-                                        outputs.annotate(
+                                        annotation = (
                                             frame.frame_index,
                                             frame.image,
-                                            regions=execution_regions,
-                                            detections=frame_detections,
+                                            execution_regions,
+                                            tuple(frame_detections),
                                         )
-                                        annotation_end_ns = perf_counter_ns()
-                                        stage_values["annotation"].append(
-                                            _milliseconds(
-                                                annotation_start_ns,
-                                                annotation_end_ns,
-                                            )
-                                        )
-                                        annotated_frame_count += 1
 
-                                    flush_start_ns = perf_counter_ns()
-                                    outputs.flush_frame()
-                                    serialization_ns += perf_counter_ns() - flush_start_ns
-                                    stage_values["serialization"].append(
-                                        serialization_ns / 1_000_000.0
+                                    annotation_ms, serialization_ms = outputs.commit_frame(
+                                        inferences=inference_records,
+                                        detection_batches=detection_batches,
+                                        annotation=annotation,
                                     )
+                                    frame_stage_values["serialization"].append(
+                                        serialization_ms
+                                    )
+                                    if annotation_ms is not None:
+                                        frame_stage_values["annotation"].append(annotation_ms)
                                     frame_pipeline_end_ns = perf_counter_ns()
                                     complete_frame_latency = _milliseconds(
                                         frame_pipeline_start_ns,
                                         frame_pipeline_end_ns,
                                     )
-                                    stage_values["frame_pipeline"].append(
+                                    frame_stage_values["frame_pipeline"].append(
                                         complete_frame_latency
                                     )
+
+                                    for stage_name, values in frame_stage_values.items():
+                                        stage_values[stage_name].extend(values)
+                                    full_frame_latencies.extend(
+                                        frame_full_frame_latencies
+                                    )
+                                    crop_latencies.extend(frame_crop_latencies)
                                     complete_frame_latencies.append(complete_frame_latency)
+                                    inference_count += len(inference_records)
+                                    if annotation is not None:
+                                        annotated_frame_count += 1
                                     frames_processed += 1
                                     emit("running")
                                     if (
@@ -433,9 +501,16 @@ def run_checkpoint(
                     if monitor is None:
                         hardware_peaks = _empty_hardware_peaks()
                     else:
-                        for sample in monitor.samples:
-                            outputs.write_hardware(sample.to_dict())
-                        hardware_peaks = monitor.peaks()
+                        try:
+                            for sample in monitor.samples:
+                                outputs.write_hardware(sample.to_dict())
+                            hardware_peaks = monitor.peaks()
+                        except Exception:  # noqa: BLE001 - telemetry is optional
+                            hardware_peaks = _empty_hardware_peaks()
+                    try:
+                        peak_device_memory_bytes = detector.peak_device_memory_bytes()
+                    except Exception:  # noqa: BLE001 - optional detector telemetry
+                        peak_device_memory_bytes = None
                     summary = _summary(
                         status=status,
                         failure=failure,
@@ -447,14 +522,24 @@ def run_checkpoint(
                         complete_frame_latencies=complete_frame_latencies,
                         stage_values=stage_values,
                         hardware_peaks=hardware_peaks,
-                        peak_device_memory_bytes=detector.peak_device_memory_bytes(),
+                        peak_device_memory_bytes=peak_device_memory_bytes,
                     )
-                    outputs.write_summary(summary)
+                    try:
+                        outputs.write_summary(summary)
+                    except Exception as finalization_error:
+                        if failure is None:
+                            raise
+                        failure.add_note(
+                            "failed to publish terminal summary: "
+                            f"{type(finalization_error).__name__}: {finalization_error}"
+                        )
         finally:
             preview.close()
     except BaseException as error:
         emit("failed", f"{type(error).__name__}: {error}")
         raise
+    finally:
+        _cleanup_capture_snapshot(capture_snapshot)
 
     emit(status)
     return summary

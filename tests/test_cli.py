@@ -19,6 +19,7 @@ from edge_perception.config import (
     RunConfig,
     write_run_config,
 )
+from edge_perception.contracts import Region
 from edge_perception.detectors.registry import DetectorDescriptor
 
 
@@ -28,7 +29,7 @@ def _write_inspect_run_fixture(tmp_path: Path) -> Path:
     annotated.mkdir(parents=True)
     for name in ("000000.png", "000002.png"):
         (annotated / name).write_bytes(b"not decoded by canonical inspection")
-    capture_path = tmp_path / "capture.mp4"
+    capture_path = tmp_path / "source.mp4"
     manifest = {
         "schema_version": "0.1.0",
         "run_id": "canonical-run-id",
@@ -73,7 +74,7 @@ def _write_inspect_run_fixture(tmp_path: Path) -> Path:
                 "has_audio": False,
                 "file_size_bytes": 1234,
                 "path": str(capture_path.resolve()),
-                "sha256": "b" * 64,
+                "sha256": "a" * 64,
             },
         },
         "host": {},
@@ -123,7 +124,7 @@ def test_inspect_command_renders_a_real_canonical_run(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     run_dir = _write_inspect_run_fixture(tmp_path)
-    capture_path = tmp_path / "capture.mp4"
+    capture_path = tmp_path / "source.mp4"
 
     assert cli.main(["inspect", str(run_dir)]) == 0
 
@@ -174,7 +175,7 @@ Capture provenance
     audio: false
     file size: 1234 bytes
     path: {capture_path}
-  SHA-256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 Annotations
   count: 2
@@ -580,6 +581,104 @@ def _install_fake_detector(
 
     monkeypatch.setattr(cli, "load_detector", fake_load_detector)
     return calls
+
+
+def _capture_provenance(video_path: Path, *, sha256: str) -> CaptureResult:
+    return CaptureResult(
+        request=CaptureRequest("camera-1", "Test camera", 200, 100, 30.0, True),
+        selected_width=200,
+        selected_height=100,
+        selected_min_fps=30.0,
+        selected_max_fps=30.0,
+        selected_pixel_format="NV12",
+        actual_width=200,
+        actual_height=100,
+        actual_fps=30.0,
+        container="mp4",
+        codec="mpeg4",
+        duration_seconds=0.1,
+        has_audio=False,
+        file_size_bytes=video_path.stat().st_size,
+        path=video_path,
+        sha256=sha256,
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_input",
+    ["deleted_source", "out_of_bounds_roi", "nonempty_output", "capture_sha_mismatch"],
+)
+def test_run_preflight_rejects_invalid_input_before_loading_detector(
+    invalid_input: str,
+    video_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_dir = tmp_path / "run"
+    regions: tuple[Region, ...] = ()
+    capture = None
+    if invalid_input == "out_of_bounds_roi":
+        regions = (Region("outside", 199, 0, 2, 1),)
+    elif invalid_input == "nonempty_output":
+        output_dir.mkdir()
+        (output_dir / "keep-me.txt").write_text("user data", encoding="utf-8")
+    elif invalid_input == "capture_sha_mismatch":
+        capture = _capture_provenance(video_path, sha256="0" * 64)
+
+    config_path = tmp_path / "experiment.json"
+    write_run_config(
+        config_path,
+        RunConfig(video_path, output_dir, regions, 0.3, 1, 0, 0, capture=capture),
+    )
+    if invalid_input == "deleted_source":
+        video_path.unlink()
+
+    load_calls: list[str] = []
+
+    def forbidden_loader(detector_id: str, **_kwargs: object) -> object:
+        load_calls.append(detector_id)
+        raise AssertionError("detector loader must not run before preflight succeeds")
+
+    monkeypatch.setattr(cli, "load_detector", forbidden_loader)
+
+    assert cli.main(["run", "--config", str(config_path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert captured.err.count("\n") == 1
+    assert "Traceback" not in captured.err
+    assert load_calls == []
+
+
+def test_run_config_regions_object_is_a_controlled_model_free_error(
+    video_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "experiment.json"
+    write_run_config(
+        config_path,
+        RunConfig(video_path, tmp_path / "run", (), 0.3, 1, 0, 0),
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["regions"] = {}
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    load_calls: list[str] = []
+
+    def forbidden_loader(detector_id: str, **_kwargs: object) -> object:
+        load_calls.append(detector_id)
+        raise AssertionError("detector loader must not run for malformed config")
+
+    monkeypatch.setattr(cli, "load_detector", forbidden_loader)
+
+    assert cli.main(["run", "--config", str(config_path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: regions must be an array\n"
+    assert "Traceback" not in captured.err
+    assert load_calls == []
 
 
 def test_run_command_parses_declared_crops_and_passes_threshold_once(
