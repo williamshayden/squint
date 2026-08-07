@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import io
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -11,8 +13,11 @@ from pathlib import Path
 
 import pytest
 
+from scripts import verify_release_archives as release_verifier
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-UV = PROJECT_ROOT / ".tools" / "uv.exe"
+UV_ENV_VAR = "RELEASE_ARCHIVES_UV"
+LOCAL_UV = PROJECT_ROOT / ".tools" / "uv.exe"
 VERIFIER = PROJECT_ROOT / "scripts" / "verify_release_archives.py"
 WHEEL_NAME = "adaptive_edge_perception-0.1.0-py3-none-any.whl"
 SDIST_NAME = "adaptive_edge_perception-0.1.0.tar.gz"
@@ -20,11 +25,23 @@ DIST_INFO = "adaptive_edge_perception-0.1.0.dist-info"
 SDIST_ROOT = "adaptive_edge_perception-0.1.0"
 
 
+def _resolve_uv() -> str:
+    override = os.environ.get(UV_ENV_VAR)
+    if override:
+        return override
+    uv = shutil.which("uv")
+    if uv:
+        return uv
+    if sys.platform == "win32" and LOCAL_UV.is_file():
+        return str(LOCAL_UV)
+    raise RuntimeError("uv is required; set RELEASE_ARCHIVES_UV or install uv on PATH")
+
+
 @pytest.fixture(scope="module")
 def release_archives(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     dist = tmp_path_factory.mktemp("release-archives")
     result = subprocess.run(
-        [str(UV), "build", "--offline", "--out-dir", str(dist)],
+        [_resolve_uv(), "build", "--offline", "--out-dir", str(dist)],
         cwd=PROJECT_ROOT,
         check=False,
         capture_output=True,
@@ -32,6 +49,85 @@ def release_archives(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Pa
     )
     assert result.returncode == 0, result.stderr
     return dist / WHEEL_NAME, dist / SDIST_NAME
+
+
+def test_uv_resolver_prefers_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(UV_ENV_VAR, "uv-from-override")
+    monkeypatch.setattr(shutil, "which", lambda name: "uv-from-path")
+
+    assert _resolve_uv() == "uv-from-override"
+
+
+def test_uv_resolver_uses_path_before_local_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(UV_ENV_VAR, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "uv-from-path")
+
+    assert _resolve_uv() == "uv-from-path"
+
+
+def test_uv_resolver_uses_local_bootstrap_only_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(UV_ENV_VAR, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert _resolve_uv() == str(LOCAL_UV)
+
+
+def test_uv_resolver_does_not_use_windows_bootstrap_on_non_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(UV_ENV_VAR, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    with pytest.raises(RuntimeError, match="uv is required"):
+        _resolve_uv()
+
+
+def test_git_resolver_prefers_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(release_verifier.GIT_ENV_VAR, "git-from-override")
+    monkeypatch.setattr(shutil, "which", lambda name: "git-from-path")
+
+    assert release_verifier._resolve_git() == "git-from-override"
+
+
+def test_git_resolver_uses_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(release_verifier.GIT_ENV_VAR, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "git-from-path")
+
+    assert release_verifier._resolve_git() == "git-from-path"
+
+
+def test_git_command_uses_resolved_executable_and_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(release_verifier.GIT_ENV_VAR, "git-from-override")
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        arguments: list[str], *, check: bool, capture_output: bool
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((arguments, check, capture_output))
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"contract")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert release_verifier._git_head_bytes("show", "HEAD:LICENSE") == b"contract"
+    assert calls == [
+        (
+            [
+                "git-from-override",
+                "-C",
+                str(release_verifier.PROJECT_ROOT),
+                "show",
+                "HEAD:LICENSE",
+            ],
+            False,
+            True,
+        )
+    ]
 
 
 def _rewrite_wheel(

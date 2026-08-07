@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Verify the exact public file and license-metadata contract for release archives."""
+"""Verify the exact public file and license-metadata contract for release archives.
+
+Set ``RELEASE_ARCHIVES_GIT`` only when Git is not discoverable on ``PATH``.
+"""
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -33,12 +38,18 @@ SDIST_PROJECT_MEMBERS = frozenset(
     {"LICENSE", "README.md", "pyproject.toml", "uv.lock", "PKG-INFO"}
 )
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GIT_ENV_VAR = "RELEASE_ARCHIVES_GIT"
 
 
-if __name__ != "__main__":
-    from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+try:
+    from hatchling.builders.hooks.plugin.interface import (  # type: ignore[import-not-found]
+        BuildHookInterface,
+    )
+except ModuleNotFoundError:
+    BuildHookInterface = None
 
-    class CustomBuildHook(BuildHookInterface):
+if __name__ != "__main__" and BuildHookInterface is not None:
+    class CustomBuildHook(BuildHookInterface):  # type: ignore[misc]
         """Keep Hatch's VCS filters without publishing the filter files themselves."""
 
         def initialize(self, version: str, build_data: dict[str, Any]) -> None:
@@ -54,10 +65,20 @@ class ArchivePolicyError(ValueError):
     """A release archive violates the public release policy."""
 
 
+def _resolve_git() -> str:
+    override = os.environ.get(GIT_ENV_VAR)
+    if override:
+        return override
+    git = shutil.which("git")
+    if git:
+        return git
+    raise ArchivePolicyError("cannot find Git on PATH")
+
+
 def _git_head_bytes(*arguments: str) -> bytes:
     try:
         result = subprocess.run(
-            ["git.exe", "-C", str(PROJECT_ROOT), *arguments],
+            [_resolve_git(), "-C", str(PROJECT_ROOT), *arguments],
             check=False,
             capture_output=True,
         )
