@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import NoReturn, cast
 
 from edge_perception.compare import compare_runs
-from edge_perception.config import RunConfig, load_run_config
+from edge_perception.config import (
+    CaptureRequest,
+    CaptureResult,
+    RunConfig,
+    load_run_config,
+)
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import load_detector
 from edge_perception.runner import run_checkpoint, validate_output_directory
@@ -82,6 +87,32 @@ def _nonnegative_tolerance(name: str) -> Callable[[str], float]:
     return parse
 
 
+def _positive_integer(name: str) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer") from error
+        if number <= 0:
+            raise argparse.ArgumentTypeError(f"{name} must be positive")
+        return number
+
+    return parse
+
+
+def _positive_finite_float(name: str) -> Callable[[str], float]:
+    def parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"{name} must be finite and positive") from error
+        if not isfinite(number) or number <= 0.0:
+            raise argparse.ArgumentTypeError(f"{name} must be finite and positive")
+        return number
+
+    return parse
+
+
 def _build_parser() -> _Parser:
     parser = _Parser(prog="edge-perception", add_help=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -115,6 +146,18 @@ def _build_parser() -> _Parser:
 
     gui = subparsers.add_parser("gui", help="open the native research GUI")
     gui.add_argument("--run", type=Path)
+
+    camera = subparsers.add_parser("camera", help="discover and record camera sources")
+    camera_subparsers = camera.add_subparsers(dest="camera_command", required=True)
+    camera_subparsers.add_parser("list", help="list discovered cameras and formats")
+    capture = camera_subparsers.add_parser("capture", help="record one timed camera capture")
+    capture.add_argument("--device", required=True)
+    capture.add_argument("--duration", required=True, type=_positive_finite_float("duration"))
+    capture.add_argument("--output", type=Path, default=argparse.SUPPRESS)
+    capture.add_argument("--width", type=_positive_integer("width"))
+    capture.add_argument("--height", type=_positive_integer("height"))
+    capture.add_argument("--fps", type=_positive_finite_float("fps"))
+    capture.add_argument("--strict", action="store_true")
     return parser
 
 
@@ -235,6 +278,76 @@ def _gui_command(args: argparse.Namespace) -> int:
     return launch_gui(run_dir)
 
 
+def _camera_command(args: argparse.Namespace) -> int:
+    try:
+        from edge_perception.camera_cli import capture_camera, list_cameras
+    except ImportError as error:
+        raise _CliError(
+            "camera support is unavailable; install adaptive-edge-perception[camera]"
+        ) from error
+    devices = list_cameras()
+    if args.camera_command == "list":
+        for device in devices:
+            print(f"{device.device_id}: {device.description}")
+            for camera_format in device.formats:
+                print(
+                    "  "
+                    f"{camera_format.width}x{camera_format.height} "
+                    f"{_format_number(camera_format.min_fps)}-"
+                    f"{_format_number(camera_format.max_fps)} fps "
+                    f"{camera_format.pixel_format}"
+                )
+        return 0
+    if args.camera_command != "capture":
+        raise _CliError("a camera command is required")
+    device_id = cast(str, args.device)
+    selected_device = next(
+        (candidate for candidate in devices if candidate.device_id == device_id),
+        None,
+    )
+    if selected_device is None:
+        raise _CliError(f"camera device is unavailable: {device_id}")
+    output = cast(Path, args.output).resolve() if hasattr(args, "output") else None
+    if output is not None and output.exists():
+        raise _CliError(f"capture destination already exists: {output}")
+    request = CaptureRequest(
+        device_id=selected_device.device_id,
+        device_description=selected_device.description,
+        requested_width=cast(int | None, args.width),
+        requested_height=cast(int | None, args.height),
+        requested_fps=cast(float | None, args.fps),
+        strict=cast(bool, args.strict),
+    )
+    result = capture_camera(
+        request,
+        duration_seconds=cast(float, args.duration),
+        output=output,
+    )
+    _render_capture_result(result)
+    return 0
+
+
+def _render_capture_result(result: CaptureResult) -> None:
+    print(f"Capture: {result.path}")
+    print(f"SHA-256: {result.sha256}")
+    print(f"Capture request: {result.request.device_id} ({result.request.device_description})")
+    print(
+        "Applied camera format: "
+        f"{result.selected_width}x{result.selected_height} "
+        f"{_format_number(result.selected_min_fps)}-"
+        f"{_format_number(result.selected_max_fps)} fps {result.selected_pixel_format}"
+    )
+    print(
+        "Recorded format: "
+        f"{result.actual_width}x{result.actual_height} "
+        f"{_format_number(result.actual_fps)} fps {result.container}/{result.codec}"
+    )
+
+
+def _format_number(value: float) -> str:
+    return f"{value:g}"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse and execute one CLI command, returning a process exit code."""
 
@@ -246,6 +359,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _compare_command(args)
         if args.command == "gui":
             return _gui_command(args)
+        if args.command == "camera":
+            return _camera_command(args)
         raise _CliError("a command is required")
     except (_CliError, OSError, RuntimeError, ValueError) as error:
         message = " ".join(str(error).splitlines()) or type(error).__name__

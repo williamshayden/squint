@@ -10,7 +10,214 @@ import pytest
 from conftest import FakeDetector
 
 from edge_perception import cli
-from edge_perception.config import RunConfig, write_run_config
+from edge_perception.capture import CameraDeviceInfo, CameraFormatInfo
+from edge_perception.config import (
+    CaptureRequest,
+    CaptureResult,
+    RunConfig,
+    write_run_config,
+)
+
+
+def _camera_device() -> CameraDeviceInfo:
+    return CameraDeviceInfo(
+        "camera-1",
+        "Desk camera",
+        (
+            CameraFormatInfo(1280, 720, 15.0, 60.0, "NV12", object()),
+            CameraFormatInfo(1920, 1080, 30.0, 30.0, "YUYV", object()),
+        ),
+        object(),
+    )
+
+
+def _camera_result(request: CaptureRequest, output: Path) -> CaptureResult:
+    return CaptureResult(
+        request=request,
+        selected_width=1920,
+        selected_height=1080,
+        selected_min_fps=30.0,
+        selected_max_fps=30.0,
+        selected_pixel_format="YUYV",
+        actual_width=1920,
+        actual_height=1080,
+        actual_fps=30.0,
+        container="mp4",
+        codec="h264",
+        duration_seconds=0.05,
+        has_audio=False,
+        file_size_bytes=7,
+        path=output,
+        sha256="b" * 64,
+    )
+
+
+def _install_camera_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    devices: tuple[CameraDeviceInfo, ...] | None = None,
+) -> list[tuple[CaptureRequest, float, Path | None]]:
+    module = ModuleType("edge_perception.camera_cli")
+    reported_devices = devices or (_camera_device(),)
+    calls: list[tuple[CaptureRequest, float, Path | None]] = []
+    module.list_cameras = lambda: reported_devices  # type: ignore[attr-defined]
+
+    def capture(request: CaptureRequest, *, duration_seconds: float, output: Path | None) -> CaptureResult:
+        calls.append((request, duration_seconds, output))
+        return _camera_result(request, output or Path("controller-choice.mp4"))
+
+    module.capture_camera = capture  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "edge_perception.camera_cli", module)
+    return calls
+
+
+def test_camera_list_renders_discovered_device_and_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_camera_boundary(monkeypatch)
+
+    assert cli.main(["camera", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "camera-1" in output
+    assert "Desk camera" in output
+    assert "1280x720" in output
+    assert "1920x1080" in output
+    assert "15-60 fps" in output
+    assert "30-30 fps" in output
+
+
+def test_camera_capture_parses_constraints_uses_discovered_description_and_renders_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = _install_camera_boundary(monkeypatch)
+    output = tmp_path / "capture.mp4"
+
+    assert (
+        cli.main(
+            [
+                "camera",
+                "capture",
+                "--device",
+                "camera-1",
+                "--duration",
+                "0.05",
+                "--output",
+                str(output),
+                "--width",
+                "1920",
+                "--height",
+                "1080",
+                "--fps",
+                "30",
+                "--strict",
+            ]
+        )
+        == 0
+    )
+
+    request = CaptureRequest("camera-1", "Desk camera", 1920, 1080, 30.0, True)
+    assert calls == [(request, 0.05, output.resolve())]
+    rendered = capsys.readouterr().out
+    assert f"Capture: {output.resolve()}" in rendered
+    assert "SHA-256: " + "b" * 64 in rendered
+    assert "Capture request: camera-1 (Desk camera)" in rendered
+    assert "Applied camera format: 1920x1080 30-30 fps YUYV" in rendered
+    assert "Recorded format: 1920x1080 30 fps mp4/h264" in rendered
+
+
+def test_camera_capture_omits_output_for_shared_backend_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_camera_boundary(monkeypatch)
+
+    assert cli.main(["camera", "capture", "--device", "camera-1", "--duration", "0.05"]) == 0
+
+    assert calls[0][2] is None
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--device", "missing", "--duration", "0.05"), "camera device is unavailable: missing"),
+        (
+            ("--device", "camera-1", "--duration", "0"),
+            "argument --duration: duration must be finite and positive",
+        ),
+        (
+            ("--device", "camera-1", "--duration", "nan"),
+            "argument --duration: duration must be finite and positive",
+        ),
+    ],
+)
+def test_camera_capture_rejects_invalid_device_or_duration_without_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: tuple[str, ...],
+    message: str,
+) -> None:
+    calls = _install_camera_boundary(monkeypatch)
+    output = tmp_path / "capture.mp4"
+
+    assert cli.main(["camera", "capture", *arguments, "--output", str(output)]) == 2
+
+    assert capsys.readouterr().err == f"error: {message}\n"
+    assert calls == []
+    assert not output.exists()
+
+
+def test_camera_capture_rejects_existing_output_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = _install_camera_boundary(monkeypatch)
+    output = tmp_path / "capture.mp4"
+    output.write_text("user capture", encoding="utf-8")
+
+    assert (
+        cli.main(
+            ["camera", "capture", "--device", "camera-1", "--duration", "0.05", "--output", str(output)]
+        )
+        == 2
+    )
+
+    assert capsys.readouterr().err == f"error: capture destination already exists: {output.resolve()}\n"
+    assert calls == []
+    assert output.read_text(encoding="utf-8") == "user capture"
+
+
+def test_camera_command_reports_missing_optional_extra(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import edge_perception
+
+    original_import = __import__
+    monkeypatch.delitem(sys.modules, "edge_perception.camera_cli", raising=False)
+    monkeypatch.delattr(edge_perception, "camera_cli", raising=False)
+
+    def import_without_camera_extra(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "edge_perception.camera_cli":
+            raise ImportError("No module named 'PySide6'")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", import_without_camera_extra)
+
+    assert cli.main(["camera", "list"]) == 2
+    assert capsys.readouterr().err == (
+        "error: camera support is unavailable; install adaptive-edge-perception[camera]\n"
+    )
 
 
 def test_gui_command_lazily_launches_native_app(
