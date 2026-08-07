@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
+import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -62,10 +64,51 @@ def validate_output_directory(output_dir: Path) -> None:
     _validate_output_directory(output_dir)
 
 
+def _cleanup_capture_snapshot(snapshot_path: Path | None) -> None:
+    if snapshot_path is None:
+        return
+    try:
+        snapshot_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _capture_snapshot(config: RunConfig, preflight: RunPreflight) -> Path | None:
+    capture = config.capture
+    if capture is None:
+        return None
+
+    snapshot_path: Path | None = None
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="edge-perception-capture-",
+            suffix=config.input_path.suffix,
+            delete=False,
+        ) as temporary:
+            snapshot_path = Path(temporary.name)
+            with config.input_path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    temporary.write(chunk)
+                    digest.update(chunk)
+        snapshot_sha256 = digest.hexdigest()
+        if (
+            snapshot_sha256 != preflight.source_sha256
+            or snapshot_sha256 != capture.sha256
+        ):
+            raise ValueError("capture source changed after preflight")
+        return snapshot_path
+    except BaseException:
+        _cleanup_capture_snapshot(snapshot_path)
+        raise
+
+
 def _preview_and_validate(
     config: RunConfig,
+    source_path: Path,
 ) -> tuple[DecodedFrame, Region, Generator[DecodedFrame, None, None]]:
-    preview = _video_iterator(config.input_path)
+    preview = _video_iterator(source_path)
     try:
         try:
             first_frame = next(preview)
@@ -241,6 +284,7 @@ def run_checkpoint(
     status: RunStatus = "complete"
     summary: dict[str, object] = {}
     monitor: TelemetryMonitor | None = None
+    capture_snapshot: Path | None = None
 
     def emit(phase: ProgressPhase, error: str | None = None) -> None:
         if progress is None:
@@ -258,7 +302,9 @@ def run_checkpoint(
     emit("validating")
     try:
         preflight = preflight_run(config)
-        first_frame, full_region, preview = _preview_and_validate(config)
+        capture_snapshot = _capture_snapshot(config, preflight)
+        source_path = capture_snapshot or config.input_path
+        first_frame, full_region, preview = _preview_and_validate(config, source_path)
 
         try:
             manifest = _manifest(config, detector, full_region, preflight)
@@ -275,7 +321,7 @@ def run_checkpoint(
                         status = "cancelled"
                     else:
                         with _optional_telemetry_monitor() as monitor:
-                            measured = _video_iterator(config.input_path)
+                            measured = _video_iterator(source_path)
                             try:
                                 while (
                                     config.max_frames is None
@@ -484,6 +530,8 @@ def run_checkpoint(
     except BaseException as error:
         emit("failed", f"{type(error).__name__}: {error}")
         raise
+    finally:
+        _cleanup_capture_snapshot(capture_snapshot)
 
     emit(status)
     return summary
