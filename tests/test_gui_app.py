@@ -8,10 +8,20 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QByteArray, QObject, QPointF, QProcess, Qt, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QObject,
+    QPoint,
+    QPointF,
+    QProcess,
+    QRect,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -24,6 +34,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
 )
 from pytestqt.qtbot import QtBot
@@ -46,7 +57,10 @@ from edge_perception.gui import run_controller as run_controller_module
 from edge_perception.gui.main_window import MainWindow
 from edge_perception.gui.region_view import RegionView
 from edge_perception.gui.results import ResultsWidget
-from edge_perception.gui.run_controller import MALFORMED_PROGRESS_ERROR
+from edge_perception.gui.run_controller import (
+    MALFORMED_PROGRESS_ERROR,
+    MISSING_TERMINAL_PROGRESS_ERROR,
+)
 from edge_perception.progress import ProgressEvent
 from edge_perception.video import DecodedFrame
 
@@ -385,6 +399,8 @@ def _write_terminal_run(run_dir: Path, status: str) -> Path:
     summary_path = run_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["status"] = status
+    if status == "failed":
+        summary["error"] = "model failed"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
     return run_dir
 
@@ -397,6 +413,29 @@ def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     assert window.objectName() == "edge-perception-main-window"
     assert window.findChild(QGraphicsView, "source-view") is not None
     assert window.findChild(QPushButton, "run-button") is not None
+
+
+def test_controls_and_results_scroll_within_a_bounded_native_window(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_completed_run(tmp_path / "completed")
+    window = MainWindow(run_dir=run_dir)
+    qtbot.addWidget(window)
+    window.resize(1100, 720)
+    window.show()
+    QApplication.processEvents()
+
+    scroll = window.findChild(QScrollArea, "controls-scroll-area")
+    assert scroll is not None
+    assert scroll.widgetResizable()
+    assert window.height() <= 864
+    assert scroll.verticalScrollBar().maximum() > 0
+    scroll.ensureWidgetVisible(window.resultsWidget)
+    QApplication.processEvents()
+    results_top_left = window.resultsWidget.mapTo(scroll.viewport(), QPoint(0, 0))
+    results_rect = QRect(results_top_left, window.resultsWidget.size())
+    assert results_rect.intersects(scroll.viewport().rect())
 
 
 def test_workflow_state_labels_and_source_browse_start_with_explicit_values(
@@ -603,6 +642,32 @@ def test_constructor_run_mode_surfaces_invalid_artifacts_and_keeps_controls_usab
     assert open_action is not None and open_action.isEnabled()
 
 
+@pytest.mark.parametrize(
+    ("canonical_status", "expected_status"),
+    [
+        ("complete", "Completed"),
+        ("cancelled", "Cancelled"),
+        ("failed", "Failed"),
+    ],
+)
+def test_loaded_run_lifecycle_projects_terminal_status_from_results_view(
+    canonical_status: str,
+    expected_status: str,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_terminal_run(tmp_path / canonical_status, canonical_status)
+
+    window = MainWindow(run_dir=run_dir)
+    qtbot.addWidget(window)
+
+    run_status = window.findChild(QLabel, "run-status")
+    assert run_status is not None
+    assert run_status.text() == f"Run status: {expected_status}"
+    assert window.resultsWidget.statusLabel.text() == expected_status
+    assert not window.resultsWidget.isHidden()
+
+
 def test_region_view_owns_one_raw_video_item_then_restores_rgb_frame(
     qtbot: QtBot,
 ) -> None:
@@ -731,6 +796,8 @@ def test_typed_capture_destination_resolves_immediately_before_recording(
     assert destination is not None
     assert preview is not None
     assert record is not None
+    capture_parent = tmp_path / "captures"
+    assert not capture_parent.exists()
     destination.setText("captures/reference.mp4")
     source_mode.setCurrentText("Camera")
     qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
@@ -740,6 +807,7 @@ def test_typed_capture_destination_resolves_immediately_before_recording(
     assert controller.record_paths == [
         (tmp_path / "captures" / "reference.mp4").resolve()
     ]
+    assert not capture_parent.exists()
 
 
 def test_browsed_capture_destination_resolves_before_recording(
@@ -2822,6 +2890,187 @@ def test_run_lifecycle_cancel_projects_cancelling_and_disables_action_immediatel
     assert observed == ("Run status: Cancelling", False, True)
 
 
+def test_cancel_publication_failure_restores_running_and_allows_button_retry(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    window = MainWindow(process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    cancel = window.findChild(QPushButton, "cancel-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert cancel is not None
+    assert run_status is not None
+    run_dir = tmp_path / "run"
+    output.setText(str(run_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    cancel_path = tmp_path / ".run.cancel"
+    actual_replace = run_controller_module.os.replace
+
+    def fail_cancel_publication(source: Path | str, destination: Path | str) -> None:
+        if Path(destination) == cancel_path:
+            raise OSError("cancel file locked")
+        actual_replace(source, destination)
+
+    monkeypatch.setattr(
+        run_controller_module.os,
+        "replace",
+        fail_cancel_publication,
+    )
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+
+    qtbot.mouseClick(cancel, Qt.MouseButton.LeftButton)
+
+    first_observation = (
+        window.runController.is_active,
+        run_status.text(),
+        cancel.isEnabled(),
+        output.isEnabled(),
+        window.resultsWidget.isHidden(),
+        cancel_path.exists(),
+        tuple(critical_messages),
+        window.statusBar().currentMessage(),
+    )
+
+    monkeypatch.setattr(run_controller_module.os, "replace", actual_replace)
+    qtbot.mouseClick(cancel, Qt.MouseButton.LeftButton)
+
+    retry_observation = (
+        run_status.text(),
+        cancel.isEnabled(),
+        cancel_path.exists(),
+    )
+    if not cancel_path.exists():
+        window.runController.cancel()
+    _write_terminal_run(run_dir, "cancelled")
+    process.emit_stdout(
+        _progress_record(ProgressEvent("cancelled", 0, 0, 0.0, None))
+    )
+    process.finish()
+
+    assert first_observation == (
+        True,
+        "Run status: Running",
+        True,
+        False,
+        True,
+        False,
+        (),
+        "Cancellation request failed: cancel file locked",
+    )
+    assert retry_observation == ("Run status: Cancelling", False, True)
+
+
+def test_cancel_publication_failure_from_close_allows_later_close_retry(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    activities: list[str] = []
+
+    def decide(activity: str) -> str:
+        activities.append(activity)
+        return "Cancel Run and Exit"
+
+    window = MainWindow(process=process, close_decision=decide)
+    qtbot.addWidget(window)
+    window.show()
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    cancel = window.findChild(QPushButton, "cancel-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert cancel is not None
+    assert run_status is not None
+    output.setText(str(tmp_path / "run"))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    cancel_path = tmp_path / ".run.cancel"
+    actual_replace = run_controller_module.os.replace
+
+    def fail_cancel_publication(source: Path | str, destination: Path | str) -> None:
+        if Path(destination) == cancel_path:
+            raise OSError("cancel file locked")
+        actual_replace(source, destination)
+
+    monkeypatch.setattr(
+        run_controller_module.os,
+        "replace",
+        fail_cancel_publication,
+    )
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+    first_close = QCloseEvent()
+
+    window.closeEvent(first_close)
+
+    first_observation = (
+        first_close.isAccepted(),
+        window.runController.is_active,
+        run_status.text(),
+        cancel.isEnabled(),
+        output.isEnabled(),
+        window.isVisible(),
+        tuple(activities),
+        tuple(critical_messages),
+        window.statusBar().currentMessage(),
+    )
+
+    monkeypatch.setattr(run_controller_module.os, "replace", actual_replace)
+    second_close = QCloseEvent()
+    window.closeEvent(second_close)
+
+    second_observation = (
+        second_close.isAccepted(),
+        tuple(activities),
+        cancel_path.exists(),
+        run_status.text(),
+    )
+    process.emit_stdout(
+        _progress_record(ProgressEvent("cancelled", 0, 0, 0.0, None))
+    )
+    process.finish()
+
+    assert first_observation == (
+        False,
+        True,
+        "Run status: Running",
+        True,
+        False,
+        True,
+        ("inference",),
+        (),
+        "Cancellation request failed: cancel file locked",
+    )
+    assert second_observation == (
+        False,
+        ("inference", "inference"),
+        True,
+        "Run status: Cancelling",
+    )
+    assert critical_messages == []
+    assert not window.isVisible()
+
+
 @pytest.mark.parametrize(
     ("phase", "expected_status"),
     [("complete", "Completed"), ("cancelled", "Cancelled")],
@@ -3087,6 +3336,87 @@ def test_close_while_inference_cancels_restarts_kill_timer_and_waits_for_finishe
     assert critical_messages == []
     assert window.resultsWidget.isHidden()
     assert window.isVisible() is False
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_error"),
+    [
+        ("failed", "model failed"),
+        ("nonterminal", MISSING_TERMINAL_PROGRESS_ERROR),
+    ],
+)
+def test_close_after_cancel_failure_is_modal_free_and_closes_from_termination(
+    outcome: str,
+    expected_error: str,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    window = MainWindow(
+        process=process,
+        close_decision=lambda _activity: "Cancel Run and Exit",
+    )
+    qtbot.addWidget(window)
+    window.show()
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert run_status is not None
+    output.setText(str(tmp_path / "run"))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert not close_event.isAccepted()
+    assert window.isVisible()
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+    observations: list[tuple[str, bool, bool, str, bool]] = []
+    window.runController.runFailed.connect(
+        lambda _message: observations.append(
+            (
+                "failed",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+                window.isVisible(),
+            )
+        )
+    )
+    window.runController.processTerminated.connect(
+        lambda: observations.append(
+            (
+                "terminated",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+                window.isVisible(),
+            )
+        )
+    )
+    if outcome == "failed":
+        process.emit_stdout(
+            _progress_record(
+                ProgressEvent("failed", 1, 1, 2.0, expected_error)
+            )
+        )
+
+    process.finish()
+
+    assert critical_messages == []
+    assert observations == [
+        ("failed", False, True, "Run status: Failed", True),
+        ("terminated", True, True, "Run status: Failed", False),
+    ]
+    assert window.statusBar().currentMessage() == expected_error
 
 
 def test_close_without_active_work_accepts_immediately(qtbot: QtBot) -> None:

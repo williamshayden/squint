@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -59,6 +60,18 @@ class _SourceSnapshot:
     capture: CaptureResult | None
     frame: np.ndarray
     regions: tuple[Region, ...]
+
+
+def _run_state_for_terminal_status(status: str) -> RunState:
+    states = {
+        "complete": RunState.COMPLETED,
+        "failed": RunState.FAILED,
+        "cancelled": RunState.CANCELLED,
+    }
+    try:
+        return states[status]
+    except KeyError as error:
+        raise ValueError(f"unsupported terminal run status: {status}") from error
 
 
 class MainWindow(QMainWindow):
@@ -186,7 +199,11 @@ class MainWindow(QMainWindow):
         self.resultsWidget.setVisible(False)
         controls_layout.addWidget(self.resultsWidget)
         controls_layout.addStretch()
-        splitter.addWidget(controls)
+        controls_scroll = QScrollArea()
+        controls_scroll.setObjectName("controls-scroll-area")
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(controls)
+        splitter.addWidget(controls_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         self.setCentralWidget(splitter)
@@ -1192,9 +1209,14 @@ class MainWindow(QMainWindow):
         try:
             self.runController.cancel()
         except OSError as error:
-            self._run_failed(str(error))
+            self._cancel_request_failed(str(error))
             return
         self.statusBar().showMessage("Cancellation requested")
+
+    def _cancel_request_failed(self, message: str) -> None:
+        self._run_state = RunState.RUNNING
+        self.statusBar().showMessage(f"Cancellation request failed: {message}")
+        self._update_control_state()
 
     def _run_progress_changed(self, value: object) -> None:
         if not isinstance(value, ProgressEvent):
@@ -1206,13 +1228,10 @@ class MainWindow(QMainWindow):
 
     def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
         phase = payload.get("phase")
-        if phase == "complete":
-            self._run_state = RunState.COMPLETED
-        elif phase == "cancelled":
-            self._run_state = RunState.CANCELLED
-        else:
+        if not isinstance(phase, str) or phase not in {"complete", "cancelled"}:
             self._run_failed(f"worker reported unexpected terminal phase: {phase}")
             return
+        self._run_state = _run_state_for_terminal_status(phase)
         self._update_control_state()
         if self._exit_after_run:
             self.statusBar().showMessage(f"Run {phase}: {Path(run_dir).resolve()}")
@@ -1232,8 +1251,10 @@ class MainWindow(QMainWindow):
 
     def _load_completed_run(self, run_dir: Path) -> Path:
         path = Path(run_dir).resolve()
-        self.resultsWidget.load_run(path)
+        view = self.resultsWidget.load_run(path)
+        self._run_state = _run_state_for_terminal_status(view.status)
         self.resultsWidget.setVisible(True)
+        self._update_control_state()
         self.statusBar().showMessage(f"Loaded completed run: {path}")
         return path
 
@@ -1241,7 +1262,7 @@ class MainWindow(QMainWindow):
         self._run_state = RunState.FAILED
         self.resultsWidget.setVisible(False)
         self.statusBar().showMessage(message)
-        if not self._run_failure_shown:
+        if not self._exit_after_run and not self._run_failure_shown:
             self._run_failure_shown = True
             QMessageBox.critical(self, "Run failed", message)
         self._update_control_state()
@@ -1315,7 +1336,7 @@ class MainWindow(QMainWindow):
                 self._update_control_state()
                 self.runController.cancel()
             except OSError as error:
-                self._run_failed(str(error))
+                self._cancel_request_failed(str(error))
                 event.ignore()
                 return
             self._exit_after_run = True

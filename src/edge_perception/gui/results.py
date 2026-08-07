@@ -181,12 +181,13 @@ class ResultsWidget(QWidget):
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         return label
 
-    def load_run(self, run_dir: Path) -> None:
+    def load_run(self, run_dir: Path) -> RunViewData:
         """Load one run through the shared canonical projection and render it."""
 
         view = load_run_view(Path(run_dir))
         self._view_data = view
         self._render(view)
+        return view
 
     def _render(self, view: RunViewData) -> None:
         self.runPathLabel.setText(str(view.run_dir))

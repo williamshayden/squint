@@ -17,6 +17,7 @@ from pytestqt.qtbot import QtBot
 
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
+from edge_perception.gui import results as results_module
 from edge_perception.gui.results import ResultsWidget
 from edge_perception.run_view import load_run_view
 
@@ -380,6 +381,30 @@ def test_results_widget_loads_annotation_without_mutating_run(
     assert widget.regionsTable.rowCount() == 2
     assert widget.regionsTable.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
     assert snapshot_tree(run_dir) == before
+
+
+def test_results_widget_load_run_returns_the_single_validated_projection(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_dir = write_completed_run_fixture(tmp_path)
+    expected = load_run_view(run_dir)
+    calls: list[Path] = []
+
+    def load_once(path: Path) -> object:
+        calls.append(path)
+        return expected
+
+    monkeypatch.setattr(results_module, "load_run_view", load_once)
+    widget = ResultsWidget()
+    qtbot.addWidget(widget)
+
+    actual = widget.load_run(tmp_path / "projection-boundary")
+
+    assert actual is expected
+    assert calls == [tmp_path / "projection-boundary"]
+    assert widget.statusLabel.text() == "Completed"
 
 
 def test_results_widget_formats_unavailable_telemetry_as_na(
