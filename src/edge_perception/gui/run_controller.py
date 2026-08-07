@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -24,9 +25,18 @@ _TERMINAL_PHASES = {"complete", "cancelled", "failed"}
 
 
 @dataclass(frozen=True, slots=True)
-class _OwnedCancellation:
+class _OwnedPrivatePath:
     path: Path
     identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedCancellation:
+    public_path: Path
+    path: Path
+    identity: tuple[int, int]
+    foreign_identity: tuple[int, int] | None = None
+    private_cleanup: _OwnedPrivatePath | None = None
 
 
 class RunController(QObject):
@@ -42,6 +52,7 @@ class RunController(QObject):
         self._process = QProcess(self) if process is None else process
         self._active = False
         self._config_path: Path | None = None
+        self._retained_config_temporary: Path | None = None
         self._cancel_path: Path | None = None
         self._owned_cancel: _OwnedCancellation | None = None
         self._last_config: RunConfig | None = None
@@ -77,11 +88,17 @@ class RunController(QObject):
             raise RuntimeError("a run is already active")
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
-        self._retry_retained_cancel_cleanup()
+        self._retry_retained_cleanup()
         validate_output_directory(config.output_dir)
         config_path = _experiment_config_path(config.output_dir)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        publish_run_config(config_path, config)
+        publication = publish_run_config(config_path, config)
+        self._retained_config_temporary = publication.retained_temporary
+        if publication.error is not None:
+            raise _publication_failure(
+                publication.error,
+                publication.cleanup_diagnostic,
+            )
         self._config_path = config_path
         self._last_config = config
         cancel_path = _cancel_file_path(config.output_dir)
@@ -138,7 +155,7 @@ class RunController(QObject):
             os.close(descriptor)
             descriptor = -1
             os.replace(temporary, cancel_path)
-            self._owned_cancel = _OwnedCancellation(cancel_path, identity)
+            self._owned_cancel = _OwnedCancellation(cancel_path, cancel_path, identity)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -215,7 +232,7 @@ class RunController(QObject):
         if self._protocol_failed:
             return
         self._protocol_failed = True
-        if self._owned_cancel is None:
+        if self._owned_cancel is None and self._retained_config_temporary is None:
             self._emit_failure_once(MALFORMED_PROGRESS_ERROR)
         if kill_process and self._active:
             self._process.kill()
@@ -298,9 +315,9 @@ class RunController(QObject):
     ) -> None:
         try:
             try:
-                cleanup_failure = self._cleanup_owned_cancel()
+                cleanup_failure = self._cleanup_retained_files()
             except Exception as error:  # noqa: BLE001 - terminal signals must survive cleanup
-                cleanup_failure = f"cancellation cleanup failed unexpectedly: {error}"
+                cleanup_failure = f"run cleanup failed unexpectedly: {error}"
             if cleanup_failure is not None:
                 failure = (
                     cleanup_failure if failure is None else f"{failure}\n{cleanup_failure}"
@@ -323,6 +340,94 @@ class RunController(QObject):
         owned = self._owned_cancel
         if owned is None:
             return None
+        if owned.private_cleanup is not None:
+            cleanup_failure = self._cleanup_private_cancel_path(owned)
+            if cleanup_failure is not None:
+                return cleanup_failure
+            owned = self._owned_cancel
+            if owned is None:
+                return None
+        if owned.path == owned.public_path:
+            return self._quarantine_cancel(owned)
+        return self._cleanup_cancel_quarantine(owned)
+
+    def _quarantine_cancel(self, owned: _OwnedCancellation) -> str | None:
+        descriptor, quarantine_name = tempfile.mkstemp(
+            dir=owned.public_path.parent,
+            prefix=f"{owned.public_path.name}.",
+            suffix=".quarantine",
+        )
+        quarantine = Path(quarantine_name)
+        placeholder_identity = _file_identity(os.fstat(descriptor))
+        os.close(descriptor)
+        try:
+            os.replace(owned.public_path, quarantine)
+        except FileNotFoundError:
+            self._owned_cancel = _OwnedCancellation(
+                owned.public_path,
+                quarantine,
+                placeholder_identity,
+            )
+            return self._cleanup_cancel_quarantine(self._owned_cancel)
+        except OSError as error:
+            failed_state = _OwnedCancellation(
+                owned.public_path,
+                owned.path,
+                owned.identity,
+                owned.foreign_identity,
+                _OwnedPrivatePath(quarantine, placeholder_identity),
+            )
+            self._owned_cancel = failed_state
+            cleanup_failure = self._cleanup_private_cancel_path(failed_state)
+            quarantine_failure = (
+                f"cancellation cleanup failed while quarantining {owned.public_path}: {error}"
+            )
+            if cleanup_failure is None:
+                return quarantine_failure
+            return f"{quarantine_failure}\n{cleanup_failure}"
+        self._owned_cancel = _OwnedCancellation(
+            owned.public_path,
+            quarantine,
+            owned.identity,
+        )
+        return self._cleanup_cancel_quarantine(self._owned_cancel)
+
+    def _cleanup_private_cancel_path(self, owned: _OwnedCancellation) -> str | None:
+        private = owned.private_cleanup
+        if private is None:
+            return None
+        try:
+            current = os.stat(private.path, follow_symlinks=False)
+        except FileNotFoundError:
+            self._owned_cancel = _without_private_cleanup(owned)
+            return None
+        except OSError as error:
+            return (
+                f"cancellation cleanup failed while inspecting private quarantine "
+                f"{private.path}: {error}"
+            )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or _file_identity(current) != private.identity
+        ):
+            return (
+                "cancellation cleanup refused to remove changed private quarantine: "
+                f"{private.path}"
+            )
+        try:
+            private.path.unlink()
+        except FileNotFoundError:
+            self._owned_cancel = _without_private_cleanup(owned)
+            return None
+        except OSError as error:
+            return (
+                f"cancellation cleanup failed while removing private quarantine "
+                f"{private.path}: {error}"
+            )
+        self._owned_cancel = _without_private_cleanup(owned)
+        return None
+
+    def _cleanup_cancel_quarantine(self, owned: _OwnedCancellation) -> str | None:
         try:
             current = os.stat(owned.path, follow_symlinks=False)
         except FileNotFoundError:
@@ -330,9 +435,29 @@ class RunController(QObject):
             return None
         except OSError as error:
             return f"cancellation cleanup failed while inspecting {owned.path}: {error}"
-        if _file_identity(current) != owned.identity:
-            self._owned_cancel = None
-            return None
+
+        current_identity = _file_identity(current)
+        if owned.foreign_identity is not None:
+            if current_identity != owned.foreign_identity:
+                return (
+                    "cancellation cleanup failed because retained quarantine changed: "
+                    f"{owned.path}"
+                )
+            return self._restore_foreign_cancel(owned, current)
+        if current_identity != owned.identity:
+            foreign = _OwnedCancellation(
+                owned.public_path,
+                owned.path,
+                owned.identity,
+                current_identity,
+            )
+            self._owned_cancel = foreign
+            return self._restore_foreign_cancel(foreign, current)
+        if not stat.S_ISREG(current.st_mode):
+            return (
+                "cancellation cleanup refused to remove non-regular owned quarantine: "
+                f"{owned.path}"
+            )
         try:
             owned.path.unlink()
         except FileNotFoundError:
@@ -343,11 +468,95 @@ class RunController(QObject):
         self._owned_cancel = None
         return None
 
-    def _retry_retained_cancel_cleanup(self) -> None:
-        cleanup_failure = self._cleanup_owned_cancel()
-        if cleanup_failure is not None:
+    def _restore_foreign_cancel(
+        self,
+        owned: _OwnedCancellation,
+        current: os.stat_result,
+    ) -> str | None:
+        foreign_identity = owned.foreign_identity
+        if foreign_identity is None:
+            raise RuntimeError("foreign cancellation identity is unavailable")
+        if not stat.S_ISREG(current.st_mode):
+            return (
+                "cancellation cleanup cannot safely restore non-regular quarantine: "
+                f"{owned.path}"
+            )
+
+        try:
+            public = os.stat(owned.public_path, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.link(owned.path, owned.public_path)
+            except OSError as error:
+                return (
+                    f"cancellation cleanup failed while restoring {owned.path} "
+                    f"to {owned.public_path}: {error}"
+                )
+        except OSError as error:
+            return (
+                f"cancellation cleanup failed while inspecting {owned.public_path} "
+                f"for restoration: {error}"
+            )
+        else:
+            if (
+                not stat.S_ISREG(public.st_mode)
+                or _file_identity(public) != foreign_identity
+            ):
+                return (
+                    f"cancellation cleanup failed while restoring {owned.path} "
+                    f"to {owned.public_path}: destination is occupied"
+                )
+
+        try:
+            owned.path.unlink()
+        except FileNotFoundError:
+            self._owned_cancel = None
+            return None
+        except OSError as error:
+            return f"cancellation cleanup failed while removing {owned.path}: {error}"
+        self._owned_cancel = None
+        return None
+
+    def _cleanup_retained_config_temporary(self) -> str | None:
+        temporary = self._retained_config_temporary
+        if temporary is None:
+            return None
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            self._retained_config_temporary = None
+            return None
+        except OSError as error:
+            return f"config publication cleanup failed while removing {temporary}: {error}"
+        self._retained_config_temporary = None
+        return None
+
+    def _cleanup_retained_files(self) -> str | None:
+        failures = [
+            failure
+            for failure in (
+                self._cleanup_retained_config_temporary(),
+                self._cleanup_owned_cancel(),
+            )
+            if failure is not None
+        ]
+        return "\n".join(failures) or None
+
+    def _retry_retained_cleanup(self) -> None:
+        config_failure = self._cleanup_retained_config_temporary()
+        cancel_failure = self._cleanup_owned_cancel()
+        if config_failure is not None and cancel_failure is None:
             raise RuntimeError(
-                f"previous cancellation cleanup is unresolved: {cleanup_failure}"
+                f"previous config publication cleanup is unresolved: {config_failure}"
+            )
+        if cancel_failure is not None and config_failure is None:
+            raise RuntimeError(
+                f"previous cancellation cleanup is unresolved: {cancel_failure}"
+            )
+        if config_failure is not None and cancel_failure is not None:
+            raise RuntimeError(
+                "previous file cleanup is unresolved: "
+                f"{config_failure}\n{cancel_failure}"
             )
 
 
@@ -363,6 +572,24 @@ def _cancel_file_path(output_dir: Path) -> Path:
 
 def _file_identity(stat_result: os.stat_result) -> tuple[int, int]:
     return stat_result.st_dev, stat_result.st_ino
+
+
+def _publication_failure(error: OSError, cleanup_diagnostic: str | None) -> OSError:
+    if cleanup_diagnostic is None:
+        return error
+    message = f"{error}\n{cleanup_diagnostic}"
+    if isinstance(error, FileExistsError):
+        return FileExistsError(message)
+    return OSError(message)
+
+
+def _without_private_cleanup(owned: _OwnedCancellation) -> _OwnedCancellation:
+    return _OwnedCancellation(
+        owned.public_path,
+        owned.path,
+        owned.identity,
+        owned.foreign_identity,
+    )
 
 
 def _reject_json_constant(value: str) -> None:

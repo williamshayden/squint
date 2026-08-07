@@ -20,6 +20,16 @@ FPS_RELATIVE_TOLERANCE = 0.005
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigPublicationResult:
+    """Outcome of an exclusive config link and its owned-temp cleanup."""
+
+    config_path: Path
+    retained_temporary: Path | None
+    error: OSError | None
+    cleanup_diagnostic: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CaptureRequest:
     device_id: str
     device_description: str
@@ -349,7 +359,7 @@ def write_run_config(path: Path, config: RunConfig) -> None:
     os.replace(temporary, config_path)
 
 
-def publish_run_config(path: Path, config: RunConfig) -> None:
+def publish_run_config(path: Path, config: RunConfig) -> ConfigPublicationResult:
     """Durably publish a new config without replacing an existing document."""
 
     encoded = _encoded_run_config(config)
@@ -361,24 +371,48 @@ def publish_run_config(path: Path, config: RunConfig) -> None:
     )
     temporary = Path(temporary_name)
     stream_open = False
+    publication_error: OSError | None = None
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream_open = True
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-        try:
-            os.link(temporary, config_path)
-        except FileExistsError as error:
-            raise FileExistsError(f"experiment config already exists: {config_path}") from error
-        except OSError as error:
-            raise OSError(
-                f"exclusive config publication requires hard-link support: {config_path}"
-            ) from error
+    except OSError as error:
+        publication_error = error
     finally:
         if not stream_open:
             os.close(descriptor)
+
+    if publication_error is None:
+        try:
+            os.link(temporary, config_path)
+        except FileExistsError as error:
+            publication_error = FileExistsError(
+                f"experiment config already exists: {config_path}"
+            )
+            publication_error.__cause__ = error
+        except OSError as error:
+            publication_error = OSError(
+                f"exclusive config publication requires hard-link support: {config_path}"
+            )
+            publication_error.__cause__ = error
+
+    retained_temporary: Path | None = None
+    cleanup_diagnostic: str | None = None
+    try:
         temporary.unlink(missing_ok=True)
+    except OSError as error:
+        retained_temporary = temporary
+        cleanup_diagnostic = (
+            f"config publication cleanup failed while removing {temporary}: {error}"
+        )
+    return ConfigPublicationResult(
+        config_path=config_path,
+        retained_temporary=retained_temporary,
+        error=publication_error,
+        cleanup_diagnostic=cleanup_diagnostic,
+    )
 
 
 def _encoded_run_config(config: RunConfig) -> str:

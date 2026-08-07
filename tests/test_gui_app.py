@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from edge_perception.config import (
 )
 from edge_perception.contracts import Region
 from edge_perception.gui import main_window
+from edge_perception.gui import run_controller as run_controller_module
 from edge_perception.gui.capture import (
     CameraDeviceInfo,
     CameraFormatInfo,
@@ -1167,23 +1169,35 @@ def test_gui_cleanup_failure_reports_once_and_restores_controls(
     qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
     qtbot.mouseClick(cancel, Qt.MouseButton.LeftButton)
     cancel_path = tmp_path / ".run.cancel"
-    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
+    actual_replace = os.replace
     actual_unlink = Path.unlink
+    quarantines: list[Path] = []
 
-    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
-        if path == cancel_path:
+    def capture_quarantine(source: Path | str, destination: Path | str) -> None:
+        actual_replace(source, destination)
+        if Path(source) == cancel_path:
+            quarantines.append(Path(destination))
+
+    def fail_owned_quarantine(path: Path, *, missing_ok: bool = False) -> None:
+        if quarantines and path == quarantines[-1]:
             raise OSError("locked")
         actual_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr(Path, "unlink", fail_owned)
+    monkeypatch.setattr(run_controller_module.os, "replace", capture_quarantine)
+    monkeypatch.setattr(Path, "unlink", fail_owned_quarantine)
     if terminal_kind == "finished":
         process.emit_stdout(_progress_record(ProgressEvent("complete", 1, 1, 2.0, None)))
-        expected = cleanup_error
         process.finish()
     else:
-        expected = f"worker failed to start\n{cleanup_error}"
         process.emit_error(QProcess.ProcessError.FailedToStart)
 
+    quarantine = quarantines[0]
+    cleanup_error = f"cancellation cleanup failed while removing {quarantine}: locked"
+    expected = (
+        cleanup_error
+        if terminal_kind == "finished"
+        else f"worker failed to start\n{cleanup_error}"
+    )
     assert messages == [("Run failed", expected)]
     assert window.statusBar().currentMessage() == expected
     assert output.isEnabled() is True

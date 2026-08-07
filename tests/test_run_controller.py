@@ -10,6 +10,7 @@ import pytest
 from PySide6.QtCore import QByteArray, QObject, QProcess, Signal
 
 import edge_perception.config as config_module
+import edge_perception.gui.run_controller as run_controller_module
 from edge_perception.config import RunConfig, load_run_config
 from edge_perception.contracts import Region
 from edge_perception.gui.run_controller import (
@@ -103,6 +104,29 @@ def make_config(tmp_path: Path, *, output: str = "run") -> RunConfig:
 
 def event_json(event: ProgressEvent) -> str:
     return json.dumps(event.to_dict(), allow_nan=False, sort_keys=True)
+
+
+def install_owned_quarantine_unlink_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_path: Path,
+) -> list[Path]:
+    actual_replace = os.replace
+    actual_unlink = Path.unlink
+    quarantines: list[Path] = []
+
+    def capture_quarantine(source: Path | str, destination: Path | str) -> None:
+        actual_replace(source, destination)
+        if Path(source) == cancel_path:
+            quarantines.append(Path(destination))
+
+    def fail_quarantine(path: Path, *, missing_ok: bool = False) -> None:
+        if quarantines and path == quarantines[-1]:
+            raise OSError("locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(run_controller_module.os, "replace", capture_quarantine)
+    monkeypatch.setattr(Path, "unlink", fail_quarantine)
+    return quarantines
 
 
 def test_run_controller_starts_worker_without_shell(
@@ -400,6 +424,222 @@ def test_hard_link_unavailable_fails_without_config_or_owned_temporary(
     assert list(tmp_path.glob(".unsupported.experiment.json.*.tmp")) == []
 
 
+def test_existing_config_error_survives_owned_temp_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    first = make_config(tmp_path, output="race-cleanup")
+    second = make_config(tmp_path, output="after-race-cleanup")
+    config_path = tmp_path / "race-cleanup.experiment.json"
+    sentinel = tmp_path / "keep.tmp"
+    sentinel.write_bytes(b"keep")
+    actual_link = os.link
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def publish_winner_then_link(source: str | bytes, destination: str | bytes) -> None:
+        source_path = Path(source)
+        link_sources.append(source_path)
+        Path(destination).write_bytes(b"winner")
+        actual_link(source, destination)
+
+    def fail_owned_temp(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as context:
+        context.setattr(config_module.os, "link", publish_winner_then_link)
+        context.setattr(Path, "unlink", fail_owned_temp)
+
+        with pytest.raises(FileExistsError) as error:
+            controller.start(first)
+
+        retained = link_sources[0]
+        cleanup_error = (
+            f"config publication cleanup failed while removing {retained}: temp locked"
+        )
+        assert str(error.value) == (
+            f"experiment config already exists: {config_path}\n{cleanup_error}"
+        )
+        assert config_path.read_bytes() == b"winner"
+        assert load_run_config(retained) == first
+        assert retained.read_bytes() != b"winner"
+        assert sentinel.read_bytes() == b"keep"
+        assert fake_process.start_count == 0
+
+        with pytest.raises(
+            RuntimeError,
+            match="previous config publication cleanup is unresolved",
+        ):
+            controller.start(second)
+
+        assert link_sources == [retained]
+        assert not (tmp_path / "after-race-cleanup.experiment.json").exists()
+
+    controller.start(second)
+
+    assert not retained.exists()
+    assert sentinel.read_bytes() == b"keep"
+    assert fake_process.start_count == 1
+
+
+def test_hard_link_error_survives_owned_temp_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    config = make_config(tmp_path, output="unsupported-cleanup")
+    config_path = tmp_path / "unsupported-cleanup.experiment.json"
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def reject_link(source: str | bytes, _destination: str | bytes) -> None:
+        link_sources.append(Path(source))
+        raise OSError("hard links disabled")
+
+    def fail_owned_temp(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(config_module.os, "link", reject_link)
+    monkeypatch.setattr(Path, "unlink", fail_owned_temp)
+
+    with pytest.raises(OSError) as error:
+        controller.start(config)
+
+    retained = link_sources[0]
+    assert str(error.value) == (
+        "exclusive config publication requires hard-link support: "
+        f"{config_path}\n"
+        f"config publication cleanup failed while removing {retained}: temp locked"
+    )
+    assert not config_path.exists()
+    assert load_run_config(retained) == config
+    assert fake_process.start_count == 0
+
+
+def test_successful_config_reservation_survives_owned_temp_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    finished: list[tuple[Path, dict[str, object]]] = []
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFinished.connect(lambda path, payload: finished.append((path, payload)))
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    first = make_config(tmp_path, output="reserved-cleanup")
+    second = make_config(tmp_path, output="after-reserved-cleanup")
+    config_path = tmp_path / "reserved-cleanup.experiment.json"
+    sentinel = tmp_path / "keep.tmp"
+    sentinel.write_bytes(b"keep")
+    actual_link = os.link
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def capture_link(source: str | bytes, destination: str | bytes) -> None:
+        link_sources.append(Path(source))
+        actual_link(source, destination)
+
+    def fail_owned_temp(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as context:
+        context.setattr(config_module.os, "link", capture_link)
+        context.setattr(Path, "unlink", fail_owned_temp)
+
+        controller.start(first)
+
+        retained = link_sources[0]
+        cleanup_error = (
+            f"config publication cleanup failed while removing {retained}: temp locked"
+        )
+        assert controller.config_path == config_path
+        assert controller.last_config == first
+        assert load_run_config(config_path) == first
+        assert config_path.read_bytes() == retained.read_bytes()
+        assert sentinel.read_bytes() == b"keep"
+        assert fake_process.start_count == 1
+
+        terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+        fake_process.emit_stdout(event_json(terminal) + "\n")
+        fake_process.finish()
+
+        assert finished == []
+        assert failures == [cleanup_error]
+        assert terminated == [None]
+        assert controller.is_active is False
+        assert retained.exists()
+
+        with pytest.raises(
+            RuntimeError,
+            match="previous config publication cleanup is unresolved",
+        ):
+            controller.start(second)
+
+        assert link_sources == [retained]
+        assert not (tmp_path / "after-reserved-cleanup.experiment.json").exists()
+
+    controller.start(second)
+
+    assert not retained.exists()
+    assert config_path.exists()
+    assert sentinel.read_bytes() == b"keep"
+    assert fake_process.start_count == 2
+
+
+def test_protocol_failure_appends_retained_config_cleanup_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    config = make_config(tmp_path, output="protocol-cleanup")
+    actual_link = os.link
+    actual_unlink = Path.unlink
+    link_sources: list[Path] = []
+
+    def capture_link(source: str | bytes, destination: str | bytes) -> None:
+        link_sources.append(Path(source))
+        actual_link(source, destination)
+
+    def fail_owned_temp(path: Path, *, missing_ok: bool = False) -> None:
+        if link_sources and path == link_sources[0]:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(config_module.os, "link", capture_link)
+    monkeypatch.setattr(Path, "unlink", fail_owned_temp)
+    controller.start(config)
+    retained = link_sources[0]
+    cleanup_error = f"config publication cleanup failed while removing {retained}: temp locked"
+
+    fake_process.emit_stdout("not-json\n")
+
+    assert failures == []
+    assert controller.is_active is True
+    assert fake_process.kill_count == 1
+
+    fake_process.finish(1, QProcess.ExitStatus.CrashExit)
+
+    assert failures == [f"{MALFORMED_PROGRESS_ERROR}\n{cleanup_error}"]
+    assert terminated == [None]
+    assert controller.is_active is False
+
+
 def test_cancel_replacement_is_preserved_and_controller_can_be_reused(
     tmp_path: Path,
     fake_process: FakeProcess,
@@ -434,6 +674,233 @@ def test_cancel_replacement_is_preserved_and_controller_can_be_reused(
     assert fake_process.start_count == 2
 
 
+def test_cancel_cleanup_quarantines_before_inspection_and_preserves_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    finished: list[tuple[Path, dict[str, object]]] = []
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFinished.connect(lambda path, payload: finished.append((path, payload)))
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    config = make_config(tmp_path, output="interleaved")
+    controller.start(config)
+    controller.cancel()
+    cancel_path = tmp_path / ".interleaved.cancel"
+    actual_replace = os.replace
+    quarantines: list[Path] = []
+
+    def replace_then_interleave(source: Path | str, destination: Path | str) -> None:
+        actual_replace(source, destination)
+        if Path(source) == cancel_path:
+            quarantines.append(Path(destination))
+            cancel_path.write_bytes(b"replacement")
+
+    monkeypatch.setattr(run_controller_module.os, "replace", replace_then_interleave)
+    terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+
+    fake_process.emit_stdout(event_json(terminal) + "\n")
+    fake_process.finish()
+
+    assert finished == [(config.output_dir, terminal.to_dict())]
+    assert failures == []
+    assert terminated == [None]
+    assert controller.is_active is False
+    assert cancel_path.read_bytes() == b"replacement"
+    assert len(quarantines) == 1
+    assert not quarantines[0].exists()
+
+
+def test_owned_cancel_quarantine_unlink_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    finished: list[tuple[Path, dict[str, object]]] = []
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFinished.connect(lambda path, payload: finished.append((path, payload)))
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    first = make_config(tmp_path, output="quarantine-retry")
+    second = make_config(tmp_path, output="after-quarantine-retry")
+    sentinel = tmp_path / "keep.cancel"
+    sentinel.write_bytes(b"keep")
+    controller.start(first)
+    controller.cancel()
+    cancel_path = tmp_path / ".quarantine-retry.cancel"
+
+    with monkeypatch.context() as context:
+        quarantines = install_owned_quarantine_unlink_failure(context, cancel_path)
+        terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+        fake_process.emit_stdout(event_json(terminal) + "\n")
+        fake_process.finish()
+
+        assert len(quarantines) == 1
+        quarantine = quarantines[0]
+        cleanup_error = (
+            f"cancellation cleanup failed while removing {quarantine}: locked"
+        )
+        assert finished == []
+        assert failures == [cleanup_error]
+        assert terminated == [None]
+        assert controller.is_active is False
+        assert quarantine.read_bytes() == b""
+        assert not cancel_path.exists()
+        assert sentinel.read_bytes() == b"keep"
+
+        with pytest.raises(
+            RuntimeError,
+            match="previous cancellation cleanup is unresolved",
+        ):
+            controller.start(second)
+
+        assert len(quarantines) == 1
+        assert fake_process.start_count == 1
+
+    controller.start(second)
+
+    assert not quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+    assert fake_process.start_count == 2
+
+
+def test_failed_cancel_quarantine_retains_owned_private_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    first = make_config(tmp_path, output="quarantine-placeholder")
+    second = make_config(tmp_path, output="after-quarantine-placeholder")
+    controller.start(first)
+    controller.cancel()
+    cancel_path = tmp_path / ".quarantine-placeholder.cancel"
+    actual_replace = os.replace
+    actual_unlink = Path.unlink
+    quarantines: list[Path] = []
+
+    def fail_quarantine_rename(source: Path | str, destination: Path | str) -> None:
+        if Path(source) == cancel_path:
+            quarantines.append(Path(destination))
+            raise OSError("rename locked")
+        actual_replace(source, destination)
+
+    def fail_private_placeholder(path: Path, *, missing_ok: bool = False) -> None:
+        if path in quarantines:
+            raise OSError("temp locked")
+        actual_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as context:
+        context.setattr(run_controller_module.os, "replace", fail_quarantine_rename)
+        context.setattr(Path, "unlink", fail_private_placeholder)
+        terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+        fake_process.emit_stdout(event_json(terminal) + "\n")
+        fake_process.finish()
+
+        assert len(quarantines) == 1
+        quarantine = quarantines[0]
+        assert failures == [
+            (
+                "cancellation cleanup failed while quarantining "
+                f"{cancel_path}: rename locked\n"
+                "cancellation cleanup failed while removing private quarantine "
+                f"{quarantine}: temp locked"
+            )
+        ]
+        assert terminated == [None]
+        assert cancel_path.read_bytes() == b""
+        assert quarantine.read_bytes() == b""
+
+        with pytest.raises(
+            RuntimeError,
+            match="previous cancellation cleanup is unresolved",
+        ):
+            controller.start(second)
+
+        assert quarantines == [quarantine]
+        assert fake_process.start_count == 1
+
+    controller.start(second)
+
+    assert not quarantine.exists()
+    assert not cancel_path.exists()
+    assert fake_process.start_count == 2
+
+
+def test_foreign_cancel_quarantine_restore_collision_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    finished: list[tuple[Path, dict[str, object]]] = []
+    failures: list[str] = []
+    terminated: list[None] = []
+    controller.runFinished.connect(lambda path, payload: finished.append((path, payload)))
+    controller.runFailed.connect(failures.append)
+    controller.processTerminated.connect(lambda: terminated.append(None))
+    first = make_config(tmp_path, output="foreign-collision")
+    second = make_config(tmp_path, output="after-foreign-collision")
+    controller.start(first)
+    controller.cancel()
+    cancel_path = tmp_path / ".foreign-collision.cancel"
+    replacement = tmp_path / "foreign.cancel"
+    replacement.write_bytes(b"foreign")
+    os.replace(replacement, cancel_path)
+    actual_replace = os.replace
+    quarantines: list[Path] = []
+
+    def quarantine_then_collide(source: Path | str, destination: Path | str) -> None:
+        actual_replace(source, destination)
+        if Path(source) == cancel_path:
+            quarantines.append(Path(destination))
+            cancel_path.write_bytes(b"collision")
+
+    with monkeypatch.context() as context:
+        context.setattr(run_controller_module.os, "replace", quarantine_then_collide)
+        terminal = ProgressEvent("complete", 3, 4, 5.0, None)
+        fake_process.emit_stdout(event_json(terminal) + "\n")
+        fake_process.finish()
+
+        assert len(quarantines) == 1
+        quarantine = quarantines[0]
+        assert finished == []
+        assert len(failures) == 1
+        assert failures[0].startswith(
+            f"cancellation cleanup failed while restoring {quarantine} to {cancel_path}:"
+        )
+        assert terminated == [None]
+        assert controller.is_active is False
+        assert quarantine.read_bytes() == b"foreign"
+        assert cancel_path.read_bytes() == b"collision"
+
+        with pytest.raises(
+            RuntimeError,
+            match="previous cancellation cleanup is unresolved",
+        ):
+            controller.start(second)
+
+        assert quarantine.read_bytes() == b"foreign"
+        assert cancel_path.read_bytes() == b"collision"
+        assert fake_process.start_count == 1
+
+    cancel_path.unlink()
+    controller.start(second)
+
+    assert cancel_path.read_bytes() == b"foreign"
+    assert not quarantine.exists()
+    assert fake_process.start_count == 2
+
+
 def test_cleanup_failure_replaces_success_and_blocks_reuse_until_retry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -450,20 +917,15 @@ def test_cleanup_failure_replaces_success_and_blocks_reuse_until_retry(
     controller.start(first)
     controller.cancel()
     cancel_path = tmp_path / ".first.cancel"
-    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
-    actual_unlink = Path.unlink
-
-    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
-        if path == cancel_path:
-            raise OSError("locked")
-        actual_unlink(path, missing_ok=missing_ok)
 
     with monkeypatch.context() as context:
-        context.setattr(Path, "unlink", fail_owned)
+        quarantines = install_owned_quarantine_unlink_failure(context, cancel_path)
         terminal = ProgressEvent("complete", 3, 4, 5.0, None)
         fake_process.emit_stdout(event_json(terminal) + "\n")
         fake_process.finish()
 
+        quarantine = quarantines[0]
+        cleanup_error = f"cancellation cleanup failed while removing {quarantine}: locked"
         assert finished == []
         assert failures == [cleanup_error]
         assert terminated == [None]
@@ -480,6 +942,7 @@ def test_cleanup_failure_replaces_success_and_blocks_reuse_until_retry(
     controller.start(second)
 
     assert fake_process.start_count == 2
+    assert not quarantine.exists()
     assert not cancel_path.exists()
 
 
@@ -499,18 +962,12 @@ def test_failed_to_start_cleanup_failure_emits_once_and_ignores_late_finished(
     controller.start(config)
     controller.cancel()
     cancel_path = tmp_path / ".run.cancel"
-    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
-    actual_unlink = Path.unlink
-
-    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
-        if path == cancel_path:
-            raise OSError("locked")
-        actual_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_owned)
+    quarantines = install_owned_quarantine_unlink_failure(monkeypatch, cancel_path)
 
     fake_process.emit_error(QProcess.ProcessError.FailedToStart)
 
+    quarantine = quarantines[0]
+    cleanup_error = f"cancellation cleanup failed while removing {quarantine}: locked"
     assert finished == []
     assert failures == [f"worker failed to start\n{cleanup_error}"]
     assert terminated == [None]
@@ -535,21 +992,15 @@ def test_worker_failure_keeps_error_and_appends_cleanup_diagnostic(
     controller.start(make_config(tmp_path))
     controller.cancel()
     cancel_path = tmp_path / ".run.cancel"
-    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
-    actual_unlink = Path.unlink
-
-    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
-        if path == cancel_path:
-            raise OSError("locked")
-        actual_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_owned)
+    quarantines = install_owned_quarantine_unlink_failure(monkeypatch, cancel_path)
     fake_process.emit_stdout(
         event_json(ProgressEvent("failed", 1, 1, 2.0, "model failed")) + "\n"
     )
 
     fake_process.finish()
 
+    quarantine = quarantines[0]
+    cleanup_error = f"cancellation cleanup failed while removing {quarantine}: locked"
     assert failures == [f"model failed\n{cleanup_error}"]
     assert terminated == [None]
 
@@ -567,15 +1018,7 @@ def test_protocol_failure_keeps_error_and_appends_cleanup_diagnostic(
     controller.start(make_config(tmp_path))
     controller.cancel()
     cancel_path = tmp_path / ".run.cancel"
-    cleanup_error = f"cancellation cleanup failed while removing {cancel_path}: locked"
-    actual_unlink = Path.unlink
-
-    def fail_owned(path: Path, *, missing_ok: bool = False) -> None:
-        if path == cancel_path:
-            raise OSError("locked")
-        actual_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_owned)
+    quarantines = install_owned_quarantine_unlink_failure(monkeypatch, cancel_path)
 
     fake_process.emit_stdout("not-json\n")
 
@@ -584,6 +1027,8 @@ def test_protocol_failure_keeps_error_and_appends_cleanup_diagnostic(
 
     fake_process.finish(1, QProcess.ExitStatus.CrashExit)
 
+    quarantine = quarantines[0]
+    cleanup_error = f"cancellation cleanup failed while removing {quarantine}: locked"
     assert failures == [f"{MALFORMED_PROGRESS_ERROR}\n{cleanup_error}"]
     assert terminated == [None]
 
