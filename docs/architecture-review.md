@@ -63,7 +63,8 @@ uv sync --extra cpu --extra gui
 # uv sync --extra cu128 --extra gui
 
 uv run edge-perception --help
-uv run edge-perception run videos/reference.mp4 `
+$Video = 'C:\path\to\your\video.mp4'
+uv run edge-perception run $Video `
   --output runs/reference-a `
   --detector dfine-nano-coco `
   --device cpu `
@@ -73,7 +74,7 @@ uv run edge-perception run videos/reference.mp4 `
 uv run edge-perception inspect runs/reference-a
 ```
 
-`videos/reference.mp4` must be a local video the user may lawfully process. A real run also requires access to the registry’s pinned D-FINE files. Verify the imported backend before a measured run using the commands in the [repository install guide](../README.md).
+`$Video` is deliberately a user-supplied placeholder: the repository does not bundle sample media, completed runs, model weights, or a model-free demo command. A real run also requires access to the registry’s pinned D-FINE files. Verify the imported backend before a measured run using the commands in the [repository install guide](../README.md).
 
 ### Ubuntu under WSL2: headless developer preview
 
@@ -93,7 +94,8 @@ cd adaptive-edge-perception
 # Install uv using the official Linux instructions first.
 uv sync --extra cpu
 uv run edge-perception --help
-uv run edge-perception run videos/reference.mp4 \
+VIDEO=/path/to/your/video.mp4
+uv run edge-perception run "$VIDEO" \
   --output runs/reference-a \
   --detector dfine-nano-coco \
   --device cpu \
@@ -318,6 +320,7 @@ No policy-quality benchmark or artifact release should proceed while either P0 r
 - **No executable action/budget semantics.** Adding policy code directly to the current frame loop would couple science to implementation order and make fair counterfactual evaluation difficult ([runner.py](../src/edge_perception/runner.py)).
 - **No live backpressure contract.** Camera acquisition produces a finalized video for the offline runner; it does not define live queues, stale frames, dropped frames, or deadlines ([capture.py](../src/edge_perception/capture.py), [runner.py](../src/edge_perception/runner.py)).
 - **Evidence concentration.** Windows is the only exercised platform, and the published real-model lane is a bounded smoke check rather than a benchmark ([checkpoint report](checkpoints/eyes-and-stopwatch.md)).
+- **No fresh-clone product smoke path.** The model-free proof is currently an internal acceptance test whose generated video and run artifacts live only in temporary test storage; a user cannot reproduce the workflow with one tracked command and no external model assets ([acceptance test](../tests/test_cli_workflow_acceptance.py)).
 
 ### P2 / deferred work
 
@@ -348,6 +351,7 @@ Vectorized environments, distributed RL, Minari export, multi-agent cameras, plu
 
 - Add `PreparedSource`/`FrameSource`, `ActionCatalog`, `BudgetLedger`, `Strategy`, `Tracker`, `DetectorAdapter`, `PerceptionEngine`, and `InspectionRuntime` with fake components first.
 - Re-express the existing fixed full-frame/ROI schedule as a baseline `Strategy` and prove output compatibility.
+- Add a two-minute, model-free contract smoke workflow with tracked synthetic inputs and explicitly non-benchmark outputs; keep real detector implementations and weights external.
 - Define replay/live backend protocols and canonical transition artifacts without adding an RL framework dependency.
 
 ### THEN — establish the research environment
