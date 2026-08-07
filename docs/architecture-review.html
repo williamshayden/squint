@@ -15,6 +15,7 @@
       --blue: #0757d9;
       --blue-dark: #063f9f;
       --orange: #e85d04;
+      --orange-text: #b54708;
       --band: #f5f7fa;
       --rail: 220px;
       --gutter: clamp(24px, 3vw, 46px);
@@ -49,8 +50,8 @@
     .rail a { position: relative; display: flex; align-items: center; min-height: 50px; padding: 10px 22px 10px 38px; color: var(--ink); font: 15px/1.25 var(--sans); text-decoration: none; }
     .rail a::before { content: ""; width: 12px; height: 12px; margin-right: 13px; border: 1.5px solid currentColor; }
     .rail a:hover, .rail a:focus-visible { color: var(--blue); }
-    .rail a:target, .rail a[aria-current="page"] { color: var(--blue); font-weight: 700; }
-    .rail a[aria-current="page"]::after { content: ""; position: absolute; inset: 5px auto 5px 0; width: 4px; background: var(--blue); }
+    .rail a:target, .rail a[aria-current="location"] { color: var(--blue); font-weight: 700; }
+    .rail a[aria-current="location"]::after { content: ""; position: absolute; inset: 5px auto 5px 0; width: 4px; background: var(--blue); }
 
     main { min-width: 0; margin-left: var(--rail); }
     section { scroll-margin-top: 0; padding: 40px var(--gutter) 76px; border-bottom: 1px solid var(--quiet-rule); }
@@ -93,7 +94,7 @@
     .verdict h3 { margin-top: 0; }
     .callout { border-left: 4px solid var(--blue); padding: 4px 0 4px 20px; }
     .callout--risk { border-left-color: var(--orange); }
-    .callout--risk .label { color: var(--orange); }
+    .callout--risk .label { color: var(--orange-text); }
 
     .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; border: 1px solid var(--rule); }
     table { width: 100%; border-collapse: collapse; background: var(--paper); font-size: 13px; line-height: 1.45; }
@@ -133,11 +134,11 @@
     .arrow { color: var(--blue); font: 28px/1 var(--sans); text-align: center; }
     .code-contract { padding: 20px; border: 1px solid var(--rule); background: var(--band); }
 
-    .warning { display: flex; gap: 12px; align-items: flex-start; margin: 20px 0; color: var(--orange); }
-    .warning-mark { flex: 0 0 auto; display: grid; place-items: center; width: 26px; height: 24px; border: 2px solid var(--orange); font-weight: 800; line-height: 1; }
+    .warning { display: flex; gap: 12px; align-items: flex-start; margin: 20px 0; color: var(--orange-text); }
+    .warning-mark { flex: 0 0 auto; display: grid; place-items: center; width: 26px; height: 24px; border: 2px solid var(--orange); color: var(--orange-text); font-weight: 800; line-height: 1; }
     .p0-list { counter-reset: p0; list-style: none; padding: 0; }
     .p0-list li { counter-increment: p0; padding: 18px 0 18px 52px; border-top: 1px solid var(--rule); position: relative; }
-    .p0-list li::before { content: "P0." counter(p0); position: absolute; left: 0; top: 19px; color: var(--orange); font: 800 13px/1 var(--sans); }
+    .p0-list li::before { content: "P0." counter(p0); position: absolute; left: 0; top: 19px; color: var(--orange-text); font: 800 13px/1 var(--sans); }
 
     .roadmap { display: grid; grid-template-columns: repeat(4, 1fr); gap: 36px; margin-top: 26px; }
     .roadmap-stage { position: relative; padding-top: 58px; }
@@ -172,7 +173,7 @@
       .rail li { flex: 0 0 auto; }
       .rail a { min-height: 52px; padding: 9px 13px; font-size: 13px; white-space: nowrap; }
       .rail a::before { width: 9px; height: 9px; margin-right: 7px; }
-      .rail a[aria-current="page"]::after { inset: auto 8px 0; width: auto; height: 3px; }
+      .rail a[aria-current="location"]::after { inset: auto 8px 0; width: auto; height: 3px; }
       main { margin-left: 0; padding-top: 52px; }
       section { scroll-margin-top: 60px; padding: 58px 20px; }
       section:first-child { padding-top: 24px; }
@@ -229,7 +230,7 @@
   <nav class="rail" aria-label="Architecture review sections">
     <div class="rail__brand"><span class="brand-mark" aria-hidden="true"></span><span>Architecture review</span></div>
     <ul>
-      <li><a href="#overview" aria-current="page">Overview</a></li>
+      <li><a href="#overview">Overview</a></li>
       <li><a href="#evidence">Evidence</a></li>
       <li><a href="#install">Install</a></li>
       <li><a href="#architecture">Architecture</a></li>
@@ -673,7 +674,7 @@ action_space = Discrete(ACTION_COUNT)</pre>
       const syncCurrent = () => {
         const current = location.hash || '#overview';
         for (const link of links) {
-          if (link.getAttribute('href') === current) link.setAttribute('aria-current', 'page');
+          if (link.getAttribute('href') === current) link.setAttribute('aria-current', 'location');
           else link.removeAttribute('aria-current');
         }
       };
