@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import io
 import os
 import shutil
@@ -13,8 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from scripts import verify_release_archives as release_verifier
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UV_ENV_VAR = "RELEASE_ARCHIVES_UV"
 LOCAL_UV = PROJECT_ROOT / ".tools" / "uv.exe"
@@ -23,6 +22,19 @@ WHEEL_NAME = "adaptive_edge_perception-0.1.0-py3-none-any.whl"
 SDIST_NAME = "adaptive_edge_perception-0.1.0.tar.gz"
 DIST_INFO = "adaptive_edge_perception-0.1.0.dist-info"
 SDIST_ROOT = "adaptive_edge_perception-0.1.0"
+
+_VERIFIER_SPEC = importlib.util.spec_from_file_location(
+    "_test_release_archives.verify_release_archives", VERIFIER
+)
+if _VERIFIER_SPEC is None or _VERIFIER_SPEC.loader is None:
+    raise ImportError(f"cannot load release verifier from {VERIFIER}")
+release_verifier = importlib.util.module_from_spec(_VERIFIER_SPEC)
+sys.modules[_VERIFIER_SPEC.name] = release_verifier
+try:
+    _VERIFIER_SPEC.loader.exec_module(release_verifier)
+except BaseException:
+    sys.modules.pop(_VERIFIER_SPEC.name, None)
+    raise
 
 
 def _resolve_uv() -> str:
