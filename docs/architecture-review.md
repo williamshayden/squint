@@ -7,13 +7,13 @@ This is the canonical architecture review for Adaptive Edge Perception. Statemen
 
 ## 1. Executive verdict
 
-**Verdict.** The repository is a credible offline detector-checkpoint runner with unusually careful artifact, cancellation, and test boundaries. It is not yet an adaptive-perception or reinforcement-learning system. The shortest honest path forward is to repair two artifact-integrity blockers, preserve the current runner as a compatibility path, and introduce one framework-neutral runtime that recorded replay, Gymnasium, and live transfer all share.
+**Verdict.** The repository is a credible offline detector-checkpoint runner with unusually careful artifact, cancellation, and test boundaries ([runner](../src/edge_perception/runner.py), [artifact writer](../src/edge_perception/outputs.py), [cancellation tests](../tests/test_runner.py), [checkpoint evidence](checkpoints/eyes-and-stopwatch.md)). It is not yet an adaptive-perception or reinforcement-learning system. The shortest honest path forward is to repair two artifact-integrity blockers, preserve the current runner as a compatibility path, and introduce one framework-neutral runtime that recorded replay, Gymnasium, and live transfer all share.
 
 The detector-versus-tracker scheduling idea is **not novel by itself**. DorT schedules detection versus tracking, SmartTBD applies deep reinforcement learning to tracking-by-detection configuration, and Chanakya learns runtime choices for adaptive perception ([DorT primary publication](https://www.microsoft.com/en-us/research/publication/detect-or-track-towards-cost-effective-video-object-detection-tracking/), [SmartTBD DOI](https://doi.org/10.1145/3703912), [Chanakya paper](https://proceedings.neurips.cc/paper_files/paper/2023/file/ae2d574d2c309f3a45880e4460efd176-Paper-Conference.pdf)). The defensible open-source contribution is the **reproducible environment/runtime/evaluation boundary**: pinned inputs and components, explicit actions and budgets, deterministic replay, honest live capture, canonical artifacts, and comparable evaluation.
 
 ### Explain it to a ten-year-old
 
-Imagine a robot watching a movie. Its sharp “detector eyes” are accurate but slow and expensive. Its “tracker memory” is cheaper, but it can drift. A strategy chooses which one to use on each frame. Recorded movies let us replay the same challenge fairly for every strategy. A live camera is the final exam: the robot must act on time, while we record everything and grade it later. Today, this project has the movie player, detector seam, stopwatch, and report folder. It does not yet have tracker memory, a choosing strategy, a Gymnasium classroom, or the live final exam.
+Imagine a robot watching a movie. Its sharp “detector eyes” are accurate but slow and expensive. Its “tracker memory” is cheaper, but it can drift. A strategy chooses which one to use on each frame. Recorded movies let us replay the same challenge fairly for every strategy. A live camera is the final exam: the robot must act on time, while we record everything and grade it later. Today, this project has the movie player, detector seam, stopwatch, and report folder ([video decoder](../src/edge_perception/video.py), [detector seam](../src/edge_perception/detector.py), [timed runner](../src/edge_perception/runner.py), [artifact outputs](../src/edge_perception/outputs.py)). It does not yet have tracker memory, a choosing strategy, a Gymnasium classroom, or the live final exam ([current package](../src/edge_perception/), [declared dependencies](../pyproject.toml)).
 
 ## 2. What the current checkpoint proves—and does not
 
@@ -120,7 +120,7 @@ flowchart LR
     Geometry[Crop and source mapping] --> Runner
     Telemetry[Host and optional GPU telemetry] --> Runner
     Runner --> Writer[RunOutputs]
-    Writer --> Artifacts[(Canonical run directory)]
+    Writer --> Artifacts[(Current run directory)]
     Artifacts --> View[RunViewData]
     View --> Inspect[Terminal inspection]
     View --> Results[GUI results]
