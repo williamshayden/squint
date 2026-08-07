@@ -177,6 +177,17 @@ class FakeWindowCaptureController(QObject):
         self.previewStopped.emit()
         self.recordingFinished.emit(result)
 
+    def complete_with_cleanup_diagnostic(
+        self,
+        result: CaptureResult,
+        diagnostic: str,
+    ) -> None:
+        self.recording_active = False
+        self.preview_active = False
+        self.previewStopped.emit()
+        self.recordingFinished.emit(result)
+        self.errorOccurred.emit(diagnostic)
+
     def finish_before_preview_stopped(self, result: CaptureResult) -> None:
         self.recording_active = False
         self.recordingFinished.emit(result)
@@ -1541,7 +1552,7 @@ def test_camera_group_control_state_follows_mode_and_recording_guard(
     assert guarded_state == ("Camera", True)
 
 
-def test_acquisition_error_then_finish_keeps_failed_and_rejects_published_result(
+def test_fatal_acquisition_error_then_finish_keeps_failed_and_rejects_result(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1567,7 +1578,7 @@ def test_acquisition_error_then_finish_keeps_failed_and_rejects_published_result
     qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
     result = _capture_result(controller.preview_requests[-1], tmp_path / "capture.mp4")
 
-    controller.fail("capture published but cleanup failed")
+    controller.fail("fatal recording failure")
     controller.recordingFinished.emit(result)
 
     assert acquisition_status.text() == "Acquisition status: Failed"
@@ -1575,6 +1586,43 @@ def test_acquisition_error_then_finish_keeps_failed_and_rejects_published_result
     assert window.findChild(QLabel, "source-path").text() == "—"
     assert checksum.text() == "—"
     assert preview.isEnabled() is True
+
+
+def test_published_cleanup_diagnostic_after_finish_keeps_finalized_result(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    source_status = window.findChild(QLabel, "source-status")
+    output = window.findChild(QLineEdit, "output")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert acquisition_status is not None
+    assert source_status is not None
+    assert output is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    result = _capture_result(controller.preview_requests[-1], tmp_path / "capture.mp4")
+    diagnostic = "capture published but cleanup failed: access denied"
+
+    controller.complete_with_cleanup_diagnostic(result, diagnostic)
+
+    output.setText(str(tmp_path / "run"))
+    assert acquisition_status.text() == "Acquisition status: Finalized"
+    assert source_status.text() == "Source status: Ready"
+    assert window.findChild(QLabel, "source-path").text() == str(result.path.resolve())
+    assert window.resolved_config().capture == result
+    assert window.statusBar().currentMessage() == diagnostic
 
 
 def test_acquisition_finish_then_error_keeps_finalized_source(

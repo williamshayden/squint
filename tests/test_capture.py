@@ -818,6 +818,52 @@ def test_success_atomically_publishes_capture(tmp_path: Path) -> None:
     assert finished[0].path == final_path.resolve()
 
 
+def test_published_result_precedes_nonfatal_cleanup_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = ControllerHarness(tmp_path)
+    harness.start_preview()
+    final_path = tmp_path / "finished.mp4"
+    staged_path = harness.start_recording(final_path)
+    staged_path.write_bytes(b"payload")
+    events: list[str] = []
+    finished: list[CaptureResult] = []
+    errors: list[str] = []
+    harness.controller.previewStopped.connect(lambda: events.append("preview-stopped"))
+
+    def capture_finished(result: CaptureResult) -> None:
+        events.append("recording-finished")
+        finished.append(result)
+
+    def capture_error(message: str) -> None:
+        events.append("error")
+        errors.append(message)
+
+    harness.controller.recordingFinished.connect(capture_finished)
+    harness.controller.errorOccurred.connect(capture_error)
+
+    def deny_unlink(_path: Path) -> None:
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr("edge_perception.capture._unlink_file", deny_unlink)
+    harness.recorder.recorderStateChanged.emit(QMediaRecorder.RecorderState.StoppedState)
+
+    assert final_path.read_bytes() == b"payload"
+    assert events == ["preview-stopped", "recording-finished", "error"]
+    assert len(finished) == 1
+    assert finished[0].path == final_path.resolve()
+    assert errors == [
+        (
+            "capture published but cleanup failed: "
+            f"could not remove staged file {staged_path}: access denied"
+        )
+    ]
+
+    monkeypatch.setattr("edge_perception.capture._unlink_file", lambda path: path.unlink())
+    harness.controller.discard()
+
+
 def test_owned_rewritten_actual_location_is_probed_hashed_and_published(tmp_path: Path) -> None:
     harness = ControllerHarness(tmp_path)
     harness.start_preview()

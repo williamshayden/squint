@@ -631,11 +631,11 @@ class QtCaptureController(QObject):
         self._release_media()
         if had_preview:
             self.previewStopped.emit()
+        self.recordingFinished.emit(result)
         if cleanup_diagnostics:
             self.errorOccurred.emit(
                 "capture published but cleanup failed: " + "; ".join(cleanup_diagnostics)
             )
-        self.recordingFinished.emit(result)
 
     def _fail(self, message: str) -> None:
         failed_generation = self._graph_generation
