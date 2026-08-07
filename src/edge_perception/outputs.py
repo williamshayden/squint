@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager
 from math import isfinite
 from pathlib import Path
 from time import perf_counter_ns
-from typing import Any, Self, TextIO
+from typing import Any, Self, TextIO, cast
 from uuid import uuid4
 
 import numpy as np
@@ -20,6 +20,8 @@ from edge_perception.contracts import Detection, Region
 
 SCHEMA_VERSION = "0.1.0"
 _OWNER_FILENAME = ".run-outputs-owner"
+_MOVEFILE_REPLACE_EXISTING = 0x1
+_MOVEFILE_WRITE_THROUGH = 0x8
 
 
 def _json_dump(record: Mapping[str, Any]) -> str:
@@ -27,12 +29,66 @@ def _json_dump(record: Mapping[str, Any]) -> str:
     return json.dumps(record, allow_nan=False, sort_keys=True)
 
 
-def _atomic_json_write(
-    path: Path,
-    record: Mapping[str, Any],
+def _load_windows_move_file_ex() -> Callable[[str, str, int], int]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move_file_ex = kernel32.MoveFileExW
+    move_file_ex.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    move_file_ex.restype = wintypes.BOOL
+    return cast(Callable[[str, str, int], int], move_file_ex)
+
+
+def _windows_error() -> OSError:
+    import ctypes
+
+    error_code = int(ctypes.get_last_error())
+    return ctypes.WinError(error_code)
+
+
+def _replace_file_windows(source: Path, destination: Path) -> None:
+    move_file_ex = _load_windows_move_file_ex()
+    flags = _MOVEFILE_REPLACE_EXISTING | _MOVEFILE_WRITE_THROUGH
+    if not move_file_ex(str(source), str(destination), flags):
+        raise _windows_error()
+
+
+def _sync_directory(directory: Path, *, platform: str | None = None) -> None:
+    """Flush directory metadata on platforms that expose directory fsync."""
+    platform_name = os.name if platform is None else platform
+    if platform_name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace(
+    source: Path,
+    destination: Path,
     *,
-    before_publish: Callable[[], None] | None = None,
+    platform: str | None = None,
 ) -> None:
+    """Atomically replace a file and durably commit its directory entry."""
+    platform_name = os.name if platform is None else platform
+    if platform_name == "nt":
+        _replace_file_windows(source, destination)
+        return
+    os.replace(source, destination)
+    _sync_directory(destination.parent, platform=platform_name)
+
+
+def _durable_unlink(path: Path, *, platform: str | None = None) -> None:
+    """Remove a directory entry and flush its parent where supported."""
+    platform_name = os.name if platform is None else platform
+    path.unlink()
+    _sync_directory(path.parent, platform=platform_name)
+
+
+def _atomic_json_write(path: Path, record: Mapping[str, Any]) -> None:
     """Atomically replace a JSON document after it has serialized successfully."""
     encoded = _json_dump(record)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -41,9 +97,7 @@ def _atomic_json_write(
             stream.write(encoded + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        if before_publish is not None:
-            before_publish()
-        os.replace(temporary, path)
+        _durable_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -283,20 +337,17 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
         )
 
     def write_summary(self, summary: Mapping[str, Any]) -> None:
-        """Close durable streams and atomically publish the terminal summary."""
-        _atomic_json_write(
-            self.run_dir / "summary.json",
-            _record(self.run_id, summary),
-            before_publish=self._prepare_terminal_publish,
-        )
+        """Close streams, publish the terminal summary, then release ownership."""
+        self._close_durable_streams()
+        _atomic_json_write(self.run_dir / "summary.json", _record(self.run_id, summary))
+        _durable_unlink(self._owner_path)
 
-    def _prepare_terminal_publish(self) -> None:
+    def _close_durable_streams(self) -> None:
         for stream in self._streams.values():
             if not stream.closed:
                 stream.flush()
                 os.fsync(stream.fileno())
         self.close()
-        self._owner_path.unlink()
 
     def annotate(
         self,

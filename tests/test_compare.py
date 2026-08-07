@@ -23,7 +23,11 @@ def _manifest(run_id: str) -> dict[str, Any]:
                 {"region_id": "alternate", "x": 50, "y": 0, "width": 40, "height": 25},
             ],
         },
-        "source_video": {"sha256": "b" * 64},
+        "source_video": {
+            "sha256": "b" * 64,
+            "frame_width": 200,
+            "frame_height": 100,
+        },
         "detector": {
             "adapter": "tests.fake",
             "model_id": "tests/fake-detector",
@@ -620,6 +624,65 @@ def test_compare_runs_reports_non_object_manifest_as_controlled_error(tmp_path: 
     (tmp_path / "left" / "manifest.json").write_text("[]", encoding="utf-8")
 
     with pytest.raises(ValueError, match="manifest.json"):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+def test_compare_runs_rejects_reserved_full_frame_configured_region(tmp_path: Path) -> None:
+    left_manifest = _manifest("left-run")
+    right_manifest = _manifest("right-run")
+    for manifest in (left_manifest, right_manifest):
+        manifest["configuration"]["regions"].append(
+            {
+                "region_id": "full-frame",
+                "x": 0,
+                "y": 0,
+                "width": 200,
+                "height": 100,
+            }
+        )
+    _write_run(
+        tmp_path / "left",
+        left_manifest,
+        _summary("left-run"),
+        _inferences("left-run"),
+        _detections("left-run"),
+    )
+    _write_run(
+        tmp_path / "right",
+        right_manifest,
+        _summary("right-run"),
+        _inferences("right-run"),
+        _detections("right-run"),
+    )
+
+    with pytest.raises(ValueError, match="reserved.*full-frame"):
+        compare_runs(tmp_path / "left", tmp_path / "right")
+
+
+def test_compare_runs_rejects_full_frame_region_that_differs_from_source_dimensions(
+    tmp_path: Path,
+) -> None:
+    left_inferences = _inferences("left-run")
+    right_inferences = _inferences("right-run")
+    for inferences in (left_inferences, right_inferences):
+        inferences[0]["region"]["width"] = 199
+        inferences[0]["input_shape"] = [100, 199, 3]
+    _write_run(
+        tmp_path / "left",
+        _manifest("left-run"),
+        _summary("left-run"),
+        left_inferences,
+        _detections("left-run"),
+    )
+    _write_run(
+        tmp_path / "right",
+        _manifest("right-run"),
+        _summary("right-run"),
+        right_inferences,
+        _detections("right-run"),
+    )
+
+    with pytest.raises(ValueError, match="full-frame inference region"):
         compare_runs(tmp_path / "left", tmp_path / "right")
 
 

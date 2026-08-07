@@ -461,6 +461,59 @@ def test_primary_inference_error_survives_secondary_peak_memory_error(
     assert summary["detector_peak_device_memory_bytes"] is None
 
 
+def test_primary_base_exception_survives_summary_finalization_failure(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PrimarySignal(BaseException):
+        pass
+
+    def fail_predict(_images: tuple[object, ...]) -> object:
+        raise PrimarySignal("primary runner failure")
+
+    def fail_summary(
+        _outputs: RunOutputs,
+        _summary: Mapping[str, object],
+    ) -> None:
+        raise OSError("summary publication failed")
+
+    fake_detector.predict = fail_predict  # type: ignore[method-assign]
+    monkeypatch.setattr(RunOutputs, "write_summary", fail_summary)
+
+    with pytest.raises(PrimarySignal, match="primary runner failure") as raised:
+        run_checkpoint(
+            RunConfig(video_path, tmp_path / "primary-summary-failure", (), 0.3, 1, 0, 0),
+            fake_detector,
+        )
+
+    assert raised.value.__notes__ == [
+        "failed to publish terminal summary: OSError: summary publication failed"
+    ]
+
+
+def test_summary_finalization_failure_surfaces_without_primary_failure(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_summary(
+        _outputs: RunOutputs,
+        _summary: Mapping[str, object],
+    ) -> None:
+        raise OSError("summary publication failed")
+
+    monkeypatch.setattr(RunOutputs, "write_summary", fail_summary)
+
+    with pytest.raises(OSError, match="summary publication failed"):
+        run_checkpoint(
+            RunConfig(video_path, tmp_path / "standalone-summary-failure", (), 0.3, 1, 0, 0),
+            fake_detector,
+        )
+
+
 @pytest.mark.parametrize("telemetry_failure", ["shutdown", "peaks", "sample"])
 def test_primary_inference_error_survives_optional_telemetry_failure(
     video_path: Path,
@@ -558,6 +611,7 @@ def test_summary_publication_waits_for_closed_complete_jsonl_streams(
             assert active_outputs is not None
             assert not destination_path.exists()
             assert all(stream.closed for stream in active_outputs._streams.values())
+            assert (run_dir / ".run-outputs-owner").is_file()
             persisted_hardware = _json_lines(run_dir / "hardware.jsonl")
             assert hardware_records
             assert len(persisted_hardware) == len(hardware_records)
@@ -568,11 +622,16 @@ def test_summary_publication_waits_for_closed_complete_jsonl_streams(
 
     monkeypatch.setattr(RunOutputs, "write_hardware", record_hardware)
     monkeypatch.setattr(RunOutputs, "write_summary", capture_outputs)
-    monkeypatch.setattr("edge_perception.outputs.os.replace", inspect_summary_replace)
+    monkeypatch.setattr(
+        "edge_perception.outputs._durable_replace",
+        inspect_summary_replace,
+        raising=False,
+    )
 
     run_checkpoint(RunConfig(video_path, run_dir, (), 0.3, 1, 0, 0), fake_detector)
 
     assert summary_published
+    assert not (run_dir / ".run-outputs-owner").exists()
 
 
 def test_run_checkpoint_finalizes_failed_artifacts_when_warmup_fails(

@@ -524,7 +524,15 @@ def run_checkpoint(
                         hardware_peaks=hardware_peaks,
                         peak_device_memory_bytes=peak_device_memory_bytes,
                     )
-                    outputs.write_summary(summary)
+                    try:
+                        outputs.write_summary(summary)
+                    except Exception as finalization_error:
+                        if failure is None:
+                            raise
+                        failure.add_note(
+                            "failed to publish terminal summary: "
+                            f"{type(finalization_error).__name__}: {finalization_error}"
+                        )
         finally:
             preview.close()
     except BaseException as error:

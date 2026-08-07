@@ -125,6 +125,10 @@ def _region_keys(configuration: dict[str, object]) -> tuple[RegionKey, ...]:
             raise ComparisonError(f"{context} must be an object")
         region = _region_key(cast(dict[str, object], item), context)
         region_id = region[0]
+        if region_id == "full-frame":
+            raise ValueError(
+                "configuration.regions contains reserved region_id 'full-frame'"
+            )
         if region_id in region_ids:
             raise ValueError(f"configuration.regions has duplicate region_id {region_id!r}")
         region_ids.add(region_id)
@@ -139,6 +143,15 @@ def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
 def _region_catalog(manifest: dict[str, object]) -> dict[str, RegionKey]:
     configuration = _mapping(manifest, "configuration")
     return {region[0]: region for region in _region_keys(configuration)}
+
+
+def _source_frame_dimensions(manifest: dict[str, object]) -> tuple[int, int]:
+    source_video = _mapping(manifest, "source_video")
+    frame_width = _required_integer(source_video, "frame_width", "source_video")
+    frame_height = _required_integer(source_video, "frame_height", "source_video")
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("source_video frame dimensions must be positive")
+    return frame_width, frame_height
 
 
 def _manifest_fields(manifest: dict[str, object]) -> tuple[tuple[str, object], ...]:
@@ -266,6 +279,7 @@ def _inference_index(
     run_id: str,
     summary: dict[str, object],
     region_catalog: dict[str, RegionKey],
+    source_frame_dimensions: tuple[int, int],
 ) -> tuple[dict[InferenceKey, dict[str, object]], dict[str, tuple[str, str]]]:
     indexed: dict[InferenceKey, dict[str, object]] = {}
     links: dict[str, tuple[str, str]] = {}
@@ -306,7 +320,13 @@ def _inference_index(
             )
         frame_ids[frame_id] = frame_index
 
-        if region_id != "full-frame" and region_catalog.get(region_id) != region:
+        if region_id == "full-frame":
+            frame_width, frame_height = source_frame_dimensions
+            if region != ("full-frame", 0, 0, frame_width, frame_height):
+                raise ComparisonError(
+                    f"{context}.full-frame inference region must match source_video dimensions"
+                )
+        elif region_catalog.get(region_id) != region:
             raise ComparisonError(
                 f"{context}.region must match a member of configuration.regions"
             )
@@ -439,6 +459,8 @@ def compare_runs(
     right_manifest_fields = _manifest_fields(right_manifest)
     left_region_catalog = _region_catalog(left_manifest)
     right_region_catalog = _region_catalog(right_manifest)
+    left_source_frame_dimensions = _source_frame_dimensions(left_manifest)
+    right_source_frame_dimensions = _source_frame_dimensions(right_manifest)
 
     left_summary = _json_object(left_path / "summary.json")
     right_summary = _json_object(right_path / "summary.json")
@@ -454,12 +476,14 @@ def compare_runs(
         run_id=left_run_id,
         summary=left_summary,
         region_catalog=left_region_catalog,
+        source_frame_dimensions=left_source_frame_dimensions,
     )
     right_inference_index, right_inference_links = _inference_index(
         right_inference_records,
         run_id=right_run_id,
         summary=right_summary,
         region_catalog=right_region_catalog,
+        source_frame_dimensions=right_source_frame_dimensions,
     )
 
     left_records = _json_lines(left_path / "detections.jsonl")

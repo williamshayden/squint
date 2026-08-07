@@ -12,8 +12,8 @@
 
 - Preserve schema version `0.1.0`, canonical filenames, detector default, batch size one, and terminal values `complete`, `failed`, and `cancelled`.
 - A run output may be absent or an existing empty directory. Exactly one process may claim it; a loser must fail without truncating, replacing, or mixing any winner artifact.
-- No ownership marker or temporary file remains after a terminal `summary.json` is published. An interrupted nonterminal run may retain an ownership marker to make incompleteness explicit.
-- `summary.json` is the final commit marker: every JSONL stream is flushed, fsynced, and closed before its atomic publication.
+- `summary.json` is the authoritative terminal commit marker: every JSONL stream is flushed, fsynced, and closed before its atomic, durable publication. Normal successful finalization then removes the ownership marker and flushes its parent directory metadata where supported.
+- No owned temporary file remains after terminal finalization. A crash after summary publication may leave a stale ownership marker; `summary.json` wins. An interrupted nonterminal run may retain an ownership marker to make incompleteness explicit.
 - `frames_processed`, `inference_count`, and `annotated_frame_count` count only fully committed frames. A detector/ROI/annotation failure cannot publish a partial frame's rows or final PNG.
 - Optional telemetry and detector peak-memory collection may report `null`; they must never replace the primary detector/runner exception or prevent a failed summary.
 - `compare` remains timing-, host-, and device-neutral, but detector adapter/model/revision/weights, source/config, terminal status/counts, and every frame-region inference are semantic.
@@ -74,7 +74,7 @@ Expected: FAIL because both constructors currently reuse the directory and overw
 
 Use one fixed private ownership filename and exclusive creation (`open("x")`) after ensuring the parent exists. Re-check that the claimed directory contains only the owned marker before creating artifacts. Open canonical JSONL files with exclusive mode. Temporary JSON/PNG names must include the run ID (or another owned unique suffix), not a process-global fixed `.tmp` name.
 
-If claim/setup fails, preserve all pre-existing paths and remove only files created by that failed constructor. A completed run removes its marker immediately before publishing terminal `summary.json`; a nonterminal interrupted run may retain it. Do not add the marker to the public artifact schema.
+If claim/setup fails, preserve all pre-existing paths and remove only files created by that failed constructor. A completed run removes its marker after durably publishing terminal `summary.json`; a crash in that interval may leave a stale marker, and the summary remains authoritative. A nonterminal interrupted run may retain its marker. Do not add the marker to the public artifact schema.
 
 - [ ] **Step 4: Write failing complete-frame and atomic-annotation tests**
 
@@ -106,7 +106,7 @@ Wrap summary publication and assert every JSONL stream is closed and all expecte
 
 - [ ] **Step 8: Implement durable terminal finalization**
 
-Treat peak-memory collection as optional: catch ordinary `Exception`, record `None`, and preserve any existing failure. Append telemetry, flush and `os.fsync` each JSONL stream, close them, release the ownership marker, then atomically publish `summary.json` as the final operation. `close()` remains idempotent. Do not catch `KeyboardInterrupt` or `SystemExit` as optional telemetry errors.
+Treat peak-memory collection as optional: catch ordinary `Exception`, record `None`, and preserve any existing failure. Append telemetry, flush and `os.fsync` each JSONL stream, close them, then atomically and durably publish `summary.json`. Remove the ownership marker afterward and flush its parent directory metadata where supported. `close()` remains idempotent. Do not catch `KeyboardInterrupt` or `SystemExit` as optional telemetry errors.
 
 - [ ] **Step 9: Verify Task 1**
 
