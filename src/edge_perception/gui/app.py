@@ -20,7 +20,7 @@ def _forget_window(window: MainWindow) -> None:
 
 
 def launch_gui(run_dir: Path | None = None, *, argv: Sequence[str] = ()) -> int:
-    """Show the native window and run the event loop when this function owns it."""
+    """Show the native window, optionally with one completed run loaded."""
 
     app = QApplication.instance()
     owns_application = app is None

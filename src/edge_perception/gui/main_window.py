@@ -43,6 +43,7 @@ from edge_perception.gui.capture import (
     select_camera_format,
 )
 from edge_perception.gui.region_view import RegionView
+from edge_perception.gui.results import ResultsWidget
 from edge_perception.gui.run_controller import RunController
 from edge_perception.progress import ProgressEvent
 from edge_perception.runner import validate_output_directory
@@ -117,7 +118,7 @@ class MainWindow(QMainWindow):
         form.addRow("Max frames", self._max_frames_spin)
         form.addRow("Warm-up runs", self._warmup_runs_spin)
         form.addRow("Annotate every", self._annotate_every_spin)
-        self._output_line = self._output(run_dir)
+        self._output_line = self._output()
         form.addRow("Output", self._output_line)
         self._config_path_line = self._readonly_line("config-path")
         self._run_cli_line = self._readonly_line("run-cli")
@@ -132,15 +133,9 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self._run_progress)
         controls_layout.addLayout(self._actions())
 
-        self._completed_run = QGroupBox("Completed run")
-        self._completed_run.setObjectName("completed-run")
-        self._completed_run.setVisible(False)
-        completed_layout = QVBoxLayout(self._completed_run)
-        self._completed_run_path = QLabel("—")
-        self._completed_run_path.setObjectName("completed-run-path")
-        self._completed_run_path.setWordWrap(True)
-        completed_layout.addWidget(self._completed_run_path)
-        controls_layout.addWidget(self._completed_run)
+        self.resultsWidget = ResultsWidget()
+        self.resultsWidget.setVisible(False)
+        controls_layout.addWidget(self.resultsWidget)
         controls_layout.addStretch()
         splitter.addWidget(controls)
         splitter.setStretchFactor(0, 1)
@@ -167,11 +162,13 @@ class MainWindow(QMainWindow):
         self.runController.runFinished.connect(self._run_finished)
         self.runController.runFailed.connect(self._run_failed)
         self.runController.processTerminated.connect(self._run_process_terminated)
+        self._clear_region_values()
+        self.statusBar().showMessage("Ready")
+        if run_dir is not None:
+            self._load_completed_run(run_dir)
         if self._capture_controller is not None:
             self._connect_capture_controller()
-        self._clear_region_values()
         self._update_control_state()
-        self.statusBar().showMessage("Ready")
 
     def load_video(self, path: Path) -> None:
         """Decode and display one bounded preview frame from a local video."""
@@ -753,12 +750,21 @@ class MainWindow(QMainWindow):
         )
 
     def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
-        path = run_dir.resolve()
-        self._completed_run_path.setText(str(path))
-        self._completed_run.setVisible(True)
+        try:
+            path = self._load_completed_run(run_dir)
+        except (OSError, TypeError, ValueError) as error:
+            self._run_failed(f"completed run could not be loaded: {error}")
+            return
         phase = payload.get("phase")
         self.statusBar().showMessage(f"Run {phase}: {path}")
         self._update_control_state()
+
+    def _load_completed_run(self, run_dir: Path) -> Path:
+        path = Path(run_dir).resolve()
+        self.resultsWidget.load_run(path)
+        self.resultsWidget.setVisible(True)
+        self.statusBar().showMessage(f"Loaded completed run: {path}")
+        return path
 
     def _run_failed(self, message: str) -> None:
         self.statusBar().showMessage(message)
@@ -885,12 +891,10 @@ class MainWindow(QMainWindow):
         return count
 
     @staticmethod
-    def _output(run_dir: Path | None) -> QLineEdit:
+    def _output() -> QLineEdit:
         output = QLineEdit()
         output.setObjectName("output")
         output.setPlaceholderText("Output directory")
-        if run_dir is not None:
-            output.setText(str(run_dir))
         return output
 
     @staticmethod

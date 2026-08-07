@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import socket
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,6 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsView,
-    QGroupBox,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -34,6 +34,7 @@ from edge_perception.config import (
     render_run_cli,
 )
 from edge_perception.contracts import Region
+from edge_perception.detectors import registry as detector_registry
 from edge_perception.gui import main_window
 from edge_perception.gui import run_controller as run_controller_module
 from edge_perception.gui.capture import (
@@ -43,6 +44,7 @@ from edge_perception.gui.capture import (
 )
 from edge_perception.gui.main_window import MainWindow
 from edge_perception.gui.region_view import RegionView
+from edge_perception.gui.results import ResultsWidget
 from edge_perception.gui.run_controller import MALFORMED_PROGRESS_ERROR
 from edge_perception.progress import ProgressEvent
 from edge_perception.video import DecodedFrame
@@ -100,12 +102,14 @@ class FakeWindowCaptureController(QObject):
         self.discard_calls = 0
         self.preview_active = False
         self.recording_active = False
+        self.devices_calls = 0
 
     @property
     def is_recording(self) -> bool:
         return self.recording_active
 
     def devices(self) -> tuple[CameraDeviceInfo, ...]:
+        self.devices_calls += 1
         return (self.device,)
 
     def start_preview(
@@ -224,6 +228,49 @@ def _progress_record(event: ProgressEvent) -> str:
     return json.dumps(event.to_dict(), allow_nan=False, sort_keys=True) + "\n"
 
 
+def _write_completed_run(run_dir: Path) -> Path:
+    annotated = run_dir / "annotated"
+    annotated.mkdir(parents=True)
+    run_id = "gui-run-id"
+    manifest = {
+        "schema_version": "0.1.0",
+        "run_id": run_id,
+        "configuration": {
+            "regions": [],
+            "threshold": 0.3,
+        },
+        "source_video": {
+            "path": str((run_dir.parent / "historical-source.mp4").resolve()),
+            "frame_width": 640,
+            "frame_height": 480,
+            "capture": None,
+        },
+        "detector": {
+            "model_id": "tests/fake-detector",
+            "revision": "test-revision",
+            "device": "cpu",
+        },
+    }
+    empty_latency = {"count": 0, "p50_ms": None, "p95_ms": None, "p99_ms": None}
+    summary = {
+        "schema_version": "0.1.0",
+        "run_id": run_id,
+        "status": "complete",
+        "frames_processed": 0,
+        "inference_count": 0,
+        "annotated_frame_count": 0,
+        "latency_ms": {"complete_frame": empty_latency},
+        "hardware_peaks": {
+            "process_rss_bytes": None,
+            "gpu_memory_used_bytes": None,
+        },
+        "detector_peak_device_memory_bytes": None,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return run_dir
+
+
 def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
@@ -232,6 +279,40 @@ def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     assert window.objectName() == "edge-perception-main-window"
     assert window.findChild(QGraphicsView, "source-view") is not None
     assert window.findChild(QPushButton, "run-button") is not None
+
+
+def test_gui_run_mode_is_camera_model_and_network_lazy(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = {"model": 0, "network": 0}
+
+    def model_sentinel(*_args: object, **_kwargs: object) -> object:
+        calls["model"] += 1
+        raise AssertionError("completed-run viewing loaded a model")
+
+    def network_sentinel(*_args: object, **_kwargs: object) -> object:
+        calls["network"] += 1
+        raise AssertionError("completed-run viewing accessed the network")
+
+    monkeypatch.setattr(detector_registry, "load_detector", model_sentinel)
+    monkeypatch.setattr(socket, "create_connection", network_sentinel)
+    controller = FakeWindowCaptureController()
+    run_dir = _write_completed_run(tmp_path / "completed")
+
+    window = MainWindow(run_dir=run_dir, capture_controller=controller)
+    qtbot.addWidget(window)
+
+    results = window.findChild(ResultsWidget, "results-widget")
+    output = window.findChild(QLineEdit, "output")
+    assert results is not None
+    assert output is not None
+    assert results.isHidden() is False
+    assert results.statusLabel.text() == "complete"
+    assert output.text() == ""
+    assert controller.devices_calls == 0
+    assert calls == {"model": 0, "network": 0}
 
 
 def test_region_view_owns_one_raw_video_item_then_restores_rgb_frame(
@@ -935,8 +1016,7 @@ def test_gui_run_displays_reproducibility_input_and_restores_controls(
     progress = window.findChild(QLabel, "run-progress")
     config_path_line = window.findChild(QLineEdit, "config-path")
     cli_line = window.findChild(QLineEdit, "run-cli")
-    completed = window.findChild(QGroupBox, "completed-run")
-    completed_path = window.findChild(QLabel, "completed-run-path")
+    completed = window.findChild(ResultsWidget, "results-widget")
     open_action = window.findChild(QAction, "open-video-action")
     view = window.findChild(RegionView, "source-view")
     assert all(
@@ -951,7 +1031,6 @@ def test_gui_run_displays_reproducibility_input_and_restores_controls(
             config_path_line,
             cli_line,
             completed,
-            completed_path,
             open_action,
             view,
         )
@@ -965,7 +1044,6 @@ def test_gui_run_displays_reproducibility_input_and_restores_controls(
     assert config_path_line is not None
     assert cli_line is not None
     assert completed is not None
-    assert completed_path is not None
     assert open_action is not None
     assert view is not None
     output.setText(str(output_dir))
@@ -992,6 +1070,7 @@ def test_gui_run_displays_reproducibility_input_and_restores_controls(
     assert progress.text() == "running: 2 frames, 3 inferences, 4.5 ms"
 
     terminal = ProgressEvent("complete", 4, 5, 6.5, None)
+    _write_completed_run(output_dir)
     process.emit_stdout(_progress_record(terminal))
     process.finish()
 
@@ -1003,7 +1082,7 @@ def test_gui_run_displays_reproducibility_input_and_restores_controls(
     assert cancel.isEnabled() is False
     assert run.isEnabled() is False
     assert completed.isHidden() is False
-    assert completed_path.text() == str(output_dir.resolve())
+    assert completed.statusLabel.text() == "complete"
 
 
 def test_gui_run_failure_shows_one_message_and_status(
