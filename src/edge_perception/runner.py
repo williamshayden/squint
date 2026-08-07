@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from collections.abc import Generator
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from time import perf_counter_ns
@@ -167,6 +169,33 @@ def _empty_hardware_peaks() -> dict[str, int | float | None]:
     }
 
 
+@contextmanager
+def _optional_telemetry_monitor() -> Generator[TelemetryMonitor | None, None, None]:
+    try:
+        monitor = TelemetryMonitor()
+    except Exception:  # noqa: BLE001 - telemetry construction is optional
+        yield None
+        return
+
+    try:
+        monitor.__enter__()
+    except Exception:  # noqa: BLE001 - telemetry startup is optional
+        try:
+            monitor.__exit__(*sys.exc_info())
+        except Exception:  # noqa: BLE001, S110 - telemetry shutdown is optional
+            pass
+        yield None
+        return
+
+    try:
+        yield monitor
+    finally:
+        try:
+            monitor.__exit__(*sys.exc_info())
+        except Exception:  # noqa: BLE001, S110 - telemetry shutdown is optional
+            pass
+
+
 def _summary(
     *,
     status: RunStatus,
@@ -258,8 +287,7 @@ def run_checkpoint(
                     if cancel_requested is not None and cancel_requested():
                         status = "cancelled"
                     else:
-                        monitor = TelemetryMonitor()
-                        with monitor:
+                        with _optional_telemetry_monitor() as monitor:
                             measured = _video_iterator(config.input_path)
                             try:
                                 while (
@@ -440,9 +468,12 @@ def run_checkpoint(
                     if monitor is None:
                         hardware_peaks = _empty_hardware_peaks()
                     else:
-                        for sample in monitor.samples:
-                            outputs.write_hardware(sample.to_dict())
-                        hardware_peaks = monitor.peaks()
+                        try:
+                            for sample in monitor.samples:
+                                outputs.write_hardware(sample.to_dict())
+                            hardware_peaks = monitor.peaks()
+                        except Exception:  # noqa: BLE001 - telemetry is optional
+                            hardware_peaks = _empty_hardware_peaks()
                     try:
                         peak_device_memory_bytes = detector.peak_device_memory_bytes()
                     except Exception:  # noqa: BLE001 - optional detector telemetry

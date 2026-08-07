@@ -5,15 +5,18 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Self
 
 import pytest
 from conftest import FakeDetector
 
+from edge_perception import runner as runner_module
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
 from edge_perception.outputs import RunOutputs
 from edge_perception.progress import ProgressEvent
 from edge_perception.runner import RunConfig, run_checkpoint
+from edge_perception.telemetry import TelemetrySample
 
 
 def _json_lines(path: Path) -> list[dict[str, object]]:
@@ -237,6 +240,73 @@ def test_primary_inference_error_survives_secondary_peak_memory_error(
     assert summary["status"] == "failed"
     assert summary["error"] == "RuntimeError: primary inference failure"
     assert summary["detector_peak_device_memory_bytes"] is None
+
+
+@pytest.mark.parametrize("telemetry_failure", ["shutdown", "peaks", "sample"])
+def test_primary_inference_error_survives_optional_telemetry_failure(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+    monkeypatch: pytest.MonkeyPatch,
+    telemetry_failure: str,
+) -> None:
+    run_dir = tmp_path / f"telemetry-{telemetry_failure}"
+    unavailable = TelemetrySample.unavailable(1)
+
+    class InvalidSample:
+        def to_dict(self) -> dict[str, object]:
+            raise RuntimeError("sample conversion failed")
+
+    class FailingTelemetryMonitor:
+        @property
+        def samples(self) -> tuple[TelemetrySample | InvalidSample, ...]:
+            if telemetry_failure == "sample":
+                return (InvalidSample(),)
+            return (unavailable,)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *unused: object) -> None:
+            if telemetry_failure == "shutdown":
+                raise RuntimeError("telemetry shutdown failed")
+
+        def peaks(self) -> dict[str, int | float | None]:
+            if telemetry_failure == "peaks":
+                raise RuntimeError("telemetry peaks failed")
+            return {
+                "process_rss_bytes": None,
+                "system_memory_used_bytes": None,
+                "gpu_utilization_percent": None,
+                "gpu_memory_used_bytes": None,
+                "gpu_power_watts": None,
+                "gpu_temperature_c": None,
+            }
+
+    def fail_predict(_images: tuple[object, ...]) -> object:
+        raise RuntimeError("primary inference failure")
+
+    monkeypatch.setattr(
+        runner_module,
+        "TelemetryMonitor",
+        lambda: FailingTelemetryMonitor(),
+    )
+    fake_detector.predict = fail_predict  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="primary inference failure"):
+        run_checkpoint(RunConfig(video_path, run_dir, (), 0.3, 1, 0, 0), fake_detector)
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert summary["error"] == "RuntimeError: primary inference failure"
+    assert summary["hardware_peaks"] == {
+        "process_rss_bytes": None,
+        "system_memory_used_bytes": None,
+        "gpu_utilization_percent": None,
+        "gpu_memory_used_bytes": None,
+        "gpu_power_watts": None,
+        "gpu_temperature_c": None,
+    }
 
 
 def test_summary_publication_waits_for_closed_complete_jsonl_streams(
