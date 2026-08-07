@@ -94,7 +94,7 @@ Camera contracts, format selection, validation, and the QtMultimedia capture bac
 
 The GUI supplies a visual video output. The CLI drives the same asynchronous backend with a `QCoreApplication`/`QEventLoop` and `QTimer`, without importing QtWidgets or creating a window. Camera and GUI command handlers import PySide6 lazily.
 
-The optional `camera` and `gui` extras each install the same compatible PySide6 dependency. The base package remains sufficient for existing-video runs, inspection, and comparison, and ordinary CLI startup imports neither optional surface. Missing optional support produces a concise install hint rather than breaking unrelated commands at import time.
+The base package supports inspection, comparison, and non-model surfaces without Qt. D-FINE is the only currently registered detector, so real existing-video run execution requires exactly one of the mutually exclusive `cpu` or `cu128` detector-runtime extras plus external pinned model files. The independently optional `camera` and `gui` extras each install the same compatible PySide6 dependency and remain lazy; ordinary CLI startup imports neither optional surface. Missing optional support produces a concise install hint rather than breaking unrelated commands at import time.
 
 ## 4. Native Information Architecture
 
@@ -366,7 +366,7 @@ The slice is complete when:
 - a researcher can complete camera discovery, timed capture, ROI configuration, detector selection, run execution, result inspection, and run comparison from the CLI without opening the GUI;
 - the complete run/inspect/compare proof works with an existing local video and requires no physical camera;
 - every durable native-GUI operation resolves to the same shared contract and canonical artifacts as its CLI counterpart;
-- installing and using the base run/inspect/compare path does not require the optional native multimedia or GUI dependency;
+- installing and using base inspection, comparison, and non-model startup requires no Qt or optional native multimedia/GUI dependency; detector execution requires a detector runtime and external pinned model files but does not require `camera` or `gui`;
 - within one event-loop turn after `recordingFinished`, the finalized path and recorded metadata are visible, Source is Ready, Acquisition is Finalized, Start preview is enabled, recording actions are disabled, and run readiness is recomputed;
 - no automatic source-mode change occurs after finalization;
 - a disabled Run action has a textual readiness reason, and camera-button availability follows directly from the persistent Acquisition status;
