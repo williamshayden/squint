@@ -53,6 +53,7 @@ from edge_perception.config import (
 from edge_perception.contracts import Region
 from edge_perception.detectors import registry as detector_registry
 from edge_perception.gui import main_window
+from edge_perception.gui import results as results_module
 from edge_perception.gui import run_controller as run_controller_module
 from edge_perception.gui.main_window import MainWindow
 from edge_perception.gui.region_view import RegionView
@@ -3147,6 +3148,177 @@ def test_run_lifecycle_terminal_artifacts_load_after_cleanup_and_unlock_on_termi
             False,
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("worker_phase", "artifact_status"),
+    [
+        ("complete", "failed"),
+        ("complete", "cancelled"),
+        ("cancelled", "complete"),
+        ("cancelled", "failed"),
+    ],
+)
+def test_live_terminal_contract_mismatch_fails_without_exposing_results(
+    worker_phase: str,
+    artifact_status: str,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    historical = _write_completed_run(tmp_path / "historical")
+    window = MainWindow(run_dir=historical, process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert run_status is not None
+    run_dir = tmp_path / "run"
+    output.setText(str(run_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    assert window.resultsWidget.isHidden()
+    _write_terminal_run(run_dir, artifact_status)
+    actual_load_run_view = results_module.load_run_view
+    parsed_paths: list[Path] = []
+
+    def counted_load_run_view(path: Path) -> object:
+        parsed_paths.append(path)
+        return actual_load_run_view(path)
+
+    monkeypatch.setattr(results_module, "load_run_view", counted_load_run_view)
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+    observations: list[tuple[str, bool, bool, str]] = []
+    window.runController.runFinished.connect(
+        lambda _path, _payload: observations.append(
+            (
+                "finished",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+            )
+        )
+    )
+    window.runController.processTerminated.connect(
+        lambda: observations.append(
+            (
+                "terminated",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+            )
+        )
+    )
+    expected_error = (
+        "run terminal contract mismatch: worker phase "
+        f"'{worker_phase}' does not match canonical artifact status "
+        f"'{artifact_status}'"
+    )
+    process.emit_stdout(
+        _progress_record(ProgressEvent(worker_phase, 1, 1, 2.0, None))
+    )
+
+    process.finish()
+
+    assert parsed_paths == [run_dir.resolve()]
+    assert critical_messages == [("Run failed", expected_error)]
+    assert observations == [
+        ("finished", False, True, "Run status: Failed"),
+        ("terminated", True, True, "Run status: Failed"),
+    ]
+    assert window.statusBar().currentMessage() == expected_error
+
+
+def test_exit_after_run_terminal_contract_mismatch_is_modal_free(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    window = MainWindow(
+        process=process,
+        close_decision=lambda _activity: "Cancel Run and Exit",
+    )
+    qtbot.addWidget(window)
+    window.show()
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert run_status is not None
+    run_dir = tmp_path / "run"
+    output.setText(str(run_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert not close_event.isAccepted()
+    _write_terminal_run(run_dir, "failed")
+    actual_load_run_view = results_module.load_run_view
+    parsed_paths: list[Path] = []
+
+    def counted_load_run_view(path: Path) -> object:
+        parsed_paths.append(path)
+        return actual_load_run_view(path)
+
+    monkeypatch.setattr(results_module, "load_run_view", counted_load_run_view)
+    critical_messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+    observations: list[tuple[str, bool, bool, str, bool]] = []
+    window.runController.runFinished.connect(
+        lambda _path, _payload: observations.append(
+            (
+                "finished",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+                window.isVisible(),
+            )
+        )
+    )
+    window.runController.processTerminated.connect(
+        lambda: observations.append(
+            (
+                "terminated",
+                output.isEnabled(),
+                window.resultsWidget.isHidden(),
+                run_status.text(),
+                window.isVisible(),
+            )
+        )
+    )
+    expected_error = (
+        "run terminal contract mismatch: worker phase 'complete' does not match "
+        "canonical artifact status 'failed'"
+    )
+    process.emit_stdout(
+        _progress_record(ProgressEvent("complete", 1, 1, 2.0, None))
+    )
+
+    process.finish()
+
+    assert parsed_paths == [run_dir.resolve()]
+    assert critical_messages == []
+    assert observations == [
+        ("finished", False, True, "Run status: Failed", True),
+        ("terminated", True, True, "Run status: Failed", False),
+    ]
+    assert window.statusBar().currentMessage() == expected_error
 
 
 @pytest.mark.parametrize("outcome", ["failed", "nonterminal"])

@@ -74,6 +74,10 @@ def _run_state_for_terminal_status(status: str) -> RunState:
         raise ValueError(f"unsupported terminal run status: {status}") from error
 
 
+class _RunTerminalContractMismatch(ValueError):
+    pass
+
+
 class MainWindow(QMainWindow):
     """Preview a local video and edit named source-pixel regions."""
 
@@ -1233,27 +1237,53 @@ class MainWindow(QMainWindow):
             return
         self._run_state = _run_state_for_terminal_status(phase)
         self._update_control_state()
-        if self._exit_after_run:
-            self.statusBar().showMessage(f"Run {phase}: {Path(run_dir).resolve()}")
-            return
-        path = self._load_completed_run_or_report(run_dir)
+        path = self._load_completed_run_or_report(
+            run_dir,
+            expected_live_status=phase,
+            expose_results=not self._exit_after_run,
+        )
         if path is None:
             return
         self.statusBar().showMessage(f"Run {phase}: {path}")
         self._update_control_state()
 
-    def _load_completed_run_or_report(self, run_dir: Path) -> Path | None:
+    def _load_completed_run_or_report(
+        self,
+        run_dir: Path,
+        *,
+        expected_live_status: str | None = None,
+        expose_results: bool = True,
+    ) -> Path | None:
         try:
-            return self._load_completed_run(run_dir)
+            return self._load_completed_run(
+                run_dir,
+                expected_live_status=expected_live_status,
+                expose_results=expose_results,
+            )
+        except _RunTerminalContractMismatch as error:
+            self._run_failed(str(error))
+            return None
         except (OSError, TypeError, ValueError) as error:
             self._run_failed(f"completed run could not be loaded: {error}")
             return None
 
-    def _load_completed_run(self, run_dir: Path) -> Path:
+    def _load_completed_run(
+        self,
+        run_dir: Path,
+        *,
+        expected_live_status: str | None = None,
+        expose_results: bool = True,
+    ) -> Path:
         path = Path(run_dir).resolve()
         view = self.resultsWidget.load_run(path)
+        if expected_live_status is not None and view.status != expected_live_status:
+            raise _RunTerminalContractMismatch(
+                "run terminal contract mismatch: worker phase "
+                f"'{expected_live_status}' does not match canonical artifact status "
+                f"'{view.status}'"
+            )
         self._run_state = _run_state_for_terminal_status(view.status)
-        self.resultsWidget.setVisible(True)
+        self.resultsWidget.setVisible(expose_results)
         self._update_control_state()
         self.statusBar().showMessage(f"Loaded completed run: {path}")
         return path
