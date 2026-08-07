@@ -273,7 +273,8 @@ def run_checkpoint(
                                     except StopIteration:
                                         break
                                     decode_end_ns = perf_counter_ns()
-                                    stage_values["decode"].append(
+                                    frame_stage_values = _empty_stage_values()
+                                    frame_stage_values["decode"].append(
                                         _milliseconds(decode_start_ns, decode_end_ns)
                                     )
 
@@ -288,20 +289,27 @@ def run_checkpoint(
 
                                     frame_id = f"frame-{frame.frame_index:06d}"
                                     frame_detections: list[Detection] = []
-                                    serialization_ns = 0
+                                    inference_records: list[dict[str, object]] = []
+                                    detection_batches: list[
+                                        tuple[str, str, str, tuple[Detection, ...]]
+                                    ] = []
+                                    frame_full_frame_latencies: list[float] = []
+                                    frame_crop_latencies: list[float] = []
                                     execution_regions = (full_region, *config.regions)
 
                                     for region_index, region in enumerate(execution_regions):
                                         region_pipeline_start_ns = perf_counter_ns()
+                                        crop_ms = 0.0
                                         if region_index == 0:
                                             image = frame.image
                                         else:
                                             crop_start_ns = perf_counter_ns()
                                             image = crop_region(frame.image, region)
                                             crop_end_ns = perf_counter_ns()
-                                            stage_values["crop"].append(
-                                                _milliseconds(crop_start_ns, crop_end_ns)
+                                            crop_ms = _milliseconds(
+                                                crop_start_ns, crop_end_ns
                                             )
+                                            frame_stage_values["crop"].append(crop_ms)
 
                                         prediction = detector.predict((image,))
                                         if len(prediction.detections) != 1:
@@ -309,7 +317,7 @@ def run_checkpoint(
                                                 "detector prediction cardinality mismatch: "
                                                 f"expected 1, got {len(prediction.detections)}"
                                             )
-                                        stage_values["detector"].append(
+                                        frame_stage_values["detector"].append(
                                             prediction.timing.total_ms
                                         )
 
@@ -324,7 +332,7 @@ def run_checkpoint(
                                             for detection in prediction.detections[0]
                                         )
                                         mapping_end_ns = perf_counter_ns()
-                                        stage_values["coordinate_mapping"].append(
+                                        frame_stage_values["coordinate_mapping"].append(
                                             _milliseconds(mapping_start_ns, mapping_end_ns)
                                         )
                                         region_latency = _milliseconds(
@@ -332,15 +340,14 @@ def run_checkpoint(
                                             mapping_end_ns,
                                         )
                                         if region_index == 0:
-                                            full_frame_latencies.append(region_latency)
+                                            frame_full_frame_latencies.append(region_latency)
                                         else:
-                                            crop_latencies.append(region_latency)
+                                            frame_crop_latencies.append(region_latency)
 
                                         inference_id = (
                                             f"inference-{frame.frame_index:06d}-{region_index:03d}"
                                         )
-                                        serialize_start_ns = perf_counter_ns()
-                                        outputs.write_inference(
+                                        inference_records.append(
                                             {
                                                 "frame_id": frame_id,
                                                 "frame_index": frame.frame_index,
@@ -355,11 +362,7 @@ def run_checkpoint(
                                                     decode_start_ns,
                                                     decode_end_ns,
                                                 ),
-                                                "crop_ms": (
-                                                    0.0
-                                                    if region_index == 0
-                                                    else stage_values["crop"][-1]
-                                                ),
+                                                "crop_ms": crop_ms,
                                                 "coordinate_mapping_ms": _milliseconds(
                                                     mapping_start_ns,
                                                     mapping_end_ns,
@@ -368,53 +371,57 @@ def run_checkpoint(
                                                 "detector_timing": prediction.timing.to_dict(),
                                             }
                                         )
-                                        outputs.write_detections(
-                                            frame_id=frame_id,
-                                            inference_id=inference_id,
-                                            region_id=region.region_id,
-                                            detections=mapped,
+                                        detection_batches.append(
+                                            (
+                                                frame_id,
+                                                inference_id,
+                                                region.region_id,
+                                                mapped,
+                                            )
                                         )
-                                        serialization_ns += (
-                                            perf_counter_ns() - serialize_start_ns
-                                        )
-                                        inference_count += 1
                                         frame_detections.extend(mapped)
 
+                                    annotation = None
                                     if (
                                         config.annotate_every > 0
                                         and frame.frame_index % config.annotate_every == 0
                                     ):
-                                        annotation_start_ns = perf_counter_ns()
-                                        outputs.annotate(
+                                        annotation = (
                                             frame.frame_index,
                                             frame.image,
-                                            regions=execution_regions,
-                                            detections=frame_detections,
+                                            execution_regions,
+                                            tuple(frame_detections),
                                         )
-                                        annotation_end_ns = perf_counter_ns()
-                                        stage_values["annotation"].append(
-                                            _milliseconds(
-                                                annotation_start_ns,
-                                                annotation_end_ns,
-                                            )
-                                        )
-                                        annotated_frame_count += 1
 
-                                    flush_start_ns = perf_counter_ns()
-                                    outputs.flush_frame()
-                                    serialization_ns += perf_counter_ns() - flush_start_ns
-                                    stage_values["serialization"].append(
-                                        serialization_ns / 1_000_000.0
+                                    annotation_ms, serialization_ms = outputs.commit_frame(
+                                        inferences=inference_records,
+                                        detection_batches=detection_batches,
+                                        annotation=annotation,
                                     )
+                                    frame_stage_values["serialization"].append(
+                                        serialization_ms
+                                    )
+                                    if annotation_ms is not None:
+                                        frame_stage_values["annotation"].append(annotation_ms)
                                     frame_pipeline_end_ns = perf_counter_ns()
                                     complete_frame_latency = _milliseconds(
                                         frame_pipeline_start_ns,
                                         frame_pipeline_end_ns,
                                     )
-                                    stage_values["frame_pipeline"].append(
+                                    frame_stage_values["frame_pipeline"].append(
                                         complete_frame_latency
                                     )
+
+                                    for stage_name, values in frame_stage_values.items():
+                                        stage_values[stage_name].extend(values)
+                                    full_frame_latencies.extend(
+                                        frame_full_frame_latencies
+                                    )
+                                    crop_latencies.extend(frame_crop_latencies)
                                     complete_frame_latencies.append(complete_frame_latency)
+                                    inference_count += len(inference_records)
+                                    if annotation is not None:
+                                        annotated_frame_count += 1
                                     frames_processed += 1
                                     emit("running")
                                     if (
@@ -436,6 +443,10 @@ def run_checkpoint(
                         for sample in monitor.samples:
                             outputs.write_hardware(sample.to_dict())
                         hardware_peaks = monitor.peaks()
+                    try:
+                        peak_device_memory_bytes = detector.peak_device_memory_bytes()
+                    except Exception:  # noqa: BLE001 - optional detector telemetry
+                        peak_device_memory_bytes = None
                     summary = _summary(
                         status=status,
                         failure=failure,
@@ -447,7 +458,7 @@ def run_checkpoint(
                         complete_frame_latencies=complete_frame_latencies,
                         stage_values=stage_values,
                         hardware_peaks=hardware_peaks,
-                        peak_device_memory_bytes=detector.peak_device_memory_bytes(),
+                        peak_device_memory_bytes=peak_device_memory_bytes,
                     )
                     outputs.write_summary(summary)
         finally:

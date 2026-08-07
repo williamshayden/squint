@@ -1,8 +1,11 @@
 import json
 import math
 from pathlib import Path
+from threading import Barrier, Thread
 
 import numpy as np
+import pytest
+from PIL import Image
 
 from edge_perception.contracts import Box, Detection, Region
 from edge_perception.outputs import RunOutputs, summarize_latencies
@@ -11,6 +14,97 @@ from edge_perception.telemetry import TelemetrySample
 
 def _records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("precreate_directory", [False, True], ids=["absent", "empty"])
+def test_run_outputs_owner_excludes_a_second_owner_without_damaging_the_first(
+    tmp_path: Path,
+    precreate_directory: bool,
+) -> None:
+    run_dir = tmp_path / "run"
+    if precreate_directory:
+        run_dir.mkdir()
+
+    with RunOutputs(run_dir, run_id="winner", manifest={"owner": "winner"}) as winner:
+        loser: RunOutputs | None = None
+        try:
+            with pytest.raises(ValueError, match="output directory is already owned"):
+                loser = RunOutputs(run_dir, run_id="loser", manifest={"owner": "loser"})
+        finally:
+            if loser is not None:
+                loser.close()
+
+        winner.write_inference({"frame_id": "winner-frame"})
+        winner.flush_frame()
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["run_id"] == "winner"
+        assert _records(run_dir / "inferences.jsonl")[0]["frame_id"] == "winner-frame"
+
+
+def test_run_outputs_owner_race_has_one_winner_and_never_truncates_it(tmp_path: Path) -> None:
+    run_dir = tmp_path / "race"
+    start = Barrier(2)
+    winners: list[RunOutputs] = []
+    failures: list[BaseException] = []
+
+    def claim(run_id: str) -> None:
+        start.wait()
+        try:
+            outputs = RunOutputs(run_dir, run_id=run_id, manifest={"owner": run_id})
+        except (OSError, ValueError) as error:
+            failures.append(error)
+        else:
+            winners.append(outputs)
+
+    threads = [Thread(target=claim, args=(run_id,)) for run_id in ("run-a", "run-b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    try:
+        assert len(winners) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], ValueError)
+        assert "output directory is already owned" in str(failures[0])
+
+        winner = winners[0]
+        winner.write_inference({"frame_id": "winner-frame"})
+        winner.flush_frame()
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["run_id"] == winner.run_id
+        assert [row["frame_id"] for row in _records(run_dir / "inferences.jsonl")] == [
+            "winner-frame"
+        ]
+    finally:
+        for winner in winners:
+            winner.close()
+
+
+def test_annotation_failure_leaves_no_canonical_or_temporary_png(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+
+    def fail_after_writing(
+        _image: Image.Image,
+        path: str | Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        Path(path).write_bytes(b"partial png")
+        raise RuntimeError("png encoding failed")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_writing)
+    with RunOutputs(run_dir, run_id="run-001", manifest={}) as outputs:
+        with pytest.raises(RuntimeError, match="png encoding failed"):
+            outputs.annotate(0, frame, regions=(), detections=())
+
+        assert list((run_dir / "annotated").iterdir()) == []
 
 
 def test_run_outputs_write_linked_json_records_and_annotated_frame(tmp_path: Path) -> None:

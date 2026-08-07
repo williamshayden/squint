@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from conftest import FakeDetector
 
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region
+from edge_perception.outputs import RunOutputs
 from edge_perception.progress import ProgressEvent
 from edge_perception.runner import RunConfig, run_checkpoint
 
@@ -167,6 +170,120 @@ def test_run_checkpoint_finalizes_outputs_and_telemetry_when_detector_fails(
     for stream_name in ("inferences.jsonl", "detections.jsonl", "hardware.jsonl"):
         with (run_dir / stream_name).open("a", encoding="utf-8") as stream:
             stream.write("")
+
+
+def test_partial_frame_failure_publishes_no_rows_counts_or_annotation(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    run_dir = tmp_path / "partial-frame"
+    successful_predict = fake_detector.predict
+    predict_count = 0
+
+    def fail_first_crop(images: tuple[object, ...]) -> object:
+        nonlocal predict_count
+        predict_count += 1
+        if predict_count == 2:
+            raise RuntimeError("crop inference failed")
+        return successful_predict(images)  # type: ignore[arg-type]
+
+    fake_detector.predict = fail_first_crop  # type: ignore[method-assign]
+    config = RunConfig(
+        input_path=video_path,
+        output_dir=run_dir,
+        regions=(Region("right", 100, 20, 80, 60),),
+        threshold=0.3,
+        max_frames=1,
+        warmup_runs=0,
+        annotate_every=1,
+    )
+
+    with pytest.raises(RuntimeError, match="crop inference failed"):
+        run_checkpoint(config, fake_detector)
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert summary["error"] == "RuntimeError: crop inference failed"
+    assert summary["frames_processed"] == 0
+    assert summary["inference_count"] == 0
+    assert summary["annotated_frame_count"] == 0
+    assert _json_lines(run_dir / "inferences.jsonl") == []
+    assert _json_lines(run_dir / "detections.jsonl") == []
+    assert list((run_dir / "annotated").glob("*.png")) == []
+
+
+def test_primary_inference_error_survives_secondary_peak_memory_error(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+) -> None:
+    run_dir = tmp_path / "primary-error"
+
+    def fail_predict(_images: tuple[object, ...]) -> object:
+        raise RuntimeError("primary inference failure")
+
+    def fail_peak_memory() -> int | None:
+        raise RuntimeError("secondary peak failure")
+
+    fake_detector.predict = fail_predict  # type: ignore[method-assign]
+    fake_detector.peak_device_memory_bytes = fail_peak_memory  # type: ignore[method-assign]
+    config = RunConfig(video_path, run_dir, (), 0.3, 1, 0, 0)
+
+    with pytest.raises(RuntimeError, match="primary inference failure"):
+        run_checkpoint(config, fake_detector)
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert summary["error"] == "RuntimeError: primary inference failure"
+    assert summary["detector_peak_device_memory_bytes"] is None
+
+
+def test_summary_publication_waits_for_closed_complete_jsonl_streams(
+    video_path: Path,
+    tmp_path: Path,
+    fake_detector: FakeDetector,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "durable-summary"
+    hardware_records: list[dict[str, object]] = []
+    active_outputs: RunOutputs | None = None
+    summary_published = False
+    original_write_hardware = RunOutputs.write_hardware
+    original_write_summary = RunOutputs.write_summary
+    original_replace = os.replace
+
+    def record_hardware(self: RunOutputs, record: Mapping[str, object]) -> None:
+        hardware_records.append(dict(record))
+        original_write_hardware(self, record)
+
+    def capture_outputs(self: RunOutputs, summary: Mapping[str, object]) -> None:
+        nonlocal active_outputs
+        active_outputs = self
+        original_write_summary(self, summary)
+
+    def inspect_summary_replace(source: object, destination: object) -> None:
+        nonlocal summary_published
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        if destination_path.name == "summary.json":
+            assert active_outputs is not None
+            assert not destination_path.exists()
+            assert all(stream.closed for stream in active_outputs._streams.values())
+            persisted_hardware = _json_lines(run_dir / "hardware.jsonl")
+            assert hardware_records
+            assert len(persisted_hardware) == len(hardware_records)
+            for persisted, expected in zip(persisted_hardware, hardware_records, strict=True):
+                assert all(persisted[key] == value for key, value in expected.items())
+            summary_published = True
+        original_replace(source, destination)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RunOutputs, "write_hardware", record_hardware)
+    monkeypatch.setattr(RunOutputs, "write_summary", capture_outputs)
+    monkeypatch.setattr("edge_perception.outputs.os.replace", inspect_summary_replace)
+
+    run_checkpoint(RunConfig(video_path, run_dir, (), 0.3, 1, 0, 0), fake_detector)
+
+    assert summary_published
 
 
 def test_run_checkpoint_finalizes_failed_artifacts_when_warmup_fails(

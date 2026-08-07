@@ -32,6 +32,11 @@ def test_region_requires_positive_integer_extent() -> None:
         Region("bad", 0, 0, 0, 10)
 
 
+def test_region_id_must_be_a_non_empty_string() -> None:
+    with pytest.raises(ValueError, match="region_id must be a non-empty string"):
+        Region("", 0, 0, 1, 1)
+
+
 def test_batch_prediction_serializes_nested_contracts() -> None:
     prediction = BatchPrediction(
         detections=((Detection(Box(0.0, 1.0, 2.0, 3.0), 1, 0.5),), ()),

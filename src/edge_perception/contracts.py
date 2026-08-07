@@ -55,6 +55,8 @@ class Region:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "region_id", _require_string(self.region_id, "region_id"))
+        if not self.region_id:
+            raise ValueError("region_id must be a non-empty string")
         for field_name, value in (("x", self.x), ("y", self.y), ("width", self.width), ("height", self.height)):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{field_name} must be an integer")

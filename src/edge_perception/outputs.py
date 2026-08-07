@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from math import isfinite
 from pathlib import Path
-from typing import Any, Self
+from time import perf_counter_ns
+from typing import Any, Self, TextIO
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -17,6 +19,7 @@ from PIL import Image, ImageDraw
 from edge_perception.contracts import Detection, Region
 
 SCHEMA_VERSION = "0.1.0"
+_OWNER_FILENAME = ".run-outputs-owner"
 
 
 def _json_dump(record: Mapping[str, Any]) -> str:
@@ -24,12 +27,25 @@ def _json_dump(record: Mapping[str, Any]) -> str:
     return json.dumps(record, allow_nan=False, sort_keys=True)
 
 
-def _atomic_json_write(path: Path, record: Mapping[str, Any]) -> None:
+def _atomic_json_write(
+    path: Path,
+    record: Mapping[str, Any],
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> None:
     """Atomically replace a JSON document after it has serialized successfully."""
     encoded = _json_dump(record)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(encoded + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(encoded + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if before_publish is not None:
+            before_publish()
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _record(run_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -39,6 +55,10 @@ def _record(run_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
 def _region_color(region_id: str) -> tuple[int, int, int]:
     digest = hashlib.sha256(region_id.encode("utf-8")).digest()
     return (64 + digest[0] % 160, 64 + digest[1] % 160, 64 + digest[2] % 160)
+
+
+def _milliseconds(elapsed_ns: int) -> float:
+    return elapsed_ns / 1_000_000.0
 
 
 def summarize_latencies(records: Iterable[float | int]) -> dict[str, int | float | None]:
@@ -64,15 +84,54 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
             raise ValueError("run_id must be a non-empty string")
         self.run_dir = Path(run_dir)
         self.run_id = run_id
+        self._streams: dict[str, TextIO] = {}
+        self._owner_path = self.run_dir / _OWNER_FILENAME
+        run_dir_existed = self.run_dir.exists()
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self._annotated_dir = self.run_dir / "annotated"
-        self._annotated_dir.mkdir(exist_ok=True)
-        _atomic_json_write(self.run_dir / "manifest.json", _record(run_id, manifest))
-        self._streams = {
-            "inferences": (self.run_dir / "inferences.jsonl").open("w", encoding="utf-8", newline="\n"),
-            "detections": (self.run_dir / "detections.jsonl").open("w", encoding="utf-8", newline="\n"),
-            "hardware": (self.run_dir / "hardware.jsonl").open("w", encoding="utf-8", newline="\n"),
-        }
+        try:
+            with self._owner_path.open("x", encoding="utf-8", newline="\n") as owner:
+                owner.write(f"{run_id}\n")
+        except FileExistsError as error:
+            raise ValueError(f"output directory is already owned: {self.run_dir}") from error
+
+        created_paths = [self._owner_path]
+        try:
+            if set(self.run_dir.iterdir()) != {self._owner_path}:
+                raise ValueError(f"output directory must be empty: {self.run_dir}")
+
+            self._annotated_dir = self.run_dir / "annotated"
+            self._annotated_dir.mkdir()
+            created_paths.append(self._annotated_dir)
+
+            manifest_path = self.run_dir / "manifest.json"
+            _atomic_json_write(manifest_path, _record(run_id, manifest))
+            created_paths.append(manifest_path)
+
+            for stream_name in ("inferences", "detections", "hardware"):
+                stream_path = self.run_dir / f"{stream_name}.jsonl"
+                self._streams[stream_name] = stream_path.open(
+                    "x", encoding="utf-8", newline="\n"
+                )
+                created_paths.append(stream_path)
+        except BaseException as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:  # noqa: BLE001 - preserve setup error
+                error.add_note(f"failed to close a created JSONL stream: {cleanup_error}")
+            for path in reversed(created_paths):
+                try:
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    error.add_note(f"failed to remove created path {path}: {cleanup_error}")
+            if not run_dir_existed:
+                try:
+                    self.run_dir.rmdir()
+                except OSError:
+                    pass
+            raise
 
     def __enter__(self) -> Self:
         return self
@@ -92,6 +151,32 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
             raise RuntimeError("run output streams are closed")
         stream.write(_json_dump(_record(self.run_id, payload)) + "\n")
 
+    def _serialized_record(self, payload: Mapping[str, Any]) -> str:
+        return _json_dump(_record(self.run_id, payload)) + "\n"
+
+    @staticmethod
+    def _detection_records(
+        *,
+        frame_id: str,
+        inference_id: str,
+        region_id: str,
+        detections: Iterable[Detection],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for detection_index, detection in enumerate(detections):
+            if not isinstance(detection, Detection):
+                raise TypeError("detections must contain Detection values")
+            records.append(
+                {
+                    "frame_id": frame_id,
+                    "inference_id": inference_id,
+                    "region_id": region_id,
+                    "detection_index": detection_index,
+                    **detection.to_dict(),
+                }
+            )
+        return records
+
     def write_inference(self, record: Mapping[str, Any]) -> None:
         """Append one inference record, retaining caller-provided join identifiers."""
         self._append("inferences", record)
@@ -105,19 +190,14 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
         detections: Iterable[Detection],
     ) -> None:
         """Append flattened, source-space detection records for one inference."""
-        for detection_index, detection in enumerate(detections):
-            if not isinstance(detection, Detection):
-                raise TypeError("detections must contain Detection values")
-            self._append(
-                "detections",
-                {
-                    "frame_id": frame_id,
-                    "inference_id": inference_id,
-                    "region_id": region_id,
-                    "detection_index": detection_index,
-                    **detection.to_dict(),
-                },
-            )
+        records = self._detection_records(
+            frame_id=frame_id,
+            inference_id=inference_id,
+            region_id=region_id,
+            detections=detections,
+        )
+        for record in records:
+            self._append("detections", record)
 
     def write_hardware(self, record: Mapping[str, Any]) -> None:
         """Append one hardware telemetry record."""
@@ -128,9 +208,95 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
         for stream in self._streams.values():
             stream.flush()
 
+    def commit_frame(
+        self,
+        *,
+        inferences: Iterable[Mapping[str, Any]],
+        detection_batches: Iterable[tuple[str, str, str, Iterable[Detection]]],
+        annotation: tuple[int, np.ndarray, Iterable[Region], Iterable[Detection]] | None,
+    ) -> tuple[float | None, float]:
+        """Publish one complete frame, rolling back every stream on failure."""
+        serialization_started_ns = perf_counter_ns()
+        serialized_inferences = [self._serialized_record(record) for record in inferences]
+        serialized_detections = [
+            self._serialized_record(record)
+            for frame_id, inference_id, region_id, detections in detection_batches
+            for record in self._detection_records(
+                frame_id=frame_id,
+                inference_id=inference_id,
+                region_id=region_id,
+                detections=detections,
+            )
+        ]
+        serialization_ns = perf_counter_ns() - serialization_started_ns
+
+        prepared_annotation: tuple[Path, Path] | None = None
+        annotation_ns: int | None = None
+        if annotation is not None:
+            annotation_started_ns = perf_counter_ns()
+            prepared_annotation = self._prepare_annotation(*annotation)
+            annotation_ns = perf_counter_ns() - annotation_started_ns
+
+        positions: dict[str, int] = {}
+        annotation_published = False
+        try:
+            for stream_name, stream in self._streams.items():
+                if stream.closed:
+                    raise RuntimeError("run output streams are closed")
+                positions[stream_name] = stream.tell()
+
+            publication_started_ns = perf_counter_ns()
+            self._streams["inferences"].writelines(serialized_inferences)
+            self._streams["detections"].writelines(serialized_detections)
+            self.flush_frame()
+            serialization_ns += perf_counter_ns() - publication_started_ns
+
+            if prepared_annotation is not None:
+                temporary, canonical = prepared_annotation
+                annotation_publish_started_ns = perf_counter_ns()
+                os.replace(temporary, canonical)
+                annotation_ns = (annotation_ns or 0) + (
+                    perf_counter_ns() - annotation_publish_started_ns
+                )
+                annotation_published = True
+        except BaseException as error:
+            for stream_name, position in positions.items():
+                stream = self._streams[stream_name]
+                try:
+                    stream.seek(position)
+                    stream.truncate()
+                    stream.flush()
+                except Exception as rollback_error:  # noqa: BLE001 - preserve primary error
+                    error.add_note(
+                        f"failed to restore {stream_name}.jsonl: {rollback_error}"
+                    )
+            if annotation_published and prepared_annotation is not None:
+                prepared_annotation[1].unlink(missing_ok=True)
+            raise
+        finally:
+            if prepared_annotation is not None:
+                prepared_annotation[0].unlink(missing_ok=True)
+
+        return (
+            None if annotation_ns is None else _milliseconds(annotation_ns),
+            _milliseconds(serialization_ns),
+        )
+
     def write_summary(self, summary: Mapping[str, Any]) -> None:
-        """Atomically publish the current run summary."""
-        _atomic_json_write(self.run_dir / "summary.json", _record(self.run_id, summary))
+        """Close durable streams and atomically publish the terminal summary."""
+        _atomic_json_write(
+            self.run_dir / "summary.json",
+            _record(self.run_id, summary),
+            before_publish=self._prepare_terminal_publish,
+        )
+
+    def _prepare_terminal_publish(self) -> None:
+        for stream in self._streams.values():
+            if not stream.closed:
+                stream.flush()
+                os.fsync(stream.fileno())
+        self.close()
+        self._owner_path.unlink()
 
     def annotate(
         self,
@@ -141,6 +307,25 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
         detections: Iterable[Detection],
     ) -> Path:
         """Render regions and mapped detections to a lossless diagnostic PNG."""
+        temporary, path = self._prepare_annotation(
+            frame_index,
+            frame,
+            regions,
+            detections,
+        )
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
+
+    def _prepare_annotation(
+        self,
+        frame_index: int,
+        frame: np.ndarray,
+        regions: Iterable[Region],
+        detections: Iterable[Detection],
+    ) -> tuple[Path, Path]:
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise ValueError("frame must be an RGB uint8 array")
         image = Image.fromarray(frame, mode="RGB").copy()
@@ -159,5 +344,10 @@ class RunOutputs(AbstractContextManager["RunOutputs"]):
             label = detection.label if detection.label is not None else str(detection.class_id)
             drawing.text((box.x1, max(0.0, box.y1 - 12.0)), f"{label} {detection.score:.3f}", fill=(255, 255, 255))
         path = self._annotated_dir / f"{frame_index:06d}.png"
-        image.save(path, format="PNG")
-        return path
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            image.save(temporary, format="PNG")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return temporary, path
