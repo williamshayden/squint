@@ -8,7 +8,7 @@
 
 ## 1. Outcome
 
-The product is a CLI-first research tool with an optional native GUI. A researcher can enumerate cameras, capture a source, configure a run, execute it, inspect its results, and compare runs without opening a window. The native application presents the same workflow visually:
+The product is a CLI-first research tool with an optional native GUI. A researcher can supply an existing video, materialize a public video, or optionally capture a camera source; then configure a run, execute it, inspect its results, and compare runs without opening a window. The native application presents the same workflow visually:
 
 ```text
 Source
@@ -47,6 +47,8 @@ The vocabulary follows recurring concepts in established ML, CV, and RL tools:
 ## 3. CLI-First Product Contract
 
 The GUI must never be the sole path to a durable operation. Visual preview and drag-to-draw ROIs are conveniences; camera capture, coordinate-based ROIs, run execution, result inspection, and comparison remain headless operations.
+
+The runner consumes a validated local video reference, not a provider page or mutable network stream. A YouTube or similar public video works after it is materialized to a local file by an external downloader. Provider-specific download APIs, credentials, and licensing policy remain outside this checkpoint; keeping that boundary preserves offline execution and reproducible local inputs.
 
 ### 3.1 Command surface
 
@@ -353,13 +355,14 @@ The default automated suite will prove:
 18. existing result fields use the agreed run, metric, provenance, and artifact terminology; and
 19. no browser, server, database, model load, or physical camera is required by the default suite.
 
-The physical Windows acceptance test will verify both CLI and GUI EMEET capture, automatic and explicit capture destinations, equivalent capture provenance, strict reference behavior, and the observed acquisition/source/run states.
+The required end-to-end acceptance uses a local materialized public or synthetic video and does not require a physical camera. When the EMEET is available, an optional Windows hardware pass verifies CLI and GUI capture, automatic and explicit destinations, equivalent capture provenance, strict behavior, and the observed acquisition/source/run states; hardware availability does not gate the checkpoint.
 
 ## 14. Acceptance Criteria
 
 The slice is complete when:
 
 - a researcher can complete camera discovery, timed capture, ROI configuration, detector selection, run execution, result inspection, and run comparison from the CLI without opening the GUI;
+- the complete run/inspect/compare proof works with an existing local video and requires no physical camera;
 - every durable native-GUI operation resolves to the same shared contract and canonical artifacts as its CLI counterpart;
 - installing and using the base run/inspect/compare path does not require the optional native multimedia or GUI dependency;
 - within one event-loop turn after `recordingFinished`, the finalized path and recorded metadata are visible, Source is Ready, Acquisition is Finalized, Start preview is enabled, recording actions are disabled, and run readiness is recomputed;
@@ -373,6 +376,6 @@ The slice is complete when:
 
 ## 15. Scope Guardrail
 
-This design clarifies and exposes the production workflow already present. It does not add a wizard, browser UI, database, experiment tracker, queue, GUI comparison dashboard, detector accuracy evaluation, live inference, tracking, policy training, or reinforcement-learning controls.
+This design clarifies and exposes the production workflow already present. It does not add a provider-specific video downloader, wizard, browser UI, database, experiment tracker, queue, GUI comparison dashboard, detector accuracy evaluation, live inference, tracking, policy training, or reinforcement-learning controls.
 
 Future RL work should introduce a separate, explicit environment contract with observation and action spaces, reset/step behavior, reward, episode boundaries, seeding, policy training, evaluation, and checkpoints. Those terms are intentionally absent from this checkpoint until those objects exist.
