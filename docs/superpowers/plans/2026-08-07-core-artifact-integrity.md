@@ -129,7 +129,7 @@ git commit -m "fix: make run artifacts transactionally complete"
 
 ---
 
-### Task 2: Preflight Before Model Load and Compare Complete Experiments
+### Task 2: Preflight Before Model Load and Enforce Capture Provenance
 
 **Files:**
 - Create: `src/edge_perception/preflight.py`
@@ -137,12 +137,10 @@ git commit -m "fix: make run artifacts transactionally complete"
 - Modify: `src/edge_perception/worker.py`
 - Modify: `src/edge_perception/runner.py`
 - Modify: `src/edge_perception/run_view.py`
-- Modify: `src/edge_perception/compare.py`
 - Modify: `tests/test_cli.py`
 - Modify: `tests/test_worker.py`
 - Modify: `tests/test_runner.py`
 - Modify: `tests/test_inspection.py`
-- Modify: `tests/test_compare.py`
 
 **Interfaces:**
 - Consumes: `RunConfig`, `iter_video`, `validate_output_directory`, source SHA-256, `CaptureResult`, canonical manifest/summary/inference/detection files, and the detector registry loader.
@@ -157,8 +155,6 @@ class RunPreflight:
 
 def preflight_run(config: RunConfig) -> RunPreflight: ...
 ```
-
-`compare_runs` keeps its return keys and tolerances but includes validated manifest, terminal-summary, inference-schedule, and detection mismatches in `mismatch_count`/`first_mismatch`.
 
 - [ ] **Step 1: Write failing detector-free preflight ordering tests**
 
@@ -190,9 +186,41 @@ Create a canonical manifest whose `source_video.sha256` differs from nested capt
 
 Validate source SHA-256 format, resolved source path, and parsed `CaptureResult` path/hash before constructing `RunViewData`. Do not require the original media file to still exist and do not re-hash it during inspection.
 
-- [ ] **Step 6: Write failing comparison coverage tests**
+- [ ] **Step 6: Verify Task 2**
 
-Extend fixtures to include `summary.json` and `inferences.jsonl`. Add literal tests for:
+Run:
+
+```powershell
+./.tools/uv.exe run --offline --frozen --no-sync pytest tests/test_cli.py tests/test_worker.py tests/test_runner.py tests/test_inspection.py tests/test_cli_workflow_acceptance.py -q -p no:cacheprovider
+./.tools/uv.exe run --offline --frozen --no-sync ruff check src tests scripts
+./.tools/uv.exe run --offline --frozen --no-sync mypy src
+```
+
+Expected: focused tests and acceptance pass; Ruff and mypy succeed; detector loaders remain untouched on invalid preflight inputs.
+
+- [ ] **Step 7: Commit**
+
+```powershell
+git add src/edge_perception/preflight.py src/edge_perception/cli.py src/edge_perception/worker.py src/edge_perception/runner.py src/edge_perception/run_view.py tests/test_cli.py tests/test_worker.py tests/test_runner.py tests/test_inspection.py
+git commit -m "fix: preflight runs before model loading"
+```
+
+---
+
+### Task 3: Compare Complete Experiment Coverage
+
+**Files:**
+- Modify: `src/edge_perception/compare.py`
+- Modify: `tests/test_compare.py`
+- Modify: `tests/test_cli_workflow_acceptance.py`
+
+**Interfaces:**
+- Consumes: canonical `manifest.json`, `summary.json`, `inferences.jsonl`, and `detections.jsonl` from Task 1's terminal artifact contract.
+- Produces: the existing `compare_runs(left, right, *, box_atol=0.01, score_atol=1e-4) -> dict[str, object]` report keys, with manifest, terminal-summary, inference-schedule, and detection mismatches all contributing to `mismatch_count` and deterministic `first_mismatch`.
+
+- [ ] **Step 1: Write failing comparison coverage tests**
+
+Extend fixtures to write `summary.json` and `inferences.jsonl`. Add literal tests for:
 
 - same detections but `complete` versus `cancelled` status;
 - same status but different `frames_processed` or `inference_count`;
@@ -203,7 +231,7 @@ Extend fixtures to include `summary.json` and `inferences.jsonl`. Add literal te
 
 The first five must report non-equivalence with deterministic `first_mismatch`; the last must remain equivalent.
 
-- [ ] **Step 7: Verify comparison RED**
+- [ ] **Step 2: Verify comparison RED**
 
 Run:
 
@@ -213,39 +241,43 @@ Run:
 
 Expected: FAIL because comparison currently reads only manifest/detections and omits adapter/weights.
 
-- [ ] **Step 8: Compare terminal coverage and inference schedules**
+- [ ] **Step 3: Compare terminal coverage and inference schedules**
 
 Validate both summaries and inference streams as JSON objects/JSONL with matching schema/run IDs. Compare detector `adapter`, `model_id`, `revision`, and 64-hex `weights_sha256`; source SHA-256, threshold, and ordered ROIs; summary `status`, `frames_processed`, and `inference_count`; and the sorted set of frame-region inference keys `(frame_index, frame_id, region_id, region, input_shape, source_time_ms)`. Include zero-detection inferences because schedule comparison is independent of detection rows.
 
-Continue ignoring run IDs as values, host/hardware, all latency/timing fields, detector device/backend/backend version/dtype, and row order. Preserve box/score tolerances and existing report keys.
+Continue ignoring run IDs as values, host/hardware, all latency/timing fields, detector device/backend/backend version/dtype, and row order. Preserve box/score tolerances and all existing report keys.
 
-- [ ] **Step 9: Verify Task 2 and full branch**
+- [ ] **Step 4: Strengthen acceptance without changing the workflow**
+
+In `tests/test_cli_workflow_acceptance.py`, parse both runs' summary/inference streams and assert the repeated run schedules contain the same nine `(frame_index, region_id)` pairs before invoking the real compare command. Keep the fake detector only at the external loader seam.
+
+- [ ] **Step 5: Verify Task 3 and full branch**
 
 Run:
 
 ```powershell
-./.tools/uv.exe run --offline --frozen --no-sync pytest tests/test_cli.py tests/test_worker.py tests/test_runner.py tests/test_inspection.py tests/test_compare.py tests/test_cli_workflow_acceptance.py -q -p no:cacheprovider
+./.tools/uv.exe run --offline --frozen --no-sync pytest tests/test_compare.py tests/test_cli_workflow_acceptance.py -q -p no:cacheprovider
 QT_QPA_PLATFORM=offscreen ./.tools/uv.exe run --offline --frozen --no-sync pytest -m "not model" -q -p no:cacheprovider
 ./.tools/uv.exe run --offline --frozen --no-sync ruff check src tests scripts
 ./.tools/uv.exe run --offline --frozen --no-sync mypy src
 ./.tools/uv.exe lock --check --offline
 ```
 
-Expected: all model-free tests pass, one model test remains deselected, Ruff/mypy/lock checks succeed, and acceptance still reports equivalent repeated runs.
+Expected: all model-free tests pass, one model test remains deselected, Ruff/mypy/lock succeed, and acceptance reports equivalent repeated runs with complete schedules.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 6: Commit**
 
 ```powershell
-git add src/edge_perception/preflight.py src/edge_perception/cli.py src/edge_perception/worker.py src/edge_perception/runner.py src/edge_perception/run_view.py src/edge_perception/compare.py tests/test_cli.py tests/test_worker.py tests/test_runner.py tests/test_inspection.py tests/test_compare.py
-git commit -m "fix: compare complete preflighted experiments"
+git add src/edge_perception/compare.py tests/test_compare.py tests/test_cli_workflow_acceptance.py
+git commit -m "fix: compare complete experiment coverage"
 ```
 
 ---
 
 ## Plan Self-Review Checklist
 
-- Every whole-branch core finding maps to one task: output race, partial frame, annotation atomicity, final-summary ordering, peak-memory masking, empty region ID (Task 1); model-free preflight, malformed config, capture consistency, detector weights, terminal coverage, and zero-detection inference schedules (Task 2).
+- Every whole-branch core finding maps to one task: output race, partial frame, annotation atomicity, final-summary ordering, peak-memory masking, empty region ID (Task 1); model-free preflight, malformed config, and capture consistency (Task 2); detector weights, terminal coverage, and zero-detection inference schedules (Task 3).
 - No task changes the schema, filenames, detector default, device-neutral comparison intent, or public CLI command shape.
-- Output ownership and scientific comparison are separate reviewable boundaries; Task 2 consumes Task 1's truthful counters and terminal marker.
+- Output ownership, preflight/provenance, and scientific comparison are separate reviewable boundaries; Tasks 2 and 3 consume Task 1's truthful counters and terminal marker.
 - Each production mutation has a real behavioral test that is run RED before implementation.
 - Default gates remain offline and require neither camera nor model runtime.
