@@ -177,6 +177,23 @@ class RegionView(QGraphicsView):
         if self._pixmap_item is None:
             self._source_scene.setSceneRect(QRectF())
 
+    def clear_source(self) -> None:
+        """Remove every source item and overlay from the one source scene."""
+
+        self.cancel_video_preview()
+        self._region_items.clear()
+        self._pixmap_item = None
+        self._video_item = None
+        self._image = None
+        self._reset_draw_state(remove_item=False)
+        previous_signal_state = self._source_scene.blockSignals(True)
+        try:
+            self._source_scene.clear()
+            self._source_scene.setSceneRect(QRectF())
+        finally:
+            self._source_scene.blockSignals(previous_signal_state)
+        self.regionsChanged.emit(())
+
     def add_region(self, region: Region) -> None:
         """Add a named source-pixel rectangle in insertion order."""
 

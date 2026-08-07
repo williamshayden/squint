@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
@@ -51,6 +53,14 @@ from edge_perception.runner import validate_output_directory
 from edge_perception.video import DecodedFrame, first_video_frame
 
 
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    path: Path
+    capture: CaptureResult | None
+    frame: np.ndarray
+    regions: tuple[Region, ...]
+
+
 class MainWindow(QMainWindow):
     """Preview a local video and edit named source-pixel regions."""
 
@@ -70,6 +80,7 @@ class MainWindow(QMainWindow):
         self._source_path: Path | None = None
         self._source_width = 0
         self._source_height = 0
+        self._source_frame: np.ndarray | None = None
         self._capture_result: CaptureResult | None = None
         self._capture_controller = capture_controller
         self._capture_controller_connected = False
@@ -78,10 +89,12 @@ class MainWindow(QMainWindow):
         self._record_start_requested = False
         self._recording_stop_requested = False
         self._acquisition_state = AcquisitionState.IDLE
+        self._acquisition_terminal: AcquisitionState | None = None
         self._run_state = RunState.NOT_STARTED
-        self._preview_source_snapshot: (
-            tuple[Path, CaptureResult | None, tuple[Region, ...]] | None
-        ) = None
+        self._preview_source_snapshot: _SourceSnapshot | None = None
+        self._preview_attempt_pending = False
+        self._preview_start_call_active = False
+        self._preview_cleanup_active = False
         self._updating_region_controls = False
         self._close_decision = close_decision
         self._exit_after_run = False
@@ -226,18 +239,27 @@ class MainWindow(QMainWindow):
         *,
         capture: CaptureResult | None,
     ) -> None:
-        self._source_view.set_rgb_frame(frame.image)
-        height, width = frame.image.shape[:2]
+        self._apply_source_frame(source_path, frame.image, capture=capture)
+
+    def _apply_source_frame(
+        self,
+        source_path: Path,
+        image: np.ndarray,
+        *,
+        capture: CaptureResult | None,
+    ) -> None:
+        owned_frame = np.ascontiguousarray(image).copy()
+        self._source_view.set_rgb_frame(owned_frame)
+        height, width = owned_frame.shape[:2]
         self._source_path = source_path
         self._source_width = int(width)
         self._source_height = int(height)
+        self._source_frame = owned_frame
         self._capture_result = capture
         self._source_path_label.setText(str(source_path))
         self._source_dimensions_label.setText(f"{width} × {height} px")
         if capture is None:
-            self._capture_requested_label.setText("—")
-            self._capture_actual_label.setText("—")
-            self._capture_sha256_label.setText("—")
+            self._clear_capture_metadata()
             self._acquisition_state = AcquisitionState.IDLE
         else:
             self._show_capture_metadata(capture)
@@ -349,13 +371,11 @@ class MainWindow(QMainWindow):
             self._source_mode_combo.blockSignals(True)
             self._source_mode_combo.setCurrentText("Camera")
             self._source_mode_combo.blockSignals(False)
-            self._camera_group.setEnabled(True)
             self.statusBar().showMessage(
                 "Stop or discard the camera recording before replacing the source"
             )
             self._update_control_state()
             return
-        self._camera_group.setEnabled(camera_mode)
         if camera_mode:
             self._connect_capture_controller()
             self._populate_camera_devices()
@@ -446,49 +466,120 @@ class MainWindow(QMainWindow):
         device = self._camera_combo.currentData()
         if request is None or not isinstance(device, CameraDeviceInfo):
             return
-        if self._source_path is None:
+        self._acquisition_terminal = None
+        if self._source_path is None or self._source_frame is None:
             self._preview_source_snapshot = None
         else:
-            self._preview_source_snapshot = (
-                self._source_path,
-                self._capture_result,
-                self._source_view.regions(),
+            self._preview_source_snapshot = _SourceSnapshot(
+                path=self._source_path,
+                capture=self._capture_result,
+                frame=self._source_frame.copy(),
+                regions=self._source_view.regions(),
             )
+        self._preview_attempt_pending = True
+        self._update_control_state()
+        controller_call_attempted = False
         try:
             selected = select_camera_format(device.formats, request)
             video_output = self._source_view.prepare_video_preview(
                 selected.width,
                 selected.height,
             )
-            controller.start_preview(request, video_output)
+            controller_call_attempted = True
+            self._preview_start_call_active = True
+            try:
+                controller.start_preview(request, video_output)
+            finally:
+                self._preview_start_call_active = False
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            self._source_view.cancel_video_preview()
-            self._restore_preview_source()
-            self._camera_error(str(error))
+            self._fail_preview_startup(
+                str(error),
+                stop_controller=controller_call_attempted,
+            )
+            return
+        if self._preview_active:
+            self._preview_attempt_pending = False
+            self._preview_source_snapshot = None
+            self._update_control_state()
 
     def _restore_preview_source(self) -> None:
         snapshot = self._preview_source_snapshot
-        self._preview_source_snapshot = None
         if snapshot is None:
             return
-        source_path, capture, regions = snapshot
-        self._load_video(source_path, capture=capture)
-        for region in regions:
+        self._apply_source_frame(
+            snapshot.path,
+            snapshot.frame,
+            capture=snapshot.capture,
+        )
+        for region in snapshot.regions:
             self._source_view.add_region(region)
 
-    def _camera_preview_started(self, selected: object) -> None:
-        if not isinstance(selected, CameraFormatInfo):
+    def _fail_preview_startup(self, message: str, *, stop_controller: bool) -> None:
+        if self._preview_cleanup_active:
+            return
+        self._preview_cleanup_active = True
+        context: list[str] = []
+        cleanup_succeeded = True
+        try:
             self._source_view.cancel_video_preview()
-            self._restore_preview_source()
-            self._camera_error("camera returned an invalid selected format")
+            if stop_controller:
+                controller = self._capture_controller
+                if controller is not None:
+                    try:
+                        controller.stop_preview()
+                    except Exception as error:  # noqa: BLE001 - preserve primary error
+                        context.append(f"cleanup failed: {error}")
+                        cleanup_succeeded = False
+            if cleanup_succeeded:
+                try:
+                    self._restore_preview_source()
+                except Exception as error:  # noqa: BLE001 - rollback must fail closed
+                    context.append(f"rollback failed: {error}")
+                    try:
+                        self._clear_active_source()
+                    except Exception as cleanup_error:  # noqa: BLE001 - preserve primary error
+                        context.append(f"fail-closed cleanup failed: {cleanup_error}")
+            else:
+                try:
+                    self._clear_active_source()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve primary error
+                    context.append(f"fail-closed cleanup failed: {cleanup_error}")
+        finally:
+            self._preview_source_snapshot = None
+            self._preview_attempt_pending = False
+            self._preview_start_call_active = False
+            self._preview_cleanup_active = False
+        if context:
+            message += "; " + "; ".join(context)
+        self._camera_error(message)
+
+    def _clear_active_source(self) -> None:
+        self._source_view.clear_source()
+        self._source_path = None
+        self._capture_result = None
+        self._source_frame = None
+        self._source_width = 0
+        self._source_height = 0
+        self._source_path_label.setText("—")
+        self._source_dimensions_label.setText("—")
+        self._clear_capture_metadata()
+        self._clear_region_values()
+
+    def _camera_preview_started(self, selected: object) -> None:
+        if not self._preview_attempt_pending or self._acquisition_terminal is not None:
+            self._source_view.cancel_video_preview()
+            return
+        if not isinstance(selected, CameraFormatInfo):
+            self._fail_preview_startup(
+                "camera returned an invalid selected format",
+                stop_controller=True,
+            )
             return
         try:
             self._source_view.commit_video_preview()
-        except RuntimeError as error:
-            self._restore_preview_source()
-            self._camera_error(str(error))
+        except Exception as error:  # noqa: BLE001 - preview commit must roll back
+            self._fail_preview_startup(str(error), stop_controller=True)
             return
-        self._preview_source_snapshot = None
         self._preview_active = True
         self._recording_active = False
         self._record_start_requested = False
@@ -496,15 +587,19 @@ class MainWindow(QMainWindow):
         self._acquisition_state = AcquisitionState.PREVIEWING
         self._source_path = None
         self._capture_result = None
+        self._source_frame = None
         self._source_width = selected.width
         self._source_height = selected.height
         self._source_path_label.setText("—")
         self._source_dimensions_label.setText(f"{selected.width} × {selected.height} px")
-        self._capture_sha256_label.setText("—")
+        self._clear_capture_metadata()
         self._capture_selected_label.setText(
             f"{selected.width} × {selected.height} px · {selected.pixel_format} · "
             f"{selected.min_fps:g}–{selected.max_fps:g} FPS"
         )
+        if not self._preview_start_call_active:
+            self._preview_attempt_pending = False
+            self._preview_source_snapshot = None
         self._update_control_state()
         self.statusBar().showMessage("Camera preview started")
 
@@ -513,12 +608,18 @@ class MainWindow(QMainWindow):
         self._recording_active = False
         self._record_start_requested = False
         self._recording_stop_requested = False
+        if (
+            not self._preview_cleanup_active
+            and self._acquisition_state is AcquisitionState.PREVIEWING
+        ):
+            self._acquisition_state = AcquisitionState.IDLE
         if self._source_path is None:
             self._source_view.end_video_preview()
         self._update_control_state()
 
     def _start_camera_recording(self) -> None:
         controller = self._connect_capture_controller()
+        self._acquisition_terminal = None
         self._record_start_requested = True
         self._update_control_state()
         try:
@@ -528,6 +629,8 @@ class MainWindow(QMainWindow):
             self._camera_error(str(error))
 
     def _camera_recording_started(self) -> None:
+        if self._acquisition_terminal is not None:
+            return
         self._record_start_requested = False
         self._recording_active = True
         self._recording_stop_requested = False
@@ -549,6 +652,12 @@ class MainWindow(QMainWindow):
             self._camera_error(str(error))
 
     def _camera_recording_finished(self, result: object) -> None:
+        if self._acquisition_terminal is not None:
+            return
+        self._preview_active = False
+        self._recording_active = False
+        self._record_start_requested = False
+        self._recording_stop_requested = False
         if not isinstance(result, CaptureResult):
             self._camera_error("camera returned an invalid capture result")
             return
@@ -557,11 +666,17 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             self._camera_error(str(error))
             return
+        self._acquisition_terminal = AcquisitionState.FINALIZED
         self._acquisition_state = AcquisitionState.FINALIZED
         self._update_control_state()
         self.statusBar().showMessage(f"Captured {result.path}")
 
     def _show_capture_metadata(self, result: CaptureResult) -> None:
+        self._capture_selected_label.setText(
+            f"{result.selected_width} × {result.selected_height} px · "
+            f"{result.selected_pixel_format} · "
+            f"{result.selected_min_fps:g}–{result.selected_max_fps:g} FPS"
+        )
         request = result.request
         requested_width = "Auto" if request.requested_width is None else str(request.requested_width)
         requested_height = (
@@ -580,11 +695,27 @@ class MainWindow(QMainWindow):
         )
         self._capture_sha256_label.setText(result.sha256)
 
+    def _clear_capture_metadata(self) -> None:
+        self._capture_selected_label.setText("—")
+        self._capture_requested_label.setText("—")
+        self._capture_actual_label.setText("—")
+        self._capture_sha256_label.setText("—")
+
     def _camera_error(self, message: str) -> None:
+        if self._preview_attempt_pending:
+            self._fail_preview_startup(message, stop_controller=True)
+            return
+        if self._acquisition_terminal is not None:
+            self.statusBar().showMessage(message)
+            return
+        self._preview_active = False
         self._record_start_requested = False
         self._recording_active = False
         self._recording_stop_requested = False
+        self._acquisition_terminal = AcquisitionState.FAILED
         self._acquisition_state = AcquisitionState.FAILED
+        if self._source_path is None:
+            self._source_view.end_video_preview()
         self._update_control_state()
         self.statusBar().showMessage(message)
 
@@ -724,19 +855,20 @@ class MainWindow(QMainWindow):
         has_camera = isinstance(self._camera_combo.currentData(), CameraDeviceInfo)
         selected = self._source_view.selected_region()
         run_readiness = self._run_readiness()
+        source_mutation_enabled = not run_active and not self._preview_attempt_pending
         self._source_status_label.setText(f"Source status: {source_state}")
         self._acquisition_status_label.setText(
             f"Acquisition status: {self._acquisition_state}"
         )
         self._run_readiness_label.setText(f"Run readiness: {run_readiness}")
         self._run_status_label.setText(f"Run status: {self._run_state}")
-        self._open_video_action.setEnabled(not run_active)
+        self._open_video_action.setEnabled(source_mutation_enabled)
         self._browse_source_button.setEnabled(
-            not run_active
+            source_mutation_enabled
             and not camera_mode
             and not self._camera_recording_in_progress()
         )
-        self._source_mode_combo.setEnabled(not run_active)
+        self._source_mode_combo.setEnabled(source_mutation_enabled)
         self._detector_combo.setEnabled(not run_active)
         self._device_combo.setEnabled(not run_active)
         self._threshold_spin.setEnabled(not run_active)
@@ -762,6 +894,7 @@ class MainWindow(QMainWindow):
             not run_active
             and camera_mode
             and has_camera
+            and not self._preview_attempt_pending
             and not self._preview_active
             and not self._record_start_requested
             and not self._recording_active
