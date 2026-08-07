@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
         self._clear_region_values()
         self.statusBar().showMessage("Ready")
         if run_dir is not None:
-            self._load_completed_run(run_dir)
+            self._load_completed_run_or_report(run_dir)
         if self._capture_controller is not None:
             self._connect_capture_controller()
         self._update_control_state()
@@ -750,14 +750,19 @@ class MainWindow(QMainWindow):
         )
 
     def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
-        try:
-            path = self._load_completed_run(run_dir)
-        except (OSError, TypeError, ValueError) as error:
-            self._run_failed(f"completed run could not be loaded: {error}")
+        path = self._load_completed_run_or_report(run_dir)
+        if path is None:
             return
         phase = payload.get("phase")
         self.statusBar().showMessage(f"Run {phase}: {path}")
         self._update_control_state()
+
+    def _load_completed_run_or_report(self, run_dir: Path) -> Path | None:
+        try:
+            return self._load_completed_run(run_dir)
+        except (OSError, TypeError, ValueError) as error:
+            self._run_failed(f"completed run could not be loaded: {error}")
+            return None
 
     def _load_completed_run(self, run_dir: Path) -> Path:
         path = Path(run_dir).resolve()

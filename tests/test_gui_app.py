@@ -315,6 +315,40 @@ def test_gui_run_mode_is_camera_model_and_network_lazy(
     assert calls == {"model": 0, "network": 0}
 
 
+def test_constructor_run_mode_surfaces_invalid_artifacts_and_keeps_controls_usable(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_completed_run(tmp_path / "invalid-completed")
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "9.9.9"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    window = MainWindow(run_dir=run_dir)
+    qtbot.addWidget(window)
+
+    expected = (
+        "completed run could not be loaded: "
+        "manifest.json.schema_version is unsupported: 9.9.9"
+    )
+    output = window.findChild(QLineEdit, "output")
+    source_mode = window.findChild(QComboBox, "source-mode")
+    open_action = window.findChild(QAction, "open-video-action")
+    assert messages == [("Run failed", expected)]
+    assert window.statusBar().currentMessage() == expected
+    assert output is not None and output.isEnabled()
+    assert source_mode is not None and source_mode.isEnabled()
+    assert open_action is not None and open_action.isEnabled()
+
+
 def test_region_view_owns_one_raw_video_item_then_restores_rgb_frame(
     qtbot: QtBot,
 ) -> None:

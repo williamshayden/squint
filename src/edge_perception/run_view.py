@@ -237,7 +237,7 @@ def _regions(
 
 def _annotations(run_dir: Path) -> tuple[Path, ...]:
     annotated = run_dir / "annotated"
-    if annotated.is_symlink() or not annotated.is_dir():
+    if annotated.is_symlink() or annotated.is_junction() or not annotated.is_dir():
         raise ValueError("annotated must be a real directory")
     root = annotated.resolve()
     selected: list[Path] = []

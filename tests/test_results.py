@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -323,6 +324,37 @@ def test_annotation_paths_are_filename_sorted_and_contained(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="annotated/000001.png"):
         load_run_view(run_dir)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction regression")
+def test_load_run_view_rejects_windows_annotation_junction(tmp_path: Path) -> None:
+    external = tmp_path / "external-annotations"
+    external.mkdir()
+    external_png = external / "000000.png"
+    Image.new("RGB", (1, 1)).save(external_png)
+    run_dir = write_completed_run_fixture(tmp_path, annotation_names=())
+    annotated = run_dir / "annotated"
+    annotated.rmdir()
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(annotated), str(external)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert annotated.is_junction()
+    summary_path = run_dir / "summary.json"
+    summary = _read_json(summary_path)
+    summary["annotated_frame_count"] = 1
+    _write_json(summary_path, summary)
+
+    try:
+        with pytest.raises(ValueError, match="annotated must be a real directory"):
+            load_run_view(run_dir)
+    finally:
+        os.rmdir(annotated)
+
+    assert external_png.is_file()
 
 
 def test_results_widget_loads_annotation_without_mutating_run(
