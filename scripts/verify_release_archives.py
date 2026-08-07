@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -31,6 +32,7 @@ WHEEL_METADATA_MEMBERS = frozenset(
 SDIST_PROJECT_MEMBERS = frozenset(
     {"LICENSE", "README.md", "pyproject.toml", "uv.lock", "PKG-INFO"}
 )
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 if __name__ != "__main__":
@@ -50,6 +52,69 @@ if __name__ != "__main__":
 
 class ArchivePolicyError(ValueError):
     """A release archive violates the public release policy."""
+
+
+def _git_head_bytes(*arguments: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git.exe", "-C", str(PROJECT_ROOT), *arguments],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise ArchivePolicyError("cannot read the clean project contract from Git") from error
+    if result.returncode != 0:
+        raise ArchivePolicyError("cannot read the clean project contract from Git")
+    return result.stdout
+
+
+def _clean_project_paths() -> frozenset[str]:
+    output = _git_head_bytes("ls-tree", "-r", "-z", "--name-only", "HEAD")
+    return frozenset(path for path in output.decode("utf-8").split("\0") if path)
+
+
+def _expected_wheel_members(project_paths: frozenset[str]) -> frozenset[str]:
+    package_members = {
+        path.removeprefix("src/")
+        for path in project_paths
+        if _is_python_member(path, "src/edge_perception/")
+    }
+    return frozenset(package_members).union(WHEEL_METADATA_MEMBERS)
+
+
+def _expected_sdist_members(project_paths: frozenset[str]) -> frozenset[str]:
+    source_members = {
+        path
+        for path in project_paths
+        if _is_python_member(path, "src/edge_perception/")
+        or _is_python_member(path, "tests/")
+        or path == "scripts/verify_release_archives.py"
+        or (
+            path.startswith("docs/checkpoints/")
+            and path.endswith(".md")
+            and len(path) > len("docs/checkpoints/")
+        )
+    }
+    return frozenset(source_members).union(SDIST_PROJECT_MEMBERS)
+
+
+def _validate_exact_members(
+    actual_members: set[str], expected_members: frozenset[str], archive_kind: str
+) -> None:
+    unexpected = sorted(actual_members.difference(expected_members))
+    if unexpected:
+        raise ArchivePolicyError(
+            f"{archive_kind} contains unexpected archive member: {unexpected[0]}"
+        )
+    missing = sorted(expected_members.difference(actual_members))
+    if missing:
+        raise ArchivePolicyError(
+            f"{archive_kind} is missing required archive member: {missing[0]}"
+        )
+
+
+def _clean_license_bytes() -> bytes:
+    return _git_head_bytes("show", "HEAD:LICENSE")
 
 
 def _validate_member_name(name: str, archive_kind: str) -> None:
@@ -103,8 +168,6 @@ def _verify_wheel(path: Path) -> str:
         if len(names) != len(set(names)):
             raise ArchivePolicyError("wheel contains duplicate archive members")
 
-        package_python = 0
-        metadata_members = 0
         for info in sorted(infos, key=lambda candidate: candidate.filename):
             name = info.filename
             _validate_member_name(name, "wheel")
@@ -112,27 +175,17 @@ def _verify_wheel(path: Path) -> str:
                 raise ArchivePolicyError(
                     f"wheel contains unexpected archive member: {name}"
                 )
-            if _is_python_member(name, "edge_perception/"):
-                package_python += 1
-            elif name in WHEEL_METADATA_MEMBERS:
-                metadata_members += 1
-            else:
-                raise ArchivePolicyError(
-                    f"wheel contains unexpected archive member: {name}"
-                )
-
-        missing = sorted(WHEEL_METADATA_MEMBERS.difference(names))
-        if missing:
-            raise ArchivePolicyError(f"wheel is missing required archive member: {missing[0]}")
-        if "edge_perception/__init__.py" not in names:
-            raise ArchivePolicyError(
-                "wheel is missing required archive member: edge_perception/__init__.py"
-            )
+        _validate_exact_members(
+            set(names), _expected_wheel_members(_clean_project_paths()), "wheel"
+        )
         _validate_metadata(archive.read(f"{DIST_INFO}/METADATA"), "wheel")
+        if archive.read(f"{DIST_INFO}/licenses/LICENSE") != _clean_license_bytes():
+            raise ArchivePolicyError("wheel LICENSE does not match repository LICENSE")
 
     return (
-        f"wheel inventory: {len(names)} files; {package_python} package Python; "
-        f"{metadata_members} metadata/license"
+        f"wheel inventory: {len(names)} files; "
+        f"{sum(_is_python_member(name, 'edge_perception/') for name in names)} package Python; "
+        f"{len(WHEEL_METADATA_MEMBERS)} metadata/license"
     )
 
 
@@ -161,55 +214,28 @@ def _verify_sdist(path: Path) -> str:
                 )
             relative_members[relative] = member
 
-        package_python = 0
-        test_python = 0
-        release_verifiers = 0
-        checkpoints = 0
-        project_metadata = 0
-        for relative in sorted(relative_members):
-            if relative in SDIST_PROJECT_MEMBERS:
-                project_metadata += 1
-            elif _is_python_member(relative, "src/edge_perception/"):
-                package_python += 1
-            elif _is_python_member(relative, "tests/"):
-                test_python += 1
-            elif relative == "scripts/verify_release_archives.py":
-                release_verifiers += 1
-            elif (
-                relative.startswith("docs/checkpoints/")
-                and relative.endswith(".md")
-                and len(relative) > len("docs/checkpoints/")
-            ):
-                checkpoints += 1
-            else:
-                raise ArchivePolicyError(
-                    f"sdist contains unexpected archive member: {relative}"
-                )
-
-        missing = sorted(SDIST_PROJECT_MEMBERS.difference(relative_members))
-        if missing:
-            raise ArchivePolicyError(f"sdist is missing required archive member: {missing[0]}")
-        required_family_counts = (
-            (package_python, "src/edge_perception package Python"),
-            (test_python, "tests Python"),
-            (release_verifiers, "scripts/verify_release_archives.py"),
-            (checkpoints, "docs/checkpoints Markdown"),
+        _validate_exact_members(
+            set(relative_members), _expected_sdist_members(_clean_project_paths()), "sdist"
         )
-        for count, family in required_family_counts:
-            if count == 0:
-                raise ArchivePolicyError(f"sdist is missing required member family: {family}")
 
         metadata_member = relative_members["PKG-INFO"]
         metadata_file = archive.extractfile(metadata_member)
         if metadata_file is None:
             raise ArchivePolicyError("sdist cannot read required archive member: PKG-INFO")
         _validate_metadata(metadata_file.read(), "sdist")
+        license_file = archive.extractfile(relative_members["LICENSE"])
+        if license_file is None:
+            raise ArchivePolicyError("sdist cannot read required archive member: LICENSE")
+        if license_file.read() != _clean_license_bytes():
+            raise ArchivePolicyError("sdist LICENSE does not match repository LICENSE")
 
     return (
         f"sdist inventory: {len(relative_members)} files; "
-        f"{package_python} package Python; {test_python} test Python; "
-        f"{release_verifiers} release verifier; {checkpoints} checkpoint; "
-        f"{project_metadata} project/metadata"
+        f"{sum(_is_python_member(name, 'src/edge_perception/') for name in relative_members)} "
+        f"package Python; {sum(_is_python_member(name, 'tests/') for name in relative_members)} "
+        f"test Python; 1 release verifier; "
+        f"{sum(name.startswith('docs/checkpoints/') for name in relative_members)} checkpoint; "
+        f"{len(SDIST_PROJECT_MEMBERS)} project/metadata"
     )
 
 
