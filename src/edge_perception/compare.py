@@ -8,7 +8,12 @@ from pathlib import Path
 from re import fullmatch
 from typing import cast
 
+SCHEMA_VERSION = "0.1.0"
+
 type SemanticKey = tuple[str, str, int, int, str | None]
+type RegionKey = tuple[str, int, int, int, int]
+type InputShape = tuple[int, int, int]
+type InferenceKey = tuple[int, str, str, RegionKey, InputShape, float | None]
 
 
 class ComparisonError(ValueError):
@@ -36,7 +41,9 @@ def _json_lines(path: Path) -> list[dict[str, object]]:
             continue
         value: object = json.loads(line)
         if not isinstance(value, dict):
-            raise TypeError(f"detection row {line_number} must be a JSON object: {path}")
+            raise ComparisonError(
+                f"{path.name} row {line_number} must be a JSON object: {path}"
+            )
         records.append(cast(dict[str, object], value))
     return records
 
@@ -68,6 +75,42 @@ def _required_integer(record: dict[str, object], field: str, context: str) -> in
     return value
 
 
+def _artifact_identity(
+    record: dict[str, object],
+    context: str,
+    *,
+    expected_run_id: str | None = None,
+) -> str:
+    schema_version = _required_string(record, "schema_version", context)
+    if schema_version != SCHEMA_VERSION:
+        raise ValueError(f"{context}.schema_version must be {SCHEMA_VERSION}")
+    run_id = _required_string(record, "run_id", context)
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ValueError(f"{context}.run_id must match manifest.json.run_id")
+    return run_id
+
+
+def _region_key(record: dict[str, object], context: str) -> RegionKey:
+    required_fields = {"region_id", "x", "y", "width", "height"}
+    if set(record) != required_fields:
+        raise ValueError(f"{context} must contain exactly {sorted(required_fields)}")
+    region_id = _required_string(record, "region_id", context)
+    x = _required_integer(record, "x", context)
+    y = _required_integer(record, "y", context)
+    width = _required_integer(record, "width", context)
+    height = _required_integer(record, "height", context)
+    if x < 0 or y < 0:
+        raise ValueError(f"{context} origin must not be negative")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{context} width and height must be positive")
+    return (region_id, x, y, width, height)
+
+
+def _region_json(region: RegionKey) -> dict[str, str | int]:
+    region_id, x, y, width, height = region
+    return {"region_id": region_id, "x": x, "y": y, "width": width, "height": height}
+
+
 def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
     if "regions" not in configuration:
         raise ValueError("configuration is missing required field regions")
@@ -76,29 +119,16 @@ def _regions(configuration: dict[str, object]) -> list[dict[str, str | int]]:
         raise ComparisonError("configuration.regions must be a list")
     normalized: list[dict[str, str | int]] = []
     region_ids: set[str] = set()
-    required_fields = {"region_id", "x", "y", "width", "height"}
     for index, item in enumerate(value):
         context = f"configuration.regions[{index}]"
         if not isinstance(item, dict):
             raise ComparisonError(f"{context} must be an object")
-        region = cast(dict[str, object], item)
-        if set(region) != required_fields:
-            raise ValueError(f"{context} must contain exactly {sorted(required_fields)}")
-        region_id = _required_string(region, "region_id", context)
-        x = _required_integer(region, "x", context)
-        y = _required_integer(region, "y", context)
-        width = _required_integer(region, "width", context)
-        height = _required_integer(region, "height", context)
-        if x < 0 or y < 0:
-            raise ValueError(f"{context} origin must not be negative")
-        if width <= 0 or height <= 0:
-            raise ValueError(f"{context} width and height must be positive")
+        region = _region_key(cast(dict[str, object], item), context)
+        region_id = region[0]
         if region_id in region_ids:
             raise ValueError(f"configuration.regions has duplicate region_id {region_id!r}")
         region_ids.add(region_id)
-        normalized.append(
-            {"region_id": region_id, "x": x, "y": y, "width": width, "height": height}
-        )
+        normalized.append(_region_json(region))
     return normalized
 
 
@@ -107,8 +137,12 @@ def _manifest_fields(manifest: dict[str, object]) -> tuple[tuple[str, object], .
     source_video = _mapping(manifest, "source_video")
     detector = _mapping(manifest, "detector")
     schema_version = _required_string(manifest, "schema_version", "manifest")
+    adapter = _required_string(detector, "adapter", "detector")
     model_id = _required_string(detector, "model_id", "detector")
     revision = _required_string(detector, "revision", "detector")
+    weights_sha256 = _required_string(detector, "weights_sha256", "detector")
+    if fullmatch(r"[0-9a-fA-F]{64}", weights_sha256) is None:
+        raise ValueError("detector.weights_sha256 must be 64 hexadecimal characters")
 
     if "threshold" not in configuration:
         raise ValueError("configuration is missing required field threshold")
@@ -129,7 +163,113 @@ def _manifest_fields(manifest: dict[str, object]) -> tuple[tuple[str, object], .
         ("threshold", threshold),
         ("source_video_sha256", source_sha256),
         ("regions", _regions(configuration)),
+        ("adapter", adapter),
+        ("weights_sha256", weights_sha256),
     )
+
+
+def _summary_fields(summary: dict[str, object]) -> tuple[tuple[str, object], ...]:
+    status = _required_string(summary, "status", "summary.json")
+    if status not in {"complete", "failed", "cancelled"}:
+        raise ValueError("summary.json.status must be complete, failed, or cancelled")
+    frames_processed = _required_integer(summary, "frames_processed", "summary.json")
+    inference_count = _required_integer(summary, "inference_count", "summary.json")
+    if frames_processed < 0:
+        raise ValueError("summary.json.frames_processed must not be negative")
+    if inference_count < 0:
+        raise ValueError("summary.json.inference_count must not be negative")
+    return (
+        ("status", status),
+        ("frames_processed", frames_processed),
+        ("inference_count", inference_count),
+    )
+
+
+def _input_shape(record: dict[str, object], context: str) -> InputShape:
+    if "input_shape" not in record:
+        raise ValueError(f"{context} is missing required field input_shape")
+    value = record["input_shape"]
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+    ):
+        raise ComparisonError(f"{context}.input_shape must contain three integers")
+    shape = cast(list[int], value)
+    if any(item <= 0 for item in shape) or shape[2] != 3:
+        raise ValueError(f"{context}.input_shape must contain positive RGB dimensions")
+    return (shape[0], shape[1], shape[2])
+
+
+def _source_time_ms(record: dict[str, object], context: str) -> float | None:
+    if "source_time_ms" not in record:
+        raise ValueError(f"{context} is missing required field source_time_ms")
+    value = record["source_time_ms"]
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ComparisonError(f"{context}.source_time_ms must be a number or null")
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError(f"{context}.source_time_ms must be finite")
+    return normalized
+
+
+def _inference_key(record: dict[str, object], context: str) -> InferenceKey:
+    frame_index = _required_integer(record, "frame_index", context)
+    if frame_index < 0:
+        raise ValueError(f"{context}.frame_index must not be negative")
+    frame_id = _required_string(record, "frame_id", context)
+    region_id = _required_string(record, "region_id", context)
+    if "region" not in record:
+        raise ValueError(f"{context} is missing required field region")
+    raw_region = record["region"]
+    if not isinstance(raw_region, dict):
+        raise ComparisonError(f"{context}.region must be an object")
+    region = _region_key(cast(dict[str, object], raw_region), f"{context}.region")
+    if region_id != region[0]:
+        raise ValueError(f"{context}.region_id must match {context}.region.region_id")
+    return (
+        frame_index,
+        frame_id,
+        region_id,
+        region,
+        _input_shape(record, context),
+        _source_time_ms(record, context),
+    )
+
+
+def _inference_sort_key(
+    key: InferenceKey,
+) -> tuple[int, str, str, RegionKey, InputShape, tuple[int, float]]:
+    source_time = key[5]
+    normalized_time = (0, 0.0) if source_time is None else (1, source_time)
+    return (*key[:5], normalized_time)
+
+
+def _inference_key_json(key: InferenceKey) -> list[object]:
+    return [key[0], key[1], key[2], _region_json(key[3]), list(key[4]), key[5]]
+
+
+def _inference_index(
+    records: list[dict[str, object]],
+    *,
+    run_id: str,
+) -> tuple[dict[InferenceKey, dict[str, object]], dict[str, tuple[str, str]]]:
+    indexed: dict[InferenceKey, dict[str, object]] = {}
+    links: dict[str, tuple[str, str]] = {}
+    for row_number, record in enumerate(records, start=1):
+        context = f"inferences.jsonl row {row_number}"
+        _artifact_identity(record, context, expected_run_id=run_id)
+        inference_id = _required_string(record, "inference_id", context)
+        if inference_id in links:
+            raise ValueError(f"duplicate inference_id: {inference_id!r}")
+        key = _inference_key(record, context)
+        if key in indexed:
+            raise ValueError(f"duplicate inference schedule key: {_inference_key_json(key)}")
+        indexed[key] = record
+        links[inference_id] = (key[1], key[2])
+    return indexed, links
 
 
 def _semantic_key(record: dict[str, object]) -> SemanticKey:
@@ -156,12 +296,28 @@ def _sort_key(key: SemanticKey) -> tuple[str, str, int, int, str]:
     return (*key[:4], "\0" if key[4] is None else key[4])
 
 
-def _indexed(records: list[dict[str, object]]) -> dict[SemanticKey, dict[str, object]]:
+def _indexed(
+    records: list[dict[str, object]],
+    *,
+    run_id: str,
+    inference_links: dict[str, tuple[str, str]],
+) -> dict[SemanticKey, dict[str, object]]:
     indexed: dict[SemanticKey, dict[str, object]] = {}
-    for record in records:
+    for row_number, record in enumerate(records, start=1):
+        context = f"detections.jsonl row {row_number}"
+        _artifact_identity(record, context, expected_run_id=run_id)
+        inference_id = _required_string(record, "inference_id", context)
+        if inference_id not in inference_links:
+            raise ValueError(f"{context}.inference_id must reference inferences.jsonl")
         key = _semantic_key(record)
+        if (key[0], key[1]) != inference_links[inference_id]:
+            raise ValueError(
+                f"{context} frame_id and region_id must match its inferences.jsonl row"
+            )
         if key in indexed:
             raise ValueError(f"duplicate semantic detection key: {key}")
+        _box(record)
+        _score(record)
         indexed[key] = record
     return indexed
 
@@ -213,18 +369,51 @@ def compare_runs(
     ):
         raise ValueError("comparison tolerances must be finite and non-negative")
 
-    left_manifest = _json_object(Path(left) / "manifest.json")
-    right_manifest = _json_object(Path(right) / "manifest.json")
-    left_records = _json_lines(Path(left) / "detections.jsonl")
-    right_records = _json_lines(Path(right) / "detections.jsonl")
-    left_index = _indexed(left_records)
-    right_index = _indexed(right_records)
+    left_path = Path(left)
+    right_path = Path(right)
+    left_manifest = _json_object(left_path / "manifest.json")
+    right_manifest = _json_object(right_path / "manifest.json")
+    left_run_id = _artifact_identity(left_manifest, "manifest.json")
+    right_run_id = _artifact_identity(right_manifest, "manifest.json")
+    left_manifest_fields = _manifest_fields(left_manifest)
+    right_manifest_fields = _manifest_fields(right_manifest)
+
+    left_summary = _json_object(left_path / "summary.json")
+    right_summary = _json_object(right_path / "summary.json")
+    _artifact_identity(left_summary, "summary.json", expected_run_id=left_run_id)
+    _artifact_identity(right_summary, "summary.json", expected_run_id=right_run_id)
+    left_summary_fields = _summary_fields(left_summary)
+    right_summary_fields = _summary_fields(right_summary)
+
+    left_inference_records = _json_lines(left_path / "inferences.jsonl")
+    right_inference_records = _json_lines(right_path / "inferences.jsonl")
+    left_inference_index, left_inference_links = _inference_index(
+        left_inference_records,
+        run_id=left_run_id,
+    )
+    right_inference_index, right_inference_links = _inference_index(
+        right_inference_records,
+        run_id=right_run_id,
+    )
+
+    left_records = _json_lines(left_path / "detections.jsonl")
+    right_records = _json_lines(right_path / "detections.jsonl")
+    left_index = _indexed(
+        left_records,
+        run_id=left_run_id,
+        inference_links=left_inference_links,
+    )
+    right_index = _indexed(
+        right_records,
+        run_id=right_run_id,
+        inference_links=right_inference_links,
+    )
 
     first_mismatch: dict[str, object] | None = None
     mismatch_count = 0
     for (field, left_value), (right_field, right_value) in zip(
-        _manifest_fields(left_manifest),
-        _manifest_fields(right_manifest),
+        left_manifest_fields,
+        right_manifest_fields,
         strict=True,
     ):
         if field != right_field:
@@ -239,23 +428,57 @@ def compare_runs(
                     "right": right_value,
                 }
 
+    for (field, left_value), (right_field, right_value) in zip(
+        left_summary_fields,
+        right_summary_fields,
+        strict=True,
+    ):
+        if field != right_field:
+            raise AssertionError("summary comparison fields are inconsistent")
+        if left_value != right_value:
+            mismatch_count += 1
+            if first_mismatch is None:
+                first_mismatch = {
+                    "kind": "summary",
+                    "field": field,
+                    "left": left_value,
+                    "right": right_value,
+                }
+
+    all_inference_keys = sorted(
+        set(left_inference_index) | set(right_inference_index),
+        key=_inference_sort_key,
+    )
+    for inference_key in all_inference_keys:
+        left_present = inference_key in left_inference_index
+        right_present = inference_key in right_inference_index
+        if not left_present or not right_present:
+            mismatch_count += 1
+            if first_mismatch is None:
+                first_mismatch = {
+                    "kind": "inference_schedule",
+                    "key": _inference_key_json(inference_key),
+                    "left_present": left_present,
+                    "right_present": right_present,
+                }
+
     matched_detection_count = 0
     all_keys = sorted(set(left_index) | set(right_index), key=_sort_key)
-    for key in all_keys:
-        left_present = key in left_index
-        right_present = key in right_index
+    for detection_key in all_keys:
+        left_present = detection_key in left_index
+        right_present = detection_key in right_index
         if not left_present or not right_present:
             mismatch_count += 1
             if first_mismatch is None:
                 first_mismatch = {
                     "kind": "semantic_key",
-                    "key": _key_json(key),
+                    "key": _key_json(detection_key),
                     "left_present": left_present,
                     "right_present": right_present,
                 }
             continue
-        left_record = left_index[key]
-        right_record = right_index[key]
+        left_record = left_index[detection_key]
+        right_record = right_index[detection_key]
         left_box = _box(left_record)
         right_box = _box(right_record)
         differing_coordinates = [
@@ -272,7 +495,7 @@ def compare_runs(
                 if differing_coordinates:
                     first_mismatch = {
                         "kind": "box",
-                        "key": _key_json(key),
+                        "key": _key_json(detection_key),
                         "left": list(left_box),
                         "right": list(right_box),
                         "box_atol": box_atol,
@@ -280,7 +503,7 @@ def compare_runs(
                 else:
                     first_mismatch = {
                         "kind": "score",
-                        "key": _key_json(key),
+                        "key": _key_json(detection_key),
                         "left": left_score,
                         "right": right_score,
                         "score_atol": score_atol,
