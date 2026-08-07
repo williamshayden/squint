@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from edge_perception.config import (
     RunConfig,
     write_run_config,
 )
+from edge_perception.detectors.registry import DetectorDescriptor
 
 
 def _camera_device() -> CameraDeviceInfo:
@@ -372,7 +374,7 @@ def test_run_command_parses_declared_crops_and_passes_threshold_once(
     load_calls = _install_fake_detector(monkeypatch, fake_detector)
     runner_calls: list[tuple[object, object]] = []
 
-    def fake_run(config: object, detector: object) -> dict[str, object]:
+    def fake_run(config: object, detector: object, **_kwargs: object) -> dict[str, object]:
         runner_calls.append((config, detector))
         return {"status": "complete", "frames_processed": 60, "inference_count": 180}
 
@@ -390,6 +392,8 @@ def test_run_command_parses_declared_crops_and_passes_threshold_once(
             "lower-left:0,50,100,50",
             "--device",
             "auto",
+            "--detector",
+            "dfine-nano-coco",
             "--threshold",
             "0.3",
             "--warmup-runs",
@@ -412,6 +416,7 @@ def test_run_command_parses_declared_crops_and_passes_threshold_once(
     assert config.max_frames == 60
     assert config.warmup_runs == 2
     assert config.annotate_every == 10
+    assert config.detector_id == "dfine-nano-coco"
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.splitlines() == [
@@ -576,7 +581,7 @@ def test_run_config_loads_selected_detector_once(
     monkeypatch.setattr(
         cli,
         "run_checkpoint",
-        lambda _config, _detector: {
+        lambda _config, _detector, **_kwargs: {
             "status": "complete",
             "frames_processed": 1,
             "inference_count": 1,
@@ -601,7 +606,7 @@ def test_run_accepts_config_without_positional_input(
     monkeypatch.setattr(
         cli,
         "run_checkpoint",
-        lambda loaded, selected: runner_calls.append((loaded, selected))
+        lambda loaded, selected, **_kwargs: runner_calls.append((loaded, selected))
         or {"status": "complete", "frames_processed": 1, "inference_count": 1},
     )
 
@@ -619,7 +624,7 @@ def test_explicit_run_flags_keep_existing_defaults(
     monkeypatch.setattr(
         cli,
         "run_checkpoint",
-        lambda config, _detector: config_calls.append(config)
+        lambda config, _detector, **_kwargs: config_calls.append(config)
         or {"status": "complete", "frames_processed": 1, "inference_count": 1},
     )
 
@@ -643,7 +648,7 @@ def test_output_flag_overrides_config_output_only(
     monkeypatch.setattr(
         cli,
         "run_checkpoint",
-        lambda loaded, _detector: config_calls.append(loaded)
+        lambda loaded, _detector, **_kwargs: config_calls.append(loaded)
         or {"status": "complete", "frames_processed": 1, "inference_count": 1},
     )
 
@@ -664,7 +669,7 @@ def test_present_flags_override_config_and_omitted_flags_do_not(
     monkeypatch.setattr(
         cli,
         "run_checkpoint",
-        lambda loaded, _detector: config_calls.append(loaded)
+        lambda loaded, _detector, **_kwargs: config_calls.append(loaded)
         or {"status": "complete", "frames_processed": 1, "inference_count": 1},
     )
 
@@ -685,6 +690,52 @@ def test_present_flags_override_config_and_omitted_flags_do_not(
         == 0
     )
     assert config_calls == [replace(config, threshold=0.8, device="cpu", max_frames=2)]
+
+
+def test_detector_flag_overrides_config_and_omission_preserves_persisted_id(
+    tmp_path: Path,
+    video_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RunConfig(
+        video_path,
+        tmp_path / "run",
+        (),
+        0.3,
+        1,
+        0,
+        0,
+        detector_id="persisted",
+    )
+    config_path = tmp_path / "experiment.json"
+    write_run_config(config_path, config)
+    monkeypatch.setattr(
+        cli,
+        "detector_descriptors",
+        lambda: (
+            DetectorDescriptor("persisted", "Persisted", "persisted/model", "one"),
+            DetectorDescriptor("override", "Override", "override/model", "one"),
+        ),
+    )
+    loaded_detector_ids: list[str] = []
+    runner_configs: list[RunConfig] = []
+    monkeypatch.setattr(
+        cli,
+        "load_detector",
+        lambda detector_id, **_kwargs: loaded_detector_ids.append(detector_id) or object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_checkpoint",
+        lambda loaded, _detector, **_kwargs: runner_configs.append(loaded)
+        or {"status": "complete", "frames_processed": 1, "inference_count": 1},
+    )
+
+    assert cli.main(["run", "--config", str(config_path)]) == 0
+    assert cli.main(["run", "--config", str(config_path), "--detector", "override"]) == 0
+
+    assert loaded_detector_ids == ["persisted", "override"]
+    assert [config.detector_id for config in runner_configs] == ["persisted", "override"]
 
 
 def test_run_requires_input_or_config(capsys: pytest.CaptureFixture[str]) -> None:
@@ -719,6 +770,87 @@ def test_unknown_detector_id_fails_before_model_import(
     assert cli.main(["run", "--config", str(config_path)]) == 2
     assert capsys.readouterr().err.strip().splitlines() == ["error: unknown detector ID: unknown"]
     assert "edge_perception.detectors.dfine" not in sys.modules
+
+
+def test_unknown_detector_flag_fails_before_model_import(
+    tmp_path: Path,
+    video_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delitem(sys.modules, "edge_perception.detectors.dfine", raising=False)
+
+    assert (
+        cli.main(
+            [
+                "run",
+                str(video_path),
+                "--output",
+                str(tmp_path / "run"),
+                "--detector",
+                "unknown",
+            ]
+        )
+        == 2
+    )
+    assert "invalid choice" in capsys.readouterr().err
+    assert "edge_perception.detectors.dfine" not in sys.modules
+
+
+def test_sigint_requests_cooperative_cancellation_and_restores_handler(
+    tmp_path: Path,
+    video_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "load_detector", lambda *_args, **_kwargs: object())
+
+    def fake_run_checkpoint(
+        _config: RunConfig,
+        _detector: object,
+        *,
+        cancel_requested: object = None,
+    ) -> dict[str, object]:
+        signal.raise_signal(signal.SIGINT)
+        assert callable(cancel_requested)
+        assert cancel_requested()
+        with pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGINT)
+        return {"status": "cancelled", "frames_processed": 0, "inference_count": 0}
+
+    monkeypatch.setattr(cli, "run_checkpoint", fake_run_checkpoint)
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    exit_code = cli.main(["run", str(video_path), "--output", str(tmp_path / "run")])
+
+    assert exit_code == 130
+    assert signal.getsignal(signal.SIGINT) == previous_handler
+
+
+@pytest.mark.parametrize("failure_point", ["detector", "runner"], ids=["load", "run"])
+def test_sigint_handler_is_restored_when_direct_run_errors(
+    failure_point: str,
+    tmp_path: Path,
+    video_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_detector(*_args: object, **_kwargs: object) -> object:
+        if failure_point == "detector":
+            signal.raise_signal(signal.SIGINT)
+            raise RuntimeError("detector load failed")
+        return object()
+
+    def fail_runner(*_args: object, **_kwargs: object) -> dict[str, object]:
+        if failure_point == "runner":
+            signal.raise_signal(signal.SIGINT)
+            raise RuntimeError("runner failed")
+        return {"status": "complete", "frames_processed": 0, "inference_count": 0}
+
+    monkeypatch.setattr(cli, "load_detector", fail_detector)
+    monkeypatch.setattr(cli, "run_checkpoint", fail_runner)
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    assert cli.main(["run", str(video_path), "--output", str(tmp_path / "run")]) == 2
+    assert signal.getsignal(signal.SIGINT) == previous_handler
 
 
 def test_malformed_config_is_one_line_and_model_free(

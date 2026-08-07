@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from math import isfinite
 from pathlib import Path
+from types import FrameType
 from typing import NoReturn, cast
 
 from edge_perception.compare import compare_runs
@@ -17,7 +20,7 @@ from edge_perception.config import (
     load_run_config,
 )
 from edge_perception.contracts import Region
-from edge_perception.detectors.registry import load_detector
+from edge_perception.detectors.registry import detector_descriptors, load_detector
 from edge_perception.runner import run_checkpoint, validate_output_directory
 
 
@@ -125,6 +128,11 @@ def _build_parser() -> _Parser:
     run.add_argument(
         "--device", choices=("auto", "cpu", "cuda"), default=argparse.SUPPRESS
     )
+    run.add_argument(
+        "--detector",
+        choices=tuple(descriptor.detector_id for descriptor in detector_descriptors()),
+        default=argparse.SUPPRESS,
+    )
     run.add_argument("--threshold", type=_threshold, default=argparse.SUPPRESS)
     run.add_argument(
         "--warmup-runs", type=_nonnegative("warmup-runs"), default=argparse.SUPPRESS
@@ -166,19 +174,31 @@ def _run_command(args: argparse.Namespace) -> int:
     if not config.input_path.is_file():
         raise _CliError(f"input video does not exist: {config.input_path}")
     validate_output_directory(config.output_dir)
-    detector = load_detector(
-        config.detector_id,
-        threshold=config.threshold,
-        device=config.device,
-    )
-    summary = run_checkpoint(config, detector)
+    cancel_event = threading.Event()
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    def request_cancel(signum: int, frame: FrameType | None) -> None:
+        if cancel_event.is_set():
+            signal.default_int_handler(signum, frame)
+        cancel_event.set()
+
+    signal.signal(signal.SIGINT, request_cancel)
+    try:
+        detector = load_detector(
+            config.detector_id,
+            threshold=config.threshold,
+            device=config.device,
+        )
+        summary = run_checkpoint(config, detector, cancel_requested=cancel_event.is_set)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
     print(f"output: {config.output_dir}")
     print(
         f"status={summary.get('status')} "
         f"frames={summary.get('frames_processed')} "
         f"inferences={summary.get('inference_count')}"
     )
-    return 0
+    return 130 if summary.get("status") == "cancelled" else 0
 
 
 def _resolve_run_config(args: argparse.Namespace) -> RunConfig:
@@ -214,6 +234,7 @@ def _explicit_run_config(args: argparse.Namespace, input_path: Path | None) -> R
         max_frames=cast(int | None, getattr(args, "max_frames", None)),
         warmup_runs=cast(int, getattr(args, "warmup_runs", 2)),
         annotate_every=cast(int, getattr(args, "annotate_every", 10)),
+        detector_id=cast(str, getattr(args, "detector", "dfine-nano-coco")),
         device=cast(str, getattr(args, "device", "auto")),
     )
 
@@ -239,7 +260,9 @@ def _apply_config_overrides(config: RunConfig, args: argparse.Namespace) -> RunC
             if hasattr(args, "annotate_every")
             else config.annotate_every
         ),
-        detector_id=config.detector_id,
+        detector_id=(
+            cast(str, args.detector) if hasattr(args, "detector") else config.detector_id
+        ),
         device=cast(str, args.device) if hasattr(args, "device") else config.device,
         capture=config.capture,
     )
