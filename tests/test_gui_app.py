@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsView,
+    QGroupBox,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -103,6 +104,8 @@ class FakeWindowCaptureController(QObject):
         self.preview_active = False
         self.recording_active = False
         self.devices_calls = 0
+        self.defer_preview_started = False
+        self.preview_start_error: Exception | None = None
 
     @property
     def is_recording(self) -> bool:
@@ -119,10 +122,17 @@ class FakeWindowCaptureController(QObject):
     ) -> CameraFormatInfo:
         self.preview_requests.append(request)
         self.video_outputs.append(video_output)
+        if self.preview_start_error is not None:
+            raise self.preview_start_error
         self.preview_active = True
         selected = select_camera_format(self.formats, request)
-        self.previewStarted.emit(selected)
+        if not self.defer_preview_started:
+            self.previewStarted.emit(selected)
         return selected
+
+    def emit_preview_started(self) -> None:
+        request = self.preview_requests[-1]
+        self.previewStarted.emit(select_camera_format(self.formats, request))
 
     def stop_preview(self) -> None:
         self.stop_preview_calls += 1
@@ -228,6 +238,27 @@ def _progress_record(event: ProgressEvent) -> str:
     return json.dumps(event.to_dict(), allow_nan=False, sort_keys=True) + "\n"
 
 
+def _capture_result(request: CaptureRequest, path: Path) -> CaptureResult:
+    return CaptureResult(
+        request=request,
+        selected_width=1280,
+        selected_height=720,
+        selected_min_fps=15.0,
+        selected_max_fps=60.0,
+        selected_pixel_format="NV12",
+        actual_width=64,
+        actual_height=48,
+        actual_fps=29.97,
+        container="mp4",
+        codec="h264",
+        duration_seconds=2.0,
+        has_audio=False,
+        file_size_bytes=7,
+        path=path,
+        sha256="a" * 64,
+    )
+
+
 def _write_completed_run(run_dir: Path) -> Path:
     annotated = run_dir / "annotated"
     annotated.mkdir(parents=True)
@@ -279,6 +310,142 @@ def test_main_window_is_one_native_qmain_window(qtbot: QtBot) -> None:
     assert window.objectName() == "edge-perception-main-window"
     assert window.findChild(QGraphicsView, "source-view") is not None
     assert window.findChild(QPushButton, "run-button") is not None
+
+
+def test_workflow_state_labels_and_source_browse_start_with_explicit_values(
+    qtbot: QtBot,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    source_status = window.findChild(QLabel, "source-status")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    run_readiness = window.findChild(QLabel, "run-readiness-status")
+    run_status = window.findChild(QLabel, "run-status")
+    browse_source = window.findChild(QPushButton, "browse-source-button")
+    capture_sha256 = window.findChild(QLabel, "capture-sha256")
+    assert source_status is not None
+    assert acquisition_status is not None
+    assert run_readiness is not None
+    assert run_status is not None
+    assert browse_source is not None
+    assert capture_sha256 is not None
+
+    assert source_status.text() == "Source status: No source"
+    assert acquisition_status.text() == "Acquisition status: Idle"
+    assert run_readiness.text() == "Run readiness: Not ready: select a source"
+    assert run_status.text() == "Run status: Not started"
+    assert browse_source.text() == "Browse…"
+    assert capture_sha256.text() == "—"
+    assert capture_sha256.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+
+
+def test_workflow_language_uses_the_approved_native_research_terms(qtbot: QtBot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    labels = {label.text() for label in window.findChildren(QLabel)}
+    groups = {group.title() for group in window.findChildren(QGroupBox)}
+    buttons = {button.text() for button in window.findChildren(QPushButton)}
+    checkboxes = {checkbox.text() for checkbox in window.findChildren(QCheckBox)}
+    visible_language = labels | groups | buttons | checkboxes
+    expected = {
+        "Source path",
+        "Frame size",
+        "Camera acquisition",
+        "Device",
+        "Frame rate",
+        "Require specified frame size and rate",
+        "Applied camera format",
+        "Capture request",
+        "Recorded format",
+        "Regions of interest (ROIs)",
+        "Add ROI",
+        "Remove ROI",
+        "Compute device",
+        "Confidence threshold",
+        "Warm-up iterations",
+        "Annotation interval (frames)",
+        "Output directory",
+        "Run configuration",
+        "CLI command",
+        "Start recording",
+        "Stop recording",
+        "Cancel run",
+    }
+
+    assert expected <= visible_language
+    strict = window.findChild(QCheckBox, "capture-strict")
+    assert strict is not None
+    assert strict.toolTip() == (
+        "Reject the capture if any specified width, height, or frame-rate value is not met."
+    )
+
+
+def test_run_readiness_reports_output_then_config_collision_then_ready(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    window = MainWindow()
+    qtbot.addWidget(window)
+    readiness = window.findChild(QLabel, "run-readiness-status")
+    output = window.findChild(QLineEdit, "output")
+    assert readiness is not None
+    assert output is not None
+
+    output.setText(str(tmp_path / "run"))
+    assert readiness.text() == "Run readiness: Not ready: select a source"
+    window.load_video(tmp_path / "source.mp4")
+    output.clear()
+    assert readiness.text() == (
+        "Run readiness: Not ready: choose an empty output directory"
+    )
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    (output_dir / "occupied.json").write_text("{}", encoding="utf-8")
+    config_path = (tmp_path / "run.experiment.json").resolve()
+    config_path.write_text("{}", encoding="utf-8")
+    output.setText(str(output_dir))
+    assert readiness.text() == (
+        "Run readiness: Not ready: choose an empty output directory"
+    )
+
+    (output_dir / "occupied.json").unlink()
+    output.setText(str(tmp_path / "temporary"))
+    output.setText(str(output_dir))
+    assert readiness.text() == (
+        "Run readiness: Not ready: choose an output directory without an existing "
+        "run configuration"
+    )
+
+    config_path.unlink()
+    output.setText(str(tmp_path / "temporary"))
+    output.setText(str(output_dir))
+    assert readiness.text() == "Run readiness: Ready"
+
+
+def test_run_readiness_prioritizes_active_camera_acquisition(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    readiness = window.findChild(QLabel, "run-readiness-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert readiness is not None
+
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert readiness.text() == (
+        "Run readiness: Not ready: finish camera acquisition"
+    )
 
 
 def test_gui_run_mode_is_camera_model_and_network_lazy(
@@ -440,6 +607,275 @@ def test_camera_record_and_stop_transitions_are_explicit(qtbot: QtBot) -> None:
     assert stop.isEnabled() is False
 
 
+def test_source_mode_change_preserves_active_source_frame_and_ordered_rois(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    view = window.findChild(RegionView, "source-view")
+    source_status = window.findChild(QLabel, "source-status")
+    assert source_mode is not None
+    assert view is not None
+    assert source_status is not None
+    source = tmp_path / "source.mp4"
+    window.load_video(source)
+    regions = (Region("left", 1, 2, 10, 11), Region("right", 20, 3, 12, 13))
+    for region in regions:
+        view.add_region(region)
+
+    source_mode.setCurrentText("Camera")
+    source_mode.setCurrentText("Video file")
+
+    assert window.findChild(QLabel, "source-path").text() == str(source)
+    assert source_status.text() == "Source status: Ready"
+    assert view.regions() == regions
+    assert view.scene().sceneRect().size().toSize().width() == 64
+    assert view.scene().sceneRect().size().toSize().height() == 48
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+
+
+def test_failed_file_decode_preserves_camera_source_capture_frame_and_ordered_rois(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    replacement = tmp_path / "replacement.mp4"
+
+    def decode(path: Path) -> DecodedFrame:
+        if path == replacement:
+            raise ValueError("decode failed")
+        return _preview_frame(width=64, height=48)
+
+    monkeypatch.setattr(main_window, "first_video_frame", decode)
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    view = window.findChild(RegionView, "source-view")
+    checksum = window.findChild(QLabel, "capture-sha256")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert view is not None
+    assert checksum is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    capture = _capture_result(controller.preview_requests[-1], tmp_path / "capture.mp4")
+    controller.complete(capture)
+    regions = (Region("first", 1, 2, 10, 11), Region("second", 20, 3, 12, 13))
+    for region in regions:
+        view.add_region(region)
+
+    with pytest.raises(ValueError, match="^decode failed$"):
+        window.load_video(replacement)
+
+    assert source_mode.currentText() == "Camera"
+    assert window.findChild(QLabel, "source-path").text() == str(capture.path.resolve())
+    assert checksum.text() == capture.sha256
+    assert view.regions() == regions
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+    output = window.findChild(QLineEdit, "output")
+    assert output is not None
+    output.setText(str(tmp_path / "run"))
+    assert window.resolved_config().capture == capture
+    monkeypatch.setattr(
+        main_window.QFileDialog,
+        "getOpenFileName",
+        lambda *_args: ("", ""),
+    )
+    open_action = window.findChild(QAction, "open-video-action")
+    assert open_action is not None
+    open_action.trigger()
+    assert window.resolved_config().capture == capture
+    assert view.regions() == regions
+
+
+def test_preview_invalidates_source_only_after_preview_started_signal(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    controller.defer_preview_started = True
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    view = window.findChild(RegionView, "source-view")
+    source_status = window.findChild(QLabel, "source-status")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert view is not None
+    assert source_status is not None
+    assert acquisition_status is not None
+    source = tmp_path / "source.mp4"
+    window.load_video(source)
+    region = Region("roi", 1, 2, 10, 11)
+    view.add_region(region)
+    source_mode.setCurrentText("Camera")
+
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert window.findChild(QLabel, "source-path").text() == str(source)
+    assert source_status.text() == "Source status: Ready"
+    assert view.regions() == (region,)
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+
+    controller.emit_preview_started()
+
+    assert source_status.text() == "Source status: No source"
+    assert acquisition_status.text() == "Acquisition status: Previewing"
+    assert view.regions() == ()
+    assert any(isinstance(item, QGraphicsVideoItem) for item in view.scene().items())
+
+
+def test_preview_startup_failure_restores_prior_camera_source_and_ordered_rois(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    view = window.findChild(RegionView, "source-view")
+    source_status = window.findChild(QLabel, "source-status")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    checksum = window.findChild(QLabel, "capture-sha256")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert view is not None
+    assert source_status is not None
+    assert acquisition_status is not None
+    assert checksum is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    capture = _capture_result(controller.preview_requests[-1], tmp_path / "capture.mp4")
+    controller.complete(capture)
+    regions = (Region("first", 1, 2, 10, 11), Region("second", 20, 3, 12, 13))
+    for region in regions:
+        view.add_region(region)
+    controller.preview_start_error = RuntimeError("preview failed")
+
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    assert window.findChild(QLabel, "source-path").text() == str(capture.path.resolve())
+    assert source_status.text() == "Source status: Ready"
+    assert acquisition_status.text() == "Acquisition status: Failed"
+    assert checksum.text() == capture.sha256
+    assert view.regions() == regions
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+
+
+def test_stop_recording_reports_finalizing_until_capture_finishes(qtbot: QtBot) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    stop = window.findChild(QPushButton, "stop-recording-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    run_readiness = window.findChild(QLabel, "run-readiness-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert stop is not None
+    assert acquisition_status is not None
+    assert run_readiness is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+
+    qtbot.mouseClick(stop, Qt.MouseButton.LeftButton)
+
+    controller.recording_active = False
+    assert acquisition_status.text() == "Acquisition status: Finalizing"
+    assert run_readiness.text() == "Run readiness: Not ready: finish camera acquisition"
+
+
+def test_successful_capture_stays_in_camera_mode_and_exposes_finalized_checksum(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    record = window.findChild(QPushButton, "record-button")
+    source_status = window.findChild(QLabel, "source-status")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    checksum = window.findChild(QLabel, "capture-sha256")
+    assert source_mode is not None
+    assert preview is not None
+    assert record is not None
+    assert source_status is not None
+    assert acquisition_status is not None
+    assert checksum is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(record, Qt.MouseButton.LeftButton)
+    capture = _capture_result(controller.preview_requests[-1], tmp_path / "capture.mp4")
+
+    controller.complete(capture)
+
+    assert source_mode.currentText() == "Camera"
+    assert source_status.text() == "Source status: Ready"
+    assert acquisition_status.text() == "Acquisition status: Finalized"
+    assert checksum.text() == capture.sha256
+    output = window.findChild(QLineEdit, "output")
+    assert output is not None
+    output.setText(str(tmp_path / "run"))
+    source_mode.setCurrentText("Video file")
+    assert window.resolved_config().capture == capture
+    source_mode.setCurrentText("Camera")
+    assert window.resolved_config().capture == capture
+    window.load_video(tmp_path / "ordinary.mp4")
+    assert checksum.text() == "—"
+
+
+def test_capture_failure_reports_failed_without_promoting_an_incomplete_source(
+    qtbot: QtBot,
+) -> None:
+    controller = FakeWindowCaptureController()
+    window = MainWindow(capture_controller=controller)
+    qtbot.addWidget(window)
+    source_mode = window.findChild(QComboBox, "source-mode")
+    preview = window.findChild(QPushButton, "start-preview-button")
+    acquisition_status = window.findChild(QLabel, "acquisition-status")
+    source_status = window.findChild(QLabel, "source-status")
+    assert source_mode is not None
+    assert preview is not None
+    assert acquisition_status is not None
+    assert source_status is not None
+    source_mode.setCurrentText("Camera")
+    qtbot.mouseClick(preview, Qt.MouseButton.LeftButton)
+
+    controller.errorOccurred.emit("capture failed")
+
+    assert acquisition_status.text() == "Acquisition status: Failed"
+    assert source_status.text() == "Source status: No source"
+    assert window.findChild(QLabel, "source-path").text() != "capture failed"
+
+
 def test_loading_file_stops_preview_before_replacing_source(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,
@@ -582,10 +1018,10 @@ def test_completed_camera_capture_loads_final_rgb_and_probed_metadata(
     assert path_label is not None
     assert requested_label is not None
     assert actual_label is not None
-    assert source_mode.currentText() == "Video file"
+    assert source_mode.currentText() == "Camera"
     assert path_label.text() == str(final_path.resolve())
-    assert requested_label.text() == "Requested: width Auto · height Auto · FPS Auto · normal"
-    assert actual_label.text() == "Actual: 64 × 48 px · 29.97 FPS · mp4/h264 · no audio"
+    assert requested_label.text() == "width Auto · height Auto · FPS Auto · normal"
+    assert actual_label.text() == "64 × 48 px · 29.97 FPS · mp4/h264 · no audio"
     assert not any(isinstance(item, QGraphicsVideoItem) for item in view.scene().items())
     assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
     output.setText(str(tmp_path / "run"))
@@ -947,6 +1383,30 @@ def test_file_menu_opens_selected_video(
     assert action.text() == "Open Video…"
 
     action.trigger()
+
+    path_label = window.findChild(QLabel, "source-path")
+    assert path_label is not None
+    assert path_label.text() == str(selected_path)
+
+
+def test_browse_source_button_uses_the_shared_video_selection_path(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame(width=64, height=48))
+    selected_path = tmp_path / "selected.mp4"
+    monkeypatch.setattr(
+        main_window.QFileDialog,
+        "getOpenFileName",
+        lambda *_args: (str(selected_path), "Video files (*.mp4)"),
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    browse = window.findChild(QPushButton, "browse-source-button")
+    assert browse is not None
+
+    qtbot.mouseClick(browse, Qt.MouseButton.LeftButton)
 
     path_label = window.findChild(QLabel, "source-path")
     assert path_label is not None

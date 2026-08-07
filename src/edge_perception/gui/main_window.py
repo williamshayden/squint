@@ -45,9 +45,10 @@ from edge_perception.detectors.registry import detector_descriptors
 from edge_perception.gui.region_view import RegionView
 from edge_perception.gui.results import ResultsWidget
 from edge_perception.gui.run_controller import RunController
+from edge_perception.gui.workflow import AcquisitionState, RunState, SourceState
 from edge_perception.progress import ProgressEvent
 from edge_perception.runner import validate_output_directory
-from edge_perception.video import first_video_frame
+from edge_perception.video import DecodedFrame, first_video_frame
 
 
 class MainWindow(QMainWindow):
@@ -76,6 +77,11 @@ class MainWindow(QMainWindow):
         self._recording_active = False
         self._record_start_requested = False
         self._recording_stop_requested = False
+        self._acquisition_state = AcquisitionState.IDLE
+        self._run_state = RunState.NOT_STARTED
+        self._preview_source_snapshot: (
+            tuple[Path, CaptureResult | None, tuple[Region, ...]] | None
+        ) = None
         self._updating_region_controls = False
         self._close_decision = close_decision
         self._exit_after_run = False
@@ -99,31 +105,54 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self._source_mode_combo = self._source_mode()
         form.addRow("Source mode", self._source_mode_combo)
-        self._source_path_label = QLabel("No video selected")
+        self._source_path_label = QLabel("—")
         self._source_path_label.setObjectName("source-path")
         self._source_path_label.setWordWrap(True)
-        form.addRow("Video", self._source_path_label)
+        source_path_row = QWidget()
+        source_path_layout = QHBoxLayout(source_path_row)
+        source_path_layout.setContentsMargins(0, 0, 0, 0)
+        source_path_layout.addWidget(self._source_path_label, 1)
+        self._browse_source_button = QPushButton("Browse…")
+        self._browse_source_button.setObjectName("browse-source-button")
+        source_path_layout.addWidget(self._browse_source_button)
+        form.addRow("Source path", source_path_row)
         self._source_dimensions_label = QLabel("—")
         self._source_dimensions_label.setObjectName("source-dimensions")
-        form.addRow("Dimensions", self._source_dimensions_label)
+        form.addRow("Frame size", self._source_dimensions_label)
+        self._source_status_label = QLabel()
+        self._source_status_label.setObjectName("source-status")
+        self._acquisition_status_label = QLabel()
+        self._acquisition_status_label.setObjectName("acquisition-status")
+        self._run_readiness_label = QLabel()
+        self._run_readiness_label.setObjectName("run-readiness-status")
+        self._run_status_label = QLabel()
+        self._run_status_label.setObjectName("run-status")
+        for status_label in (
+            self._source_status_label,
+            self._acquisition_status_label,
+            self._run_readiness_label,
+            self._run_status_label,
+        ):
+            status_label.setWordWrap(True)
+            form.addRow(status_label)
         self._detector_combo = self._detector()
         self._device_combo = self._device()
         self._threshold_spin = self._threshold()
         form.addRow("Detector", self._detector_combo)
-        form.addRow("Device", self._device_combo)
-        form.addRow("Threshold", self._threshold_spin)
+        form.addRow("Compute device", self._device_combo)
+        form.addRow("Confidence threshold", self._threshold_spin)
         self._max_frames_spin = self._max_frames()
         self._warmup_runs_spin = self._execution_count("warmup-runs")
         self._annotate_every_spin = self._execution_count("annotate-every")
         form.addRow("Max frames", self._max_frames_spin)
-        form.addRow("Warm-up runs", self._warmup_runs_spin)
-        form.addRow("Annotate every", self._annotate_every_spin)
+        form.addRow("Warm-up iterations", self._warmup_runs_spin)
+        form.addRow("Annotation interval (frames)", self._annotate_every_spin)
         self._output_line = self._output()
-        form.addRow("Output", self._output_line)
+        form.addRow("Output directory", self._output_line)
         self._config_path_line = self._readonly_line("config-path")
         self._run_cli_line = self._readonly_line("run-cli")
-        form.addRow("Experiment config", self._config_path_line)
-        form.addRow("CLI", self._run_cli_line)
+        form.addRow("Run configuration", self._config_path_line)
+        form.addRow("CLI command", self._run_cli_line)
         controls_layout.addLayout(form)
         controls_layout.addWidget(self._camera_controls())
         controls_layout.addWidget(self._region_controls())
@@ -143,6 +172,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self._output_line.textChanged.connect(self._update_control_state)
+        self._browse_source_button.clicked.connect(self._choose_video)
         self._region_id.textChanged.connect(self._update_control_state)
         self._new_region_button.clicked.connect(self._begin_region_draw)
         self._delete_region_button.clicked.connect(self._delete_selected_region)
@@ -177,14 +207,25 @@ class MainWindow(QMainWindow):
             raise RuntimeError("cannot replace source while a run is active")
         if self._camera_recording_in_progress():
             raise RuntimeError("cannot replace source while camera recording is active")
+        source_path = Path(path)
+        frame = first_video_frame(source_path)
         if self._preview_active and self._capture_controller is not None:
             self._capture_controller.stop_preview()
         self._source_mode_combo.setCurrentText("Video file")
-        self._load_video(Path(path), capture=None)
+        self._apply_video_frame(source_path, frame, capture=None)
 
     def _load_video(self, path: Path, *, capture: CaptureResult | None) -> None:
         source_path = Path(path)
         frame = first_video_frame(source_path)
+        self._apply_video_frame(source_path, frame, capture=capture)
+
+    def _apply_video_frame(
+        self,
+        source_path: Path,
+        frame: DecodedFrame,
+        *,
+        capture: CaptureResult | None,
+    ) -> None:
         self._source_view.set_rgb_frame(frame.image)
         height, width = frame.image.shape[:2]
         self._source_path = source_path
@@ -194,8 +235,10 @@ class MainWindow(QMainWindow):
         self._source_path_label.setText(str(source_path))
         self._source_dimensions_label.setText(f"{width} × {height} px")
         if capture is None:
-            self._capture_requested_label.setText("Requested: —")
-            self._capture_actual_label.setText("Actual: —")
+            self._capture_requested_label.setText("—")
+            self._capture_actual_label.setText("—")
+            self._capture_sha256_label.setText("—")
+            self._acquisition_state = AcquisitionState.IDLE
         else:
             self._show_capture_metadata(capture)
         self._configure_region_controls()
@@ -224,7 +267,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(error))
 
     def _camera_controls(self) -> QGroupBox:
-        group = QGroupBox("Camera capture")
+        group = QGroupBox("Camera acquisition")
         group.setObjectName("camera-controls")
         layout = QVBoxLayout(group)
         form = QFormLayout()
@@ -233,32 +276,42 @@ class MainWindow(QMainWindow):
         self._capture_width_combo = self._capture_constraint_combo("capture-width")
         self._capture_height_combo = self._capture_constraint_combo("capture-height")
         self._capture_fps_combo = self._capture_constraint_combo("capture-fps")
-        self._capture_strict = QCheckBox("Require exact supplied constraints")
+        self._capture_strict = QCheckBox("Require specified frame size and rate")
         self._capture_strict.setObjectName("capture-strict")
-        form.addRow("Camera", self._camera_combo)
+        self._capture_strict.setToolTip(
+            "Reject the capture if any specified width, height, or frame-rate value is not met."
+        )
+        form.addRow("Device", self._camera_combo)
         form.addRow("Width", self._capture_width_combo)
         form.addRow("Height", self._capture_height_combo)
-        form.addRow("FPS", self._capture_fps_combo)
-        form.addRow("Strict", self._capture_strict)
+        form.addRow("Frame rate", self._capture_fps_combo)
+        form.addRow(self._capture_strict)
         self._capture_selected_label = QLabel("—")
         self._capture_selected_label.setObjectName("capture-selected-format")
         self._capture_selected_label.setWordWrap(True)
-        self._capture_requested_label = QLabel("Requested: —")
+        self._capture_requested_label = QLabel("—")
         self._capture_requested_label.setObjectName("capture-requested-metadata")
         self._capture_requested_label.setWordWrap(True)
-        self._capture_actual_label = QLabel("Actual: —")
+        self._capture_actual_label = QLabel("—")
         self._capture_actual_label.setObjectName("capture-actual-metadata")
         self._capture_actual_label.setWordWrap(True)
-        form.addRow("Selected", self._capture_selected_label)
-        form.addRow(self._capture_requested_label)
-        form.addRow(self._capture_actual_label)
+        self._capture_sha256_label = QLabel("—")
+        self._capture_sha256_label.setObjectName("capture-sha256")
+        self._capture_sha256_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._capture_sha256_label.setWordWrap(True)
+        form.addRow("Applied camera format", self._capture_selected_label)
+        form.addRow("Capture request", self._capture_requested_label)
+        form.addRow("Recorded format", self._capture_actual_label)
+        form.addRow("SHA-256", self._capture_sha256_label)
         layout.addLayout(form)
         buttons = QHBoxLayout()
-        self._start_preview_button = QPushButton("Start Preview")
+        self._start_preview_button = QPushButton("Start preview")
         self._start_preview_button.setObjectName("start-preview-button")
-        self._record_button = QPushButton("Record")
+        self._record_button = QPushButton("Start recording")
         self._record_button.setObjectName("record-button")
-        self._stop_recording_button = QPushButton("Stop")
+        self._stop_recording_button = QPushButton("Stop recording")
         self._stop_recording_button.setObjectName("stop-recording-button")
         buttons.addWidget(self._start_preview_button)
         buttons.addWidget(self._record_button)
@@ -393,31 +446,61 @@ class MainWindow(QMainWindow):
         device = self._camera_combo.currentData()
         if request is None or not isinstance(device, CameraDeviceInfo):
             return
+        if self._source_path is None:
+            self._preview_source_snapshot = None
+        else:
+            self._preview_source_snapshot = (
+                self._source_path,
+                self._capture_result,
+                self._source_view.regions(),
+            )
         try:
             selected = select_camera_format(device.formats, request)
-            video_output = self._source_view.begin_video_preview(
+            video_output = self._source_view.prepare_video_preview(
                 selected.width,
                 selected.height,
             )
             controller.start_preview(request, video_output)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            self._source_view.end_video_preview()
+            self._source_view.cancel_video_preview()
+            self._restore_preview_source()
             self._camera_error(str(error))
+
+    def _restore_preview_source(self) -> None:
+        snapshot = self._preview_source_snapshot
+        self._preview_source_snapshot = None
+        if snapshot is None:
+            return
+        source_path, capture, regions = snapshot
+        self._load_video(source_path, capture=capture)
+        for region in regions:
+            self._source_view.add_region(region)
 
     def _camera_preview_started(self, selected: object) -> None:
         if not isinstance(selected, CameraFormatInfo):
+            self._source_view.cancel_video_preview()
+            self._restore_preview_source()
             self._camera_error("camera returned an invalid selected format")
             return
+        try:
+            self._source_view.commit_video_preview()
+        except RuntimeError as error:
+            self._restore_preview_source()
+            self._camera_error(str(error))
+            return
+        self._preview_source_snapshot = None
         self._preview_active = True
         self._recording_active = False
         self._record_start_requested = False
         self._recording_stop_requested = False
+        self._acquisition_state = AcquisitionState.PREVIEWING
         self._source_path = None
         self._capture_result = None
         self._source_width = selected.width
         self._source_height = selected.height
-        self._source_path_label.setText("Live camera preview")
+        self._source_path_label.setText("—")
         self._source_dimensions_label.setText(f"{selected.width} × {selected.height} px")
+        self._capture_sha256_label.setText("—")
         self._capture_selected_label.setText(
             f"{selected.width} × {selected.height} px · {selected.pixel_format} · "
             f"{selected.min_fps:g}–{selected.max_fps:g} FPS"
@@ -448,6 +531,7 @@ class MainWindow(QMainWindow):
         self._record_start_requested = False
         self._recording_active = True
         self._recording_stop_requested = False
+        self._acquisition_state = AcquisitionState.RECORDING
         self._update_control_state()
         self.statusBar().showMessage("Camera recording started")
 
@@ -456,6 +540,7 @@ class MainWindow(QMainWindow):
         if controller is None:
             return
         self._recording_stop_requested = True
+        self._acquisition_state = AcquisitionState.FINALIZING
         self._update_control_state()
         try:
             controller.stop_recording()
@@ -467,12 +552,13 @@ class MainWindow(QMainWindow):
         if not isinstance(result, CaptureResult):
             self._camera_error("camera returned an invalid capture result")
             return
-        self._source_mode_combo.setCurrentText("Video file")
         try:
             self._load_video(result.path, capture=result)
         except (OSError, ValueError) as error:
             self._camera_error(str(error))
             return
+        self._acquisition_state = AcquisitionState.FINALIZED
+        self._update_control_state()
         self.statusBar().showMessage(f"Captured {result.path}")
 
     def _show_capture_metadata(self, result: CaptureResult) -> None:
@@ -484,24 +570,26 @@ class MainWindow(QMainWindow):
         requested_fps = "Auto" if request.requested_fps is None else f"{request.requested_fps:g}"
         strictness = "strict" if request.strict else "normal"
         self._capture_requested_label.setText(
-            f"Requested: width {requested_width} · height {requested_height} · "
+            f"width {requested_width} · height {requested_height} · "
             f"FPS {requested_fps} · {strictness}"
         )
         audio = "audio" if result.has_audio else "no audio"
         self._capture_actual_label.setText(
-            f"Actual: {result.actual_width} × {result.actual_height} px · "
+            f"{result.actual_width} × {result.actual_height} px · "
             f"{result.actual_fps:g} FPS · {result.container}/{result.codec} · {audio}"
         )
+        self._capture_sha256_label.setText(result.sha256)
 
     def _camera_error(self, message: str) -> None:
         self._record_start_requested = False
         self._recording_active = False
         self._recording_stop_requested = False
+        self._acquisition_state = AcquisitionState.FAILED
         self._update_control_state()
         self.statusBar().showMessage(message)
 
     def _region_controls(self) -> QGroupBox:
-        group = QGroupBox("Source regions")
+        group = QGroupBox("Regions of interest (ROIs)")
         self._region_group = group
         region_layout = QVBoxLayout(group)
         form = QFormLayout()
@@ -525,9 +613,9 @@ class MainWindow(QMainWindow):
         form.addRow("height", self._region_height)
         region_layout.addLayout(form)
         buttons = QHBoxLayout()
-        self._new_region_button = QPushButton("New Region")
+        self._new_region_button = QPushButton("Add ROI")
         self._new_region_button.setObjectName("new-region-button")
-        self._delete_region_button = QPushButton("Delete Region")
+        self._delete_region_button = QPushButton("Remove ROI")
         self._delete_region_button.setObjectName("delete-region-button")
         buttons.addWidget(self._new_region_button)
         buttons.addWidget(self._delete_region_button)
@@ -631,10 +719,23 @@ class MainWindow(QMainWindow):
     def _update_control_state(self) -> None:
         run_active = self.runController.is_active
         has_source = self._source_path is not None
+        source_state = SourceState.READY if has_source else SourceState.NO_SOURCE
         camera_mode = self._source_mode_combo.currentText() == "Camera"
         has_camera = isinstance(self._camera_combo.currentData(), CameraDeviceInfo)
         selected = self._source_view.selected_region()
+        run_readiness = self._run_readiness()
+        self._source_status_label.setText(f"Source status: {source_state}")
+        self._acquisition_status_label.setText(
+            f"Acquisition status: {self._acquisition_state}"
+        )
+        self._run_readiness_label.setText(f"Run readiness: {run_readiness}")
+        self._run_status_label.setText(f"Run status: {self._run_state}")
         self._open_video_action.setEnabled(not run_active)
+        self._browse_source_button.setEnabled(
+            not run_active
+            and not camera_mode
+            and not self._camera_recording_in_progress()
+        )
         self._source_mode_combo.setEnabled(not run_active)
         self._detector_combo.setEnabled(not run_active)
         self._device_combo.setEnabled(not run_active)
@@ -678,8 +779,30 @@ class MainWindow(QMainWindow):
             and self._recording_active
             and not self._recording_stop_requested
         )
-        self._run_button.setEnabled(not run_active and self._current_run_config() is not None)
+        self._run_button.setEnabled(not run_active and run_readiness == "Ready")
         self._cancel_button.setEnabled(run_active)
+
+    def _run_readiness(self) -> str:
+        if self._acquisition_state in {
+            AcquisitionState.PREVIEWING,
+            AcquisitionState.RECORDING,
+            AcquisitionState.FINALIZING,
+        }:
+            return "Not ready: finish camera acquisition"
+        if self._source_path is None:
+            return "Not ready: select a source"
+        if not self._output_line.text().strip():
+            return "Not ready: choose an empty output directory"
+        try:
+            self.resolved_config()
+        except FileExistsError:
+            return (
+                "Not ready: choose an output directory without an existing "
+                "run configuration"
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return "Not ready: choose an empty output directory"
+        return "Ready"
 
     def _current_run_config(self) -> RunConfig | None:
         try:
@@ -917,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._run_button = QPushButton("Run")
         self._run_button.setObjectName("run-button")
         self._run_button.setEnabled(False)
-        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button = QPushButton("Cancel run")
         self._cancel_button.setObjectName("cancel-button")
         self._cancel_button.setEnabled(False)
         actions.addWidget(self._run_button)

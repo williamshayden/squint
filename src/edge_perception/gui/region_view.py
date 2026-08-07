@@ -77,6 +77,7 @@ class RegionView(QGraphicsView):
         self._image: QImage | None = None
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._video_item: QGraphicsVideoItem | None = None
+        self._pending_video_item: QGraphicsVideoItem | None = None
         self._region_items: list[_RegionItem] = []
         self._drawing_region_id: str | None = None
         self._draw_origin: QPointF | None = None
@@ -115,8 +116,29 @@ class RegionView(QGraphicsView):
     def begin_video_preview(self, width: int, height: int) -> QGraphicsVideoItem:
         """Display one raw Qt video item behind overlays in source coordinates."""
 
+        video_item = self.prepare_video_preview(width, height)
+        self.commit_video_preview()
+        return video_item
+
+    def prepare_video_preview(self, width: int, height: int) -> QGraphicsVideoItem:
+        """Create a video output without replacing the active source coordinates."""
+
         if width <= 0 or height <= 0:
             raise ValueError("video preview dimensions must be positive")
+        self.cancel_video_preview()
+        video_item = QGraphicsVideoItem()
+        video_item.setSize(QSizeF(float(width), float(height)))
+        video_item.setZValue(-1.0)
+        self._pending_video_item = video_item
+        return video_item
+
+    def commit_video_preview(self) -> None:
+        """Replace the source frame with the prepared video output."""
+
+        video_item = self._pending_video_item
+        if video_item is None:
+            raise RuntimeError("no camera preview is prepared")
+        self._pending_video_item = None
         self._region_items.clear()
         self._pixmap_item = None
         self._video_item = None
@@ -127,19 +149,27 @@ class RegionView(QGraphicsView):
             self._source_scene.clear()
         finally:
             self._source_scene.blockSignals(previous_signal_state)
-        video_item = QGraphicsVideoItem()
-        video_item.setSize(QSizeF(float(width), float(height)))
-        video_item.setZValue(-1.0)
         self._source_scene.addItem(video_item)
         self._video_item = video_item
-        self._source_scene.setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
+        size = video_item.size()
+        self._source_scene.setSceneRect(
+            QRectF(0.0, 0.0, float(size.width()), float(size.height()))
+        )
         self._fit_source()
         self.regionsChanged.emit(())
-        return video_item
+
+    def cancel_video_preview(self) -> None:
+        """Discard a prepared output without mutating the active source frame."""
+
+        video_item = self._pending_video_item
+        self._pending_video_item = None
+        if video_item is not None:
+            video_item.deleteLater()
 
     def end_video_preview(self) -> None:
         """Remove the owned raw video item while awaiting a finalized RGB frame."""
 
+        self.cancel_video_preview()
         video_item = self._video_item
         self._video_item = None
         if video_item is not None and video_item.scene() is self._source_scene:

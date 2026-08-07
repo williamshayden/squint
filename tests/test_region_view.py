@@ -34,6 +34,29 @@ def test_region_view_keeps_scene_coordinates_in_source_pixels(qtbot: QtBot) -> N
     assert view.regions() == (Region("upper-right", 960, 0, 960, 540),)
 
 
+def test_prepared_video_preview_preserves_source_coordinates_until_committed(
+    qtbot: QtBot,
+) -> None:
+    view = RegionView()
+    qtbot.addWidget(view)
+    view.set_rgb_frame(np.zeros((48, 64, 3), dtype=np.uint8))
+    region = Region("roi", 1, 2, 10, 11)
+    view.add_region(region)
+
+    video_item = view.prepare_video_preview(1280, 720)
+
+    assert video_item.scene() is None
+    assert view.scene().sceneRect() == QRectF(0.0, 0.0, 64.0, 48.0)
+    assert view.regions() == (region,)
+    assert any(isinstance(item, QGraphicsPixmapItem) for item in view.scene().items())
+
+    view.commit_video_preview()
+
+    assert video_item.scene() is view.scene()
+    assert view.scene().sceneRect() == QRectF(0.0, 0.0, 1280.0, 720.0)
+    assert view.regions() == ()
+
+
 def test_region_from_drag_clips_and_rounds_to_source_pixels(qtbot: QtBot) -> None:
     view = RegionView()
     qtbot.addWidget(view)
