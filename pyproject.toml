@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,6 +7,8 @@ name = "adaptive-edge-perception"
 version = "0.1.0"
 description = "Adaptive edge-perception checkpoint tooling."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "av>=16,<17",
@@ -38,7 +40,23 @@ gui = [
 edge-perception = "edge_perception.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/edge_perception"]
+only-include = ["src/edge_perception"]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "uv.lock",
+    "src",
+    "tests",
+    "scripts/verify_release_archives.py",
+    "docs/checkpoints",
+]
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/verify_release_archives.py"
 
 [tool.uv]
 conflicts = [

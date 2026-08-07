@@ -4,6 +4,8 @@
 
 **Status:** Approved for implementation planning
 
+**Evidence correction (2026-08-07):** The implemented checkpoint is gated by the generated 200×100 local-video workflow and non-model suite. The strict-4K, two-pass CUDA, and real-model CPU items in the original acceptance design are unproved, are superseded as checkpoint completion criteria, and remain planned opt-in hardware validation.
+
 **Project:** Adaptive Edge Perception (working title)
 
 ## 1. Outcome
@@ -81,13 +83,14 @@ The typed Python application layer accepts the same validated experiment configu
 
 ### 5.3 Optional Native GUI Package
 
-The core package remains importable and testable without GUI dependencies. The native GUI is installed as an optional extra:
+The core package remains importable without GUI dependencies. From a clean repository checkout, install the native GUI with an installed `uv` or into an activated local virtual environment with pip:
 
 ```text
-pip install adaptive-edge-perception[gui]
+uv sync --extra gui
+python -m pip install -e ".[gui]"
 ```
 
-Invoking `edge-perception gui` without the extra prints the exact installation command and exits cleanly.
+The complete non-model test suite includes GUI tests and therefore starts with `uv sync --extra gui`, followed by `uv run pytest -m "not model"`. Invoking `edge-perception gui` without the extra prints checkout-safe installation commands and exits cleanly.
 
 The optional runtime uses PySide6 with Qt Widgets and Qt Multimedia. PySide6 remains isolated in the `gui` extra because its wheels include Qt binaries. The interface uses platform-native Qt widget styles with only restrained status-color customization; it contains no HTML, JavaScript, QML, webview, or frontend compilation step.
 
@@ -110,6 +113,8 @@ The optional runtime uses PySide6 with Qt Widgets and Qt Multimedia. PySide6 rem
 - schema version.
 
 The resolved configuration is validated before model loading and written into the run manifest. When the source was captured by the GUI, the manifest copies the requested and actual `CaptureResult` fields so a later CLI run retains acquisition provenance. Region coordinates are integer source-frame pixels, independent of preview scaling.
+
+Annotations are optional diagnostic artifacts. An annotation interval of zero disables PNG generation without disabling canonical detections, telemetry, inspection, or comparison.
 
 ### 6.2 Capture Request
 
@@ -138,7 +143,7 @@ The GUI offers `Auto`, camera-reported formats, common presets, and custom value
 - final path; and
 - SHA-256 digest.
 
-The reference Eyes and Stopwatch experiment requests and strictly verifies `3840 × 2160 @ 30 FPS`. That is a property of the reference experiment, not a product requirement. Other experiments may use any decodable resolution, FPS, aspect ratio, prerecorded file, or synthetic video.
+The original reference design proposed strict `3840 × 2160 @ 30 FPS` validation, but the implemented checkpoint did not prove it. That profile is now planned opt-in hardware validation, not a product requirement or completion gate. Other experiments may use any decodable resolution, FPS, aspect ratio, prerecorded file, or synthetic video.
 
 ## 7. Architecture
 
@@ -286,7 +291,7 @@ The default suite does not require a physical camera, model, CUDA device, browse
 
 ### 15.3 Opt-In Hardware Tests
 
-Physical camera, real model, CUDA, and long-running tests remain opt-in and identify the actual hardware used. Initial claimed support requires:
+Physical camera, real model, CUDA, CPU-model, and long-running tests remain opt-in and identify the actual hardware used. Future hardware-support claims are planned to require:
 
 - Windows reference-laptop validation with the EMEET SmartCam Nova 4K;
 - Windows CPU and NVIDIA CUDA inference;
@@ -307,7 +312,7 @@ Physical camera, real model, CUDA, and long-running tests remain opt-in and iden
 10. Copy the generated config/CLI command and run it into a second output directory.
 11. Compare both run directories with the existing comparison command.
 
-The reference Eyes and Stopwatch evidence run additionally uses its strict 4K/30 profile, two bounded CUDA passes, and one bounded CPU pass.
+Superseded acceptance note: the implemented evidence did not run the strict 4K/30 profile, two bounded CUDA passes, or a bounded real-model CPU pass. Those remain planned opt-in experiments and cannot be cited as current checkpoint evidence.
 
 ## 17. Success Criteria
 
@@ -319,13 +324,13 @@ The GUI slice is complete when:
 4. Width, height, and FPS are independently configurable and requested/actual values are recorded.
 5. A user can create valid named source-frame regions visually.
 6. The GUI and CLI resolve equivalent configs into the same application service and artifact schema.
-7. A bounded CUDA run can complete while the native window displays honest progress from an isolated worker.
+7. The generated-video, model-replaced acceptance can complete while the native window displays honest progress from the isolated worker; CUDA GUI execution remains opt-in evidence.
 8. A close request during capture or inference requires an explicit discard/cancel decision and leaves no hidden process.
 9. Failed and cancelled runs preserve honest terminal summaries and valid partial artifacts.
 10. The native completed-run view presents annotated frames, measurements, and provenance from only the run directory.
-11. The documented first user acceptance test succeeds on the reference Windows laptop.
+11. The source-agnostic acceptance and default GUI suite succeed on the reference Windows laptop; the physical-camera/real-model user acceptance remains planned and opt-in.
 12. Offline tests, lint, typing, package build, and clean-wheel checks pass.
 
 ## 18. Scope Guardrail
 
-This specification adds a production-oriented visual adapter and configuration workflow to the first engineering checkpoint. It does not change the scientific claim: the checkpoint proves deterministic high-resolution detector execution, coordinate mapping, telemetry, repeatability, and usable research interfaces on constrained hardware. It does not yet prove policy quality, RL generalization, tracker performance, or detector accuracy.
+This specification adds a production-oriented visual adapter and configuration workflow to the first engineering checkpoint. The verified claim is narrower: a deterministic generated local video exercises the production decode, coordinate, runner, artifact, inspection, comparison, and GUI contracts with the external model-loading boundary replaced, plus separately labeled optional hardware smoke evidence. It does not prove high-resolution performance, real-model CPU behavior, two-pass reproducibility, policy quality, RL generalization, tracker performance, or detector accuracy.

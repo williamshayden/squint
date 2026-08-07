@@ -408,14 +408,15 @@ def test_camera_command_reports_missing_optional_extra(
         level: int = 0,
     ) -> ModuleType:
         if name == "edge_perception.camera_cli":
-            raise ImportError("No module named 'PySide6'")
+            raise ModuleNotFoundError("No module named 'PySide6'", name="PySide6")
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr("builtins.__import__", import_without_camera_extra)
 
     assert cli.main(["camera", "list"]) == 2
     assert capsys.readouterr().err == (
-        "error: camera support is unavailable; install adaptive-edge-perception[camera]\n"
+        "error: camera support is unavailable; from this checkout run "
+        "`uv sync --extra camera` or `python -m pip install -e \".[camera]\"`\n"
     )
 
 
@@ -462,6 +463,13 @@ def test_camera_command_preserves_unrelated_import_error(
                 "cannot import name 'QTimer' from 'PySide6.QtCore'",
                 name="PySide6.QtCore",
             ),
+            False,
+        ),
+        (
+            ModuleNotFoundError(
+                "No module named 'PySide6.QtCore'",
+                name="PySide6.QtCore",
+            ),
             True,
         ),
     ],
@@ -502,7 +510,7 @@ def test_gui_command_reports_missing_optional_extra(
         level: int = 0,
     ) -> ModuleType:
         if name == "edge_perception.gui.app":
-            raise ImportError("No module named 'PySide6'")
+            raise ModuleNotFoundError("No module named 'PySide6'", name="PySide6")
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr("builtins.__import__", import_without_gui_extra)
@@ -510,9 +518,35 @@ def test_gui_command_reports_missing_optional_extra(
     assert cli.main(["gui"]) == 2
     captured = capsys.readouterr()
     assert captured.err == (
-        "error: native GUI dependencies are unavailable; install adaptive-edge-perception[gui]\n"
+        "error: native GUI dependencies are unavailable; from this checkout run "
+        "`uv sync --extra gui` or `python -m pip install -e \".[gui]\"`\n"
     )
     assert "Traceback" not in captured.err
+
+
+def test_gui_command_preserves_unrelated_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = __import__
+
+    def import_with_internal_gui_failure(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "edge_perception.gui.app":
+            raise ImportError(
+                "cannot import name 'BrokenWidget'",
+                name="edge_perception.gui.internal",
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", import_with_internal_gui_failure)
+
+    with pytest.raises(ImportError, match="BrokenWidget"):
+        cli.main(["gui"])
 
 
 @pytest.mark.parametrize("missing", ["manifest.json", "summary.json"])
@@ -724,6 +758,58 @@ def test_run_command_reports_unavailable_requested_cuda_without_traceback(
     assert capsys.readouterr().err.strip().splitlines() == [
         "error: CUDA was requested but is not available"
     ]
+
+
+@pytest.mark.parametrize(
+    "missing_module",
+    ["torch", "transformers", "huggingface_hub", "safetensors"],
+)
+def test_run_command_reports_missing_detector_runtime_without_traceback(
+    missing_module: str,
+    video_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_fake_detector(
+        monkeypatch,
+        error=ModuleNotFoundError(
+            f"No module named '{missing_module}'",
+            name=missing_module,
+        ),
+    )
+
+    exit_code = cli.main(
+        ["run", str(video_path), "--output", str(tmp_path / "run")]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.err == (
+        f"error: detector runtime is unavailable (missing {missing_module}); "
+        "from this checkout run `uv sync --extra cpu` or `uv sync --extra cu128`; "
+        "pip users: create a fresh environment, install the exact Torch backend, then run "
+        "`python -m pip install -e \".[cpu]\"` or "
+        "`python -m pip install -e \".[cu128]\"`\n"
+    )
+    assert "Traceback" not in captured.err
+
+
+def test_run_command_preserves_unrelated_missing_model_dependency(
+    video_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_detector(
+        monkeypatch,
+        error=ModuleNotFoundError(
+            "No module named 'custom_model_code'",
+            name="custom_model_code",
+        ),
+    )
+
+    with pytest.raises(ModuleNotFoundError, match="custom_model_code"):
+        cli.main(["run", str(video_path), "--output", str(tmp_path / "run")])
 
 
 @pytest.mark.parametrize(("equivalent", "exit_code"), [(True, 0), (False, 1)])

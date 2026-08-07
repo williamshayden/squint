@@ -50,7 +50,7 @@ The vocabulary follows recurring concepts in established ML, CV, and RL tools:
 
 The GUI must never be the sole path to a durable operation. Visual preview and drag-to-draw ROIs are conveniences; camera capture, coordinate-based ROIs, run execution, result inspection, and comparison remain headless operations.
 
-The runner consumes a validated local video reference, not a provider page or mutable network stream. A YouTube or similar public video works after it is materialized to a local file by an external downloader. Provider-specific download APIs, credentials, and licensing policy remain outside this checkpoint; keeping that boundary preserves offline execution and reproducible local inputs.
+The runner consumes a validated local video reference, not a provider page or mutable network stream. A public video may be used only after the researcher lawfully materializes it to a local file outside the tool. Record the provider/source URL, title or asset ID, license or permission basis, retrieval date, original filename, and SHA-256 digest; do not redistribute the file unless its terms permit that. Provider-specific download APIs, credentials, and licensing policy remain outside this checkpoint; keeping that boundary preserves offline execution and reproducible local inputs.
 
 ### 3.1 Command surface
 
@@ -94,7 +94,7 @@ Camera contracts, format selection, validation, and the QtMultimedia capture bac
 
 The GUI supplies a visual video output. The CLI drives the same asynchronous backend with a `QCoreApplication`/`QEventLoop` and `QTimer`, without importing QtWidgets or creating a window. Camera and GUI command handlers import PySide6 lazily.
 
-The base package supports inspection, comparison, and non-model surfaces without Qt. D-FINE is the only currently registered detector, so real existing-video run execution requires exactly one of the mutually exclusive `cpu` or `cu128` detector-runtime extras plus external pinned model files. The independently optional `camera` and `gui` extras each install the same compatible PySide6 dependency and remain lazy; ordinary CLI startup imports neither optional surface. Missing optional support produces a concise install hint rather than breaking unrelated commands at import time.
+The base package supports inspection, comparison, and non-model surfaces without Qt. D-FINE is the only currently registered detector, so real existing-video run execution requires exactly one of the mutually exclusive `cpu` or `cu128` detector-runtime extras plus external pinned model files. The independently optional `camera` and `gui` extras each install the same compatible PySide6 dependency and remain lazy; ordinary CLI startup imports neither optional surface. From a clean checkout, use installed-uv commands such as `uv sync --extra gui`, `uv sync --extra cpu`, or `uv sync --extra cu128`; the complete non-model suite requires `uv sync --extra gui`. Missing optional support produces a checkout-safe hint, while unrelated import failures propagate.
 
 ## 4. Native Information Architecture
 
@@ -115,7 +115,7 @@ The researcher adds, selects, edits, and removes ROIs over the source frame. The
 
 ### 4.3 Run configuration
 
-The researcher selects the detector adapter, compute device, confidence threshold, frame limit, warm-up iterations, annotation interval, and output directory. Before the first launch, Run configuration and CLI command are blank. After successful configuration publication, their resolved values remain visible and read-only.
+The researcher selects the detector adapter, compute device, confidence threshold, frame limit, warm-up iterations, optional annotation interval, and output directory. An interval of zero disables diagnostic PNGs without disabling canonical detections or telemetry. Before the first launch, Run configuration and CLI command are blank. After successful configuration publication, their resolved values remain visible and read-only.
 
 ### 4.4 Run
 
@@ -214,6 +214,8 @@ The application does not address the researcher conversationally or explain a st
 ## 7. User Flow
 
 ### 7.1 Headless reference workflow
+
+The strict 4K command below is a planned hardware-workflow example retained from the original design. It was not proven by the implemented checkpoint and is not a completion gate; the recorded optional camera evidence used a smaller format and did not satisfy strict FPS validation.
 
 ```text
 # Discover the stable camera ID and supported frame sizes/rates.
@@ -357,7 +359,7 @@ The default automated suite will prove:
 18. existing result fields use the agreed run, metric, provenance, and artifact terminology; and
 19. no browser, server, database, model load, or physical camera is required by the default suite.
 
-The required end-to-end acceptance uses a local materialized public or synthetic video and does not require a physical camera. When the EMEET is available, an optional Windows hardware pass verifies CLI and GUI capture, automatic and explicit destinations, equivalent capture provenance, strict behavior, and the observed acquisition/source/run states; hardware availability does not gate the checkpoint.
+The required end-to-end acceptance uses a synthetic video or a lawfully materialized local public video with the provenance record defined above and does not require a physical camera. When the EMEET is available, an optional Windows hardware pass may verify CLI and GUI capture, automatic and explicit destinations, equivalent capture provenance, strict behavior, and the observed acquisition/source/run states; hardware availability does not gate the checkpoint.
 
 ## 14. Acceptance Criteria
 

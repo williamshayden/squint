@@ -11,7 +11,7 @@ The only replaced boundary was `edge_perception.cli.load_detector`, the external
 The acceptance test passed on its first Task 7 run:
 
 ```text
-./.tools/uv.exe run pytest tests/test_cli_workflow_acceptance.py -q
+uv run pytest tests/test_cli_workflow_acceptance.py -q
 .                                                                        [100%]
 1 passed in 0.66s
 ```
@@ -52,7 +52,7 @@ This fixes the encoded dimensions at 200×100, the stream rate and time base at 
 The first focused run after adding these characterization assertions passed honestly without a fabricated RED:
 
 ```text
-./.tools/uv.exe run pytest tests/test_cli_workflow_acceptance.py -q
+uv run pytest tests/test_cli_workflow_acceptance.py -q
 1 passed in 0.92s
 ```
 
@@ -87,6 +87,8 @@ edge-perception compare run-a run-b
 ```
 
 Each frame produces one full-frame inference followed by the declared `left` and `right` ROI inferences: 3 frames × 3 inference regions = 9 inferences. The fake emits one deterministic source-mappable detection per inference, so comparison reports 9 detections on each side.
+
+The three annotated PNGs are evidence for this particular run configuration, not a required product output. Setting `--annotate-every 0` disables diagnostic PNG generation while preserving canonical detections, telemetry, inspection, and comparison.
 
 ## Fake-detector boundary
 
@@ -153,33 +155,41 @@ equivalent=true left=9 right=9 mismatches=0
 The required commands and observed results were:
 
 ```text
-./.tools/uv.exe run pytest tests/test_cli_workflow_acceptance.py -q
-1 passed in 0.58s (Fix Round 1 final rerun; the first Task 7 run is recorded above)
+uv run pytest tests/test_release_archives.py tests/test_cli.py -q -k \
+  "release or missing_optional_extra or preserves_unrelated_import_error or pyside6_import_classifier or missing_detector_runtime or preserves_unrelated_missing_model_dependency"
+20 passed, 44 deselected in 2.17s
 
-./.tools/uv.exe run pytest -m "not model" -q
-396 passed, 1 skipped, 1 deselected in 11.55s
+uv run pytest -m "not model" -q
+409 passed, 1 skipped, 1 deselected in 12.56s
 
-./.tools/uv.exe run ruff check src tests
+uv run ruff check src tests scripts
 All checks passed!
 
-./.tools/uv.exe run mypy src
+uv run mypy src
 Success: no issues found in 27 source files
 
-./.tools/uv.exe build
+uv lock --check --offline
+Resolved 69 packages in 1ms
+
+uv build --offline
 Successfully built dist\adaptive_edge_perception-0.1.0.tar.gz
 Successfully built dist\adaptive_edge_perception-0.1.0-py3-none-any.whl
 
-./.tools/uv.exe run python -m zipfile -l \
-  dist/adaptive_edge_perception-0.1.0-py3-none-any.whl
+uv run python scripts/verify_release_archives.py \
+  dist/adaptive_edge_perception-0.1.0-py3-none-any.whl \
+  dist/adaptive_edge_perception-0.1.0.tar.gz
+wheel inventory: 32 files; 27 package Python; 5 metadata/license
+sdist inventory: 59 files; 27 package Python; 25 test Python; 1 release verifier; 1 checkpoint; 5 project/metadata
+release archive policy: passed
 ```
 
-The wheel listing contained 31 entries: 27 `edge_perception/**/*.py` files and four `adaptive_edge_perception-0.1.0.dist-info` metadata files (`METADATA`, `WHEEL`, `entry_points.txt`, and `RECORD`). The exact allowlist/denylist inventory check reported:
+The wheel contains 27 `edge_perception/**/*.py` files and exactly five `adaptive_edge_perception-0.1.0.dist-info` metadata/license files: `METADATA`, `WHEEL`, `entry_points.txt`, `licenses/LICENSE`, and `RECORD`. Its `METADATA` declares metadata version 2.4, `License-Expression: Apache-2.0`, and `License-File: LICENSE`.
 
-```text
-wheel inventory: 31 entries; 27 package Python files; 4 metadata files; no blocked or unexpected data
-```
+The sdist contains only `LICENSE`, `README.md`, `pyproject.toml`, `uv.lock`, generated `PKG-INFO`, package Python, test Python, `scripts/verify_release_archives.py`, and Markdown under `docs/checkpoints`. Its `PKG-INFO` carries the same PEP 639 metadata. The verifier rejects every other member family, including ignored checkout state, before printing either inventory.
 
-It proved that the wheel contains Python/package metadata only. It contains no MP4 or other video, JSON/JSONL run artifact, PNG annotation, model weight (`.pt`, `.pth`, `.onnx`, `.safetensors`, or `.bin`), private capture, Qt binary, PySide6 payload, `.superpowers` path, test file, or unexpected data file.
+Together these checks prove that the wheel contains Python/package metadata only and the sdist contains only the declared public source families. Neither archive contains video, run artifacts, PNG annotations, model weights, private captures, Qt/PySide6 payloads, `.superpowers` state, or unexpected data.
+
+Clean lazy-startup probes using installed-uv command shapes—`uv run edge-perception --help`, `uv run edge-perception run --help`, `uv run edge-perception gui --help`, and `uv run edge-perception camera --help`—all exited 0 without loading a model, opening a camera, or launching the GUI.
 
 ## Additive, not gating: cached D-FINE and CUDA
 
@@ -229,9 +239,11 @@ Machine-specific device identifiers, encoder-instance values, temporary paths, a
 
 ## Optional evidence not run
 
-No public-video lane was run. Public media is unnecessary for the acceptance proof and would have required externally materialized content that the user may lawfully obtain.
+No public-video lane was run. Public media is unnecessary for the acceptance proof. Any future public-video lane must use content the researcher may lawfully obtain and must retain provider/source URL, title or asset ID, license or permission basis, retrieval date, original filename, and SHA-256 provenance without redistributing media unless permitted.
 
 No CPU real-model lane was run because the already-cached CUDA lane was sufficient additive functional evidence. Neither real-model lane is a completion gate.
+
+No strict-4K evidence run or second bounded CUDA pass was run. The old strict-4K, two-pass CUDA, and real-model CPU criteria are superseded as checkpoint completion gates and remain planned opt-in hardware validation.
 
 ## Limitations
 

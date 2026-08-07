@@ -25,6 +25,13 @@ from edge_perception.inspection import render_run_inspection
 from edge_perception.run_view import load_run_view
 from edge_perception.runner import run_checkpoint, validate_output_directory
 
+_DETECTOR_RUNTIME_MODULES = (
+    "huggingface_hub",
+    "safetensors",
+    "torch",
+    "transformers",
+)
+
 
 class _CliError(ValueError):
     pass
@@ -188,11 +195,26 @@ def _run_command(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, request_cancel)
     try:
-        detector = load_detector(
-            config.detector_id,
-            threshold=config.threshold,
-            device=config.device,
-        )
+        try:
+            detector = load_detector(
+                config.detector_id,
+                threshold=config.threshold,
+                device=config.device,
+            )
+        except ModuleNotFoundError as error:
+            missing_module = _missing_module_in_families(
+                error, _DETECTOR_RUNTIME_MODULES
+            )
+            if missing_module is None:
+                raise
+            raise _CliError(
+                f"detector runtime is unavailable (missing {missing_module}); "
+                "from this checkout run `uv sync --extra cpu` or "
+                "`uv sync --extra cu128`; pip users: create a fresh environment, "
+                "install the exact Torch backend, then run "
+                "`python -m pip install -e \".[cpu]\"` or "
+                "`python -m pip install -e \".[cu128]\"`"
+            ) from error
         summary = run_checkpoint(config, detector, cancel_requested=cancel_event.is_set)
     finally:
         signal.signal(signal.SIGINT, previous_handler)
@@ -305,8 +327,11 @@ def _gui_command(args: argparse.Namespace) -> int:
     try:
         from edge_perception.gui.app import launch_gui
     except ImportError as error:
+        if not _is_pyside6_import_error(error):
+            raise
         raise _CliError(
-            "native GUI dependencies are unavailable; install adaptive-edge-perception[gui]"
+            "native GUI dependencies are unavailable; from this checkout run "
+            "`uv sync --extra gui` or `python -m pip install -e \".[gui]\"`"
         ) from error
     return launch_gui(run_dir)
 
@@ -318,7 +343,8 @@ def _camera_command(args: argparse.Namespace) -> int:
         if not _is_pyside6_import_error(error):
             raise
         raise _CliError(
-            "camera support is unavailable; install adaptive-edge-perception[camera]"
+            "camera support is unavailable; from this checkout run "
+            "`uv sync --extra camera` or `python -m pip install -e \".[camera]\"`"
         ) from error
     devices = list_cameras()
     if args.camera_command == "list":
@@ -401,16 +427,21 @@ def _format_optional_measure(value: float | None, unit: str) -> str:
 
 
 def _is_pyside6_import_error(error: ImportError) -> bool:
-    module_name = error.name or ""
-    message = str(error)
-    return (
-        module_name == "PySide6"
-        or module_name.startswith("PySide6.")
-        or "No module named 'PySide6'" in message
-        or "No module named 'PySide6." in message
-        or "from 'PySide6'" in message
-        or "from 'PySide6." in message
-    )
+    return _missing_module_in_families(error, ("PySide6",)) is not None
+
+
+def _missing_module_in_families(
+    error: ImportError,
+    module_families: Sequence[str],
+) -> str | None:
+    if not isinstance(error, ModuleNotFoundError) or error.name is None:
+        return None
+    if any(
+        error.name == family or error.name.startswith(f"{family}.")
+        for family in module_families
+    ):
+        return error.name
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
