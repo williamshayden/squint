@@ -311,6 +311,32 @@ def test_terminal_cleanup_removes_only_cancel_file(
     assert keep.read_text(encoding="utf-8") == "keep"
 
 
+def test_run_lifecycle_terminal_outcome_follows_cleanup_and_precedes_termination(
+    tmp_path: Path,
+    fake_process: FakeProcess,
+) -> None:
+    controller = RunController(process=fake_process)
+    config = make_config(tmp_path)
+    controller.start(config)
+    controller.cancel()
+    cancel_path = tmp_path / ".run.cancel"
+    observations: list[tuple[str, bool]] = []
+    controller.runFinished.connect(
+        lambda _path, _payload: observations.append(
+            ("finished", cancel_path.exists())
+        )
+    )
+    controller.processTerminated.connect(
+        lambda: observations.append(("terminated", cancel_path.exists()))
+    )
+    terminal = ProgressEvent("cancelled", 1, 1, 2.0, None)
+    fake_process.emit_stdout(event_json(terminal) + "\n")
+
+    fake_process.finish()
+
+    assert observations == [("finished", False), ("terminated", False)]
+
+
 def test_persisted_gui_config_loads_as_last_config(
     tmp_path: Path,
     fake_process: FakeProcess,

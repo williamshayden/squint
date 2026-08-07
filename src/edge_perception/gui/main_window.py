@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
         self._acquisition_state = AcquisitionState.IDLE
         self._acquisition_terminal: AcquisitionState | None = None
         self._run_state = RunState.NOT_STARTED
+        self._run_controls_locked = False
         self._preview_source_snapshot: _SourceSnapshot | None = None
         self._preview_attempt_pending = False
         self._preview_attempt_current = False
@@ -315,11 +316,24 @@ class MainWindow(QMainWindow):
         self._capture_strict.setToolTip(
             "Reject the capture if any specified width, height, or frame-rate value is not met."
         )
+        self._capture_destination_line = QLineEdit()
+        self._capture_destination_line.setObjectName("capture-destination")
+        self._capture_destination_line.setPlaceholderText("Automatic")
+        capture_destination_row = QWidget()
+        capture_destination_layout = QHBoxLayout(capture_destination_row)
+        capture_destination_layout.setContentsMargins(0, 0, 0, 0)
+        capture_destination_layout.addWidget(self._capture_destination_line, 1)
+        self._browse_capture_destination_button = QPushButton("Browse…")
+        self._browse_capture_destination_button.setObjectName(
+            "browse-capture-destination-button"
+        )
+        capture_destination_layout.addWidget(self._browse_capture_destination_button)
         form.addRow("Device", self._camera_combo)
         form.addRow("Width", self._capture_width_combo)
         form.addRow("Height", self._capture_height_combo)
         form.addRow("Frame rate", self._capture_fps_combo)
         form.addRow(self._capture_strict)
+        form.addRow("Capture destination", capture_destination_row)
         self._capture_selected_label = QLabel("—")
         self._capture_selected_label.setObjectName("capture-selected-format")
         self._capture_selected_label.setWordWrap(True)
@@ -347,6 +361,9 @@ class MainWindow(QMainWindow):
         self._record_button.setObjectName("record-button")
         self._stop_recording_button = QPushButton("Stop recording")
         self._stop_recording_button.setObjectName("stop-recording-button")
+        self._browse_capture_destination_button.clicked.connect(
+            self._choose_capture_destination
+        )
         buttons.addWidget(self._start_preview_button)
         buttons.addWidget(self._record_button)
         buttons.addWidget(self._stop_recording_button)
@@ -376,6 +393,16 @@ class MainWindow(QMainWindow):
             controller.errorOccurred.connect(self._camera_error)
             self._capture_controller_connected = True
         return controller
+
+    def _choose_capture_destination(self) -> None:
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Capture Destination",
+            self._capture_destination_line.text(),
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)",
+        )
+        if selected:
+            self._capture_destination_line.setText(selected)
 
     def _source_mode_changed(self, source_mode: str) -> None:
         camera_mode = source_mode == "Camera"
@@ -710,7 +737,9 @@ class MainWindow(QMainWindow):
         self._record_start_requested = True
         self._update_control_state()
         try:
-            controller.start_recording()
+            destination_text = self._capture_destination_line.text().strip()
+            destination = Path(destination_text).resolve() if destination_text else None
+            controller.start_recording(destination)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             if self._acquisition_terminal is not None:
                 return
@@ -985,7 +1014,7 @@ class MainWindow(QMainWindow):
         self._updating_region_controls = False
 
     def _update_control_state(self) -> None:
-        run_active = self.runController.is_active
+        run_active = self.runController.is_active or self._run_controls_locked
         has_source = self._source_path is not None
         source_state = SourceState.READY if has_source else SourceState.NO_SOURCE
         camera_mode = self._source_mode_combo.currentText() == "Camera"
@@ -1020,6 +1049,20 @@ class MainWindow(QMainWindow):
         self._source_view.setEnabled(not run_active)
         self._region_group.setEnabled(not run_active)
         self._camera_group.setEnabled(camera_mode and not run_active)
+        capture_destination_enabled = (
+            camera_mode
+            and not run_active
+            and not self._preview_attempt_pending
+            and not self._backend_cleanup_pending
+            and not self._preview_active
+            and not self._record_start_requested
+            and not self._recording_active
+            and not self._recording_stop_requested
+        )
+        self._capture_destination_line.setEnabled(capture_destination_enabled)
+        self._browse_capture_destination_button.setEnabled(
+            capture_destination_enabled
+        )
         for spin_box in self._region_spin_boxes:
             spin_box.setEnabled(selected is not None and not run_active)
         self._new_region_button.setEnabled(
@@ -1057,7 +1100,9 @@ class MainWindow(QMainWindow):
             and not self._recording_stop_requested
         )
         self._run_button.setEnabled(not run_active and run_readiness == "Ready")
-        self._cancel_button.setEnabled(run_active)
+        self._cancel_button.setEnabled(
+            self.runController.is_active and self._run_state is RunState.RUNNING
+        )
 
     def _run_readiness(self) -> str:
         if self._acquisition_state in {
@@ -1119,11 +1164,19 @@ class MainWindow(QMainWindow):
     def _start_run(self) -> None:
         try:
             config = self.resolved_config()
-            self._run_failure_shown = False
-            self.runController.start(config)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             self._run_failed(str(error))
-            self._update_control_state()
+            return
+        self._run_failure_shown = False
+        self._run_state = RunState.RUNNING
+        self._run_controls_locked = True
+        self.resultsWidget.setVisible(False)
+        self._update_control_state()
+        try:
+            self.runController.start(config)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._run_controls_locked = False
+            self._run_failed(str(error))
             return
         config_path = self.runController.config_path
         if config_path is not None:
@@ -1134,6 +1187,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Run started: {config.output_dir}")
 
     def _cancel_run(self) -> None:
+        self._run_state = RunState.CANCELLING
+        self._update_control_state()
         try:
             self.runController.cancel()
         except OSError as error:
@@ -1151,6 +1206,14 @@ class MainWindow(QMainWindow):
 
     def _run_finished(self, run_dir: Path, payload: dict[str, object]) -> None:
         phase = payload.get("phase")
+        if phase == "complete":
+            self._run_state = RunState.COMPLETED
+        elif phase == "cancelled":
+            self._run_state = RunState.CANCELLED
+        else:
+            self._run_failed(f"worker reported unexpected terminal phase: {phase}")
+            return
+        self._update_control_state()
         if self._exit_after_run:
             self.statusBar().showMessage(f"Run {phase}: {Path(run_dir).resolve()}")
             return
@@ -1175,6 +1238,8 @@ class MainWindow(QMainWindow):
         return path
 
     def _run_failed(self, message: str) -> None:
+        self._run_state = RunState.FAILED
+        self.resultsWidget.setVisible(False)
         self.statusBar().showMessage(message)
         if not self._run_failure_shown:
             self._run_failure_shown = True
@@ -1182,6 +1247,7 @@ class MainWindow(QMainWindow):
         self._update_control_state()
 
     def _run_process_terminated(self) -> None:
+        self._run_controls_locked = False
         self._update_control_state()
         if not self._exit_after_run:
             return
@@ -1245,9 +1311,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             try:
+                self._run_state = RunState.CANCELLING
+                self._update_control_state()
                 self.runController.cancel()
             except OSError as error:
-                self.statusBar().showMessage(str(error))
+                self._run_failed(str(error))
                 event.ignore()
                 return
             self._exit_after_run = True

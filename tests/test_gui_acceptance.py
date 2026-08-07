@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QByteArray, QObject, QProcess, Qt, QTimer, Signal
-from PySide6.QtWidgets import QLineEdit, QPushButton
+from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton
 from pytestqt.qtbot import QtBot
 
 from edge_perception.config import RunConfig, load_run_config, render_run_cli
@@ -179,10 +179,12 @@ def test_native_gui_vertical_slice_is_config_reproducible(
     output = window.findChild(QLineEdit, "output")
     run_button = window.findChild(QPushButton, "run-button")
     run_cli = window.findChild(QLineEdit, "run-cli")
+    run_status = window.findChild(QLabel, "run-status")
     assert source_view is not None
     assert output is not None
     assert run_button is not None
     assert run_cli is not None
+    assert run_status is not None
 
     regions = (
         Region("z-first", 10, 10, 40, 30),
@@ -199,6 +201,8 @@ def test_native_gui_vertical_slice_is_config_reproducible(
     with qtbot.waitSignal(window.runController.runFinished, timeout=1_000):
         qtbot.mouseClick(run_button, Qt.MouseButton.LeftButton)
         assert process.start_count == 1
+        assert window.resultsWidget.isHidden()
+        assert run_status.text() == "Run status: Running"
         assert process.program == sys.executable
         assert process.arguments == [
             "-m",
@@ -231,7 +235,8 @@ def test_native_gui_vertical_slice_is_config_reproducible(
         ProgressEvent("complete", 3, 6, 2.0, None),
     ]
     assert not window.resultsWidget.isHidden()
-    assert window.resultsWidget.statusLabel.text() == "complete"
+    assert window.resultsWidget.statusLabel.text() == "Completed"
+    assert run_status.text() == "Run status: Completed"
     assert window.resultsWidget.sourceLabel.text() == str(video_path.resolve())
     assert window.resultsWidget.regionsTable.rowCount() == len(regions)
     assert [

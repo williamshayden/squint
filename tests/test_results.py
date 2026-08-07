@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
-from PySide6.QtWidgets import QAbstractItemView, QGraphicsPixmapItem
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QGraphicsPixmapItem,
+    QGroupBox,
+    QLabel,
+)
 from pytestqt.qtbot import QtBot
 
 from edge_perception.config import CaptureRequest, CaptureResult
@@ -368,7 +373,7 @@ def test_results_widget_loads_annotation_without_mutating_run(
 
     widget.load_run(run_dir)
 
-    assert widget.statusLabel.text() == "complete"
+    assert widget.statusLabel.text() == "Completed"
     assert widget.annotationList.count() == 2
     assert widget.annotationList.item(0).text() == "000000.png"
     assert len([item for item in widget.imageScene.items() if isinstance(item, QGraphicsPixmapItem)]) == 1
@@ -396,7 +401,6 @@ def test_results_widget_formats_unavailable_telemetry_as_na(
 
     assert widget.peakRssLabel.text() == "N/A"
     assert widget.peakVramLabel.text() == "N/A"
-    assert widget.nvmlGpuMemoryLabel.text() == "N/A"
 
 
 def test_capture_provenance_is_typed(tmp_path: Path) -> None:
@@ -406,3 +410,70 @@ def test_capture_provenance_is_typed(tmp_path: Path) -> None:
     view = load_run_view(run_dir)
 
     assert view.capture == expected
+
+
+def test_results_widget_groups_projection_and_renders_camera_provenance(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    capture = _capture(tmp_path / "historical-capture.mp4")
+    run_dir = write_completed_run_fixture(tmp_path, capture=capture)
+    widget = ResultsWidget()
+    qtbot.addWidget(widget)
+
+    widget.load_run(run_dir)
+
+    assert [group.objectName() for group in widget.findChildren(QGroupBox)] == [
+        "results-overview",
+        "results-metrics",
+        "results-run-configuration",
+        "results-source-provenance",
+        "results-annotations",
+    ]
+    assert widget.statusLabel.text() == "Completed"
+    assert widget.capturePathLabel.text() == str(capture.path)
+    assert widget.captureSha256Label.text() == "b" * 64
+    assert widget.captureRequestLabel.text() == (
+        "Test camera (camera-1) · width 640 · height 480 · 30 FPS · strict"
+    )
+    assert widget.captureRecordedFormatLabel.text() == (
+        "640 × 480 px · 29.970 FPS · mp4/h264 · no audio"
+    )
+    assert widget.annotationCountLabel.text() == "2"
+    assert widget.findChild(QLabel, "result-nvml-gpu-memory") is None
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("complete", "Completed"), ("cancelled", "Cancelled"), ("failed", "Failed")],
+)
+def test_results_widget_renders_terminal_status_in_professional_title_case(
+    status: str,
+    expected: str,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    run_dir = write_completed_run_fixture(
+        tmp_path,
+        annotation_names=(),
+    )
+    summary_path = run_dir / "summary.json"
+    summary = _read_json(summary_path)
+    summary["status"] = status
+    summary["frames_processed"] = 0
+    summary["inference_count"] = 0
+    summary["annotated_frame_count"] = 0
+    summary["latency_ms"] = {
+        "full_frame": _latency(0, None, None, None),
+        "crop": _latency(0, None, None, None),
+        "complete_frame": _latency(0, None, None, None),
+    }
+    if status == "failed":
+        summary["error"] = "detector failed"
+    _write_json(summary_path, summary)
+    widget = ResultsWidget()
+    qtbot.addWidget(widget)
+
+    widget.load_run(run_dir)
+
+    assert widget.statusLabel.text() == expected
