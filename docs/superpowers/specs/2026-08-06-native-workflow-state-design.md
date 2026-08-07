@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-06
 
-**Status:** Reviewed; awaiting user approval
+**Status:** Approved for implementation
 
 **Project:** Adaptive Edge Perception (working title)
 
@@ -227,7 +227,7 @@ edge-perception camera capture \
 # Execute the same run contract used by the GUI.
 edge-perception run fixtures/private/reference.mp4 \
   --output runs/reference \
-  --detector dfine \
+  --detector dfine-nano-coco \
   --crop left:0,0,1920,2160 \
   --crop right:1920,0,1920,2160
 

@@ -2,6 +2,7 @@
 .tools/
 .worktrees/
 .superpowers/brainstorm/
+.superpowers/planning/
 .superpowers/sdd/
 __pycache__/
 *.py[cod]
