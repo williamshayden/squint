@@ -3238,6 +3238,154 @@ def test_live_terminal_contract_mismatch_fails_without_exposing_results(
     assert window.statusBar().currentMessage() == expected_error
 
 
+@pytest.mark.parametrize(
+    ("failure_source", "expected_message"),
+    [
+        (
+            "terminal-mismatch",
+            (
+                "run terminal contract mismatch: worker phase 'complete' does not "
+                "match canonical artifact status 'failed'"
+            ),
+        ),
+        ("artifact-load", "completed run could not be loaded:"),
+        ("worker-failure", MALFORMED_PROGRESS_ERROR),
+    ],
+)
+def test_run_failure_projects_failed_state_before_blocking_modal(
+    failure_source: str,
+    expected_message: str,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    historical = _write_completed_run(tmp_path / "historical")
+    window = MainWindow(run_dir=historical, process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert run_status is not None
+    run_dir = tmp_path / "run"
+    output.setText(str(run_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    modal_observations: list[tuple[str, str, str, bool, bool, str]] = []
+
+    def observe_critical(_parent: object, title: str, message: str) -> None:
+        modal_observations.append(
+            (
+                title,
+                message,
+                run_status.text(),
+                window.resultsWidget.isHidden(),
+                output.isEnabled(),
+                window.statusBar().currentMessage(),
+            )
+        )
+
+    monkeypatch.setattr(QMessageBox, "critical", observe_critical)
+    if failure_source == "terminal-mismatch":
+        _write_terminal_run(run_dir, "failed")
+        process.emit_stdout(
+            _progress_record(ProgressEvent("complete", 1, 1, 2.0, None))
+        )
+    elif failure_source == "artifact-load":
+        process.emit_stdout(
+            _progress_record(ProgressEvent("complete", 1, 1, 2.0, None))
+        )
+    else:
+        process.emit_stdout("not-json\n")
+
+    process.finish()
+
+    assert len(modal_observations) == 1
+    title, message, status, results_hidden, output_enabled, status_message = (
+        modal_observations[0]
+    )
+    assert title == "Run failed"
+    assert message == status_message
+    if failure_source == "artifact-load":
+        assert message.startswith(expected_message)
+    else:
+        assert message == expected_message
+    assert status == "Run status: Failed"
+    assert results_hidden
+    assert not output_enabled
+    assert output.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("phase", "status_before_validation", "validated_status"),
+    [
+        ("complete", "Run status: Running", "Run status: Completed"),
+        ("cancelled", "Run status: Cancelling", "Run status: Cancelled"),
+    ],
+)
+def test_live_terminal_state_is_projected_only_after_canonical_validation(
+    phase: str,
+    status_before_validation: str,
+    validated_status: str,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_first_frame(monkeypatch, _preview_frame())
+    process = FakeGuiProcess()
+    window = MainWindow(process=process)
+    qtbot.addWidget(window)
+    window.load_video(tmp_path / "source.mp4")
+    output = window.findChild(QLineEdit, "output")
+    run = window.findChild(QPushButton, "run-button")
+    cancel = window.findChild(QPushButton, "cancel-button")
+    run_status = window.findChild(QLabel, "run-status")
+    assert output is not None
+    assert run is not None
+    assert cancel is not None
+    assert run_status is not None
+    run_dir = tmp_path / "run"
+    output.setText(str(run_dir))
+    qtbot.mouseClick(run, Qt.MouseButton.LeftButton)
+    if phase == "cancelled":
+        qtbot.mouseClick(cancel, Qt.MouseButton.LeftButton)
+    _write_terminal_run(run_dir, phase)
+    actual_load_run = window.resultsWidget.load_run
+    validation_observations: list[tuple[str, bool, bool]] = []
+
+    def observe_load_run(path: Path) -> object:
+        validation_observations.append(
+            (
+                run_status.text(),
+                window.resultsWidget.isHidden(),
+                output.isEnabled(),
+            )
+        )
+        return actual_load_run(path)
+
+    monkeypatch.setattr(window.resultsWidget, "load_run", observe_load_run)
+    projected_observations: list[tuple[str, bool, bool]] = []
+    window.runController.runFinished.connect(
+        lambda _path, _payload: projected_observations.append(
+            (
+                run_status.text(),
+                window.resultsWidget.isHidden(),
+                output.isEnabled(),
+            )
+        )
+    )
+
+    process.emit_stdout(_progress_record(ProgressEvent(phase, 1, 1, 2.0, None)))
+    process.finish()
+
+    assert validation_observations == [(status_before_validation, True, False)]
+    assert projected_observations == [(validated_status, False, False)]
+    assert output.isEnabled()
+
+
 def test_exit_after_run_terminal_contract_mismatch_is_modal_free(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,

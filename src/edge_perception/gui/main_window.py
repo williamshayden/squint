@@ -1235,8 +1235,6 @@ class MainWindow(QMainWindow):
         if not isinstance(phase, str) or phase not in {"complete", "cancelled"}:
             self._run_failed(f"worker reported unexpected terminal phase: {phase}")
             return
-        self._run_state = _run_state_for_terminal_status(phase)
-        self._update_control_state()
         path = self._load_completed_run_or_report(
             run_dir,
             expected_live_status=phase,
@@ -1292,10 +1290,10 @@ class MainWindow(QMainWindow):
         self._run_state = RunState.FAILED
         self.resultsWidget.setVisible(False)
         self.statusBar().showMessage(message)
+        self._update_control_state()
         if not self._exit_after_run and not self._run_failure_shown:
             self._run_failure_shown = True
             QMessageBox.critical(self, "Run failed", message)
-        self._update_control_state()
 
     def _run_process_terminated(self) -> None:
         self._run_controls_locked = False
