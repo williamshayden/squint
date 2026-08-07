@@ -91,7 +91,7 @@
     .evidence-item strong { display: block; font-family: var(--sans); }
     .evidence-item span { display: block; margin-top: 8px; color: var(--slate); font-size: 13px; }
     .verdict { display: grid; grid-template-columns: 1.35fr 0.65fr; gap: clamp(30px, 6vw, 90px); margin-top: 24px; }
-    .verdict h3 { margin-top: 0; }
+    .verdict h2, .verdict h3 { margin: 0 0 0.75em; font-size: clamp(20px, 2vw, 28px); letter-spacing: normal; }
     .callout { border-left: 4px solid var(--blue); padding: 4px 0 4px 20px; }
     .callout--risk { border-left-color: var(--orange); }
     .callout--risk .label { color: var(--orange-text); }
@@ -288,7 +288,7 @@
 
         <div class="verdict">
           <article>
-            <h3>1. Executive verdict</h3>
+            <h2>1. Executive verdict</h2>
             <p><strong>Verdict.</strong> The repository is a credible offline detector-checkpoint runner with unusually careful artifact, cancellation, and test boundaries (<a href="../src/edge_perception/runner.py">runner</a>, <a href="../src/edge_perception/outputs.py">artifact writer</a>, <a href="../tests/test_runner.py">cancellation tests</a>, <a href="checkpoints/eyes-and-stopwatch.md">checkpoint evidence</a>). It is not yet an adaptive-perception or reinforcement-learning system. The shortest honest path forward is to repair two artifact-integrity blockers, preserve the current runner as a compatibility path, and introduce one framework-neutral runtime that recorded replay, Gymnasium, and live transfer all share.</p>
             <p>The detector-versus-tracker scheduling idea is <strong>not novel by itself</strong>. DorT schedules detection versus tracking, SmartTBD applies deep reinforcement learning to tracking-by-detection configuration, and Chanakya learns runtime choices for adaptive perception. See the <a href="https://www.microsoft.com/en-us/research/publication/detect-or-track-towards-cost-effective-video-object-detection-tracking/">DorT primary publication — microsoft.com</a>, <a href="https://doi.org/10.1145/3703912">SmartTBD DOI — doi.org</a>, and <a href="https://proceedings.neurips.cc/paper_files/paper/2023/file/ae2d574d2c309f3a45880e4460efd176-Paper-Conference.pdf">Chanakya paper — proceedings.neurips.cc</a>. The defensible open-source contribution is the <strong>reproducible environment/runtime/evaluation boundary</strong>: pinned inputs and components, explicit actions and budgets, deterministic replay, honest live capture, canonical artifacts, and comparable evaluation.</p>
           </article>
@@ -441,7 +441,7 @@ uv run edge-perception inspect runs/reference-a</pre>
               <tr><td>Runner</td><td>Execute full frame and declared ROIs synchronously, map results, finalize status</td><td><a href="../src/edge_perception/runner.py">runner.py</a>, <a href="../tests/test_runner.py">runner tests</a></td></tr>
               <tr><td>Artifact writer</td><td>Claim an empty directory and publish structured records and terminal summary</td><td><a href="../src/edge_perception/outputs.py">outputs.py</a>, <a href="../tests/test_outputs.py">output tests</a></td></tr>
               <tr><td>Readers</td><td>Project a run for humans or compare semantic schedules/detections</td><td><a href="../src/edge_perception/run_view.py">run_view.py</a>, <a href="../src/edge_perception/compare.py">compare.py</a></td></tr>
-              <tr><td>Native adapters</td><td>Capture video, control the worker, and project canonical results</td><td><a href="../src/edge_perception/capture.py">capture.py</a>, <a href="../src/edge_perception/gui/main_window.py">main_window.py</a></td></tr>
+              <tr><td>Native adapters</td><td>Capture video, control the worker, and project current run results</td><td><a href="../src/edge_perception/capture.py">capture.py</a>, <a href="../src/edge_perception/gui/main_window.py">main_window.py</a></td></tr>
             </tbody>
           </table>
         </div>
@@ -532,19 +532,22 @@ uv run edge-perception inspect runs/reference-a</pre>
           </div>
           <div>
             <span class="label">Initial spaces</span>
-            <pre aria-label="Proposed Gymnasium observation and action spaces">observation_space = Dict({
+            <pre aria-label="Proposed Gymnasium observation and action spaces">NO_PREVIOUS_ACTION = ACTION_COUNT
+
+observation_space = Dict({
   "content": Box(float32, shape=(CONTENT_FEATURES,)),
   "tracks": Box(float32, shape=(MAX_TRACKS, TRACK_FEATURES)),
   "track_mask": MultiBinary(MAX_TRACKS),
   "system": Box(float32, shape=(SYSTEM_FEATURES,)),
-  "last_action": Discrete(ACTION_COUNT),
+  "horizon": Box(float32, low=0.0, high=1.0, shape=(2,)),
+  "last_action": Discrete(ACTION_COUNT + 1),
 })
 
 action_space = Discrete(ACTION_COUNT)</pre>
           </div>
         </div>
         <p><strong>Target:</strong> one single-agent Gymnasium environment wraps the recorded replay backend. Gymnasium’s current API returns <code>(observation, reward, terminated, truncated, info)</code> from <code>step</code> and <code>(observation, info)</code> from <code>reset</code>; separating termination from truncation is important for correct bootstrapping (<a href="https://gymnasium.farama.org/api/env/">Gymnasium Env API — gymnasium.farama.org</a>, <a href="https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/">time-limit guidance — gymnasium.farama.org</a>).</p>
-        <p><code>content</code> must be action-independent for the current frame. <code>tracks</code> and <code>track_mask</code> summarize bounded tracker state. <code>system</code> contains normalized budget remaining, age since last detection, and prior measured costs. The exact feature definitions, normalization constants, <code>MAX_TRACKS</code>, and ordering are versioned environment configuration, not hidden conventions.</p>
+        <p><code>content</code> must be action-independent for the current frame. <code>tracks</code> and <code>track_mask</code> summarize bounded tracker state. <code>system</code> contains normalized budget remaining, age since last detection, and prior measured costs. <code>horizon</code> is the fixed two-element normalized vector <code>[elapsed_fraction, remaining_fraction]</code>, derived from the decision point within the pinned episode's exact natural source horizon and exposed before every decision so natural-end termination remains fully observable. Its exact denominator, endpoint semantics, clipping, and element order are versioned environment configuration. <code>last_action</code> accepts the <code>ACTION_COUNT</code> legal action IDs plus the observation-only <code>NO_PREVIOUS_ACTION = ACTION_COUNT</code> sentinel returned after reset; the policy can never emit that sentinel because <code>action_space</code> remains <code>Discrete(ACTION_COUNT)</code>. The exact feature definitions, normalization constants, <code>MAX_TRACKS</code>, and ordering are versioned environment configuration, not hidden conventions.</p>
         <p><code>info</code> is diagnostic evidence, not a second observation channel. It should include <code>episode_id</code>, <code>frame_index</code>, <code>source_time_ms</code>, <code>action_id</code>, <code>action_spec</code>, actual cost, budget remaining, prediction reference, component revisions, cache key, reward components/availability, violation flags, and terminal reason. A policy must not require <code>info</code> to act.</p>
 
         <div class="columns-3">

@@ -135,7 +135,7 @@ flowchart LR
 | Runner | Execute full frame and declared ROIs synchronously, map results, finalize status | [runner.py](../src/edge_perception/runner.py), [runner tests](../tests/test_runner.py) |
 | Artifact writer | Claim an empty directory and publish structured records and terminal summary | [outputs.py](../src/edge_perception/outputs.py), [output tests](../tests/test_outputs.py) |
 | Readers | Project a run for humans or compare semantic schedules/detections | [run_view.py](../src/edge_perception/run_view.py), [compare.py](../src/edge_perception/compare.py) |
-| Native adapters | Capture video, control the worker, and project canonical results | [capture.py](../src/edge_perception/capture.py), [main_window.py](../src/edge_perception/gui/main_window.py) |
+| Native adapters | Capture video, control the worker, and project current run results | [capture.py](../src/edge_perception/capture.py), [main_window.py](../src/edge_perception/gui/main_window.py) |
 
 ## 5. Recorded replay and live transfer workflows
 
@@ -194,18 +194,21 @@ The runtime core must not import Gymnasium, SB3, RLlib, TorchRL, Qt, or a detect
 The initial spaces should be deliberately small and fixed-shape:
 
 ```text
+NO_PREVIOUS_ACTION = ACTION_COUNT
+
 observation_space = Dict({
   "content": Box(float32, shape=(CONTENT_FEATURES,)),
   "tracks": Box(float32, shape=(MAX_TRACKS, TRACK_FEATURES)),
   "track_mask": MultiBinary(MAX_TRACKS),
   "system": Box(float32, shape=(SYSTEM_FEATURES,)),
-  "last_action": Discrete(ACTION_COUNT),
+  "horizon": Box(float32, low=0.0, high=1.0, shape=(2,)),
+  "last_action": Discrete(ACTION_COUNT + 1),
 })
 
 action_space = Discrete(ACTION_COUNT)
 ```
 
-`content` must be action-independent for the current frame. `tracks` and `track_mask` summarize bounded tracker state. `system` contains normalized budget remaining, age since last detection, and prior measured costs. The exact feature definitions, normalization constants, `MAX_TRACKS`, and ordering are versioned environment configuration, not hidden conventions.
+`content` must be action-independent for the current frame. `tracks` and `track_mask` summarize bounded tracker state. `system` contains normalized budget remaining, age since last detection, and prior measured costs. `horizon` is the fixed two-element normalized vector `[elapsed_fraction, remaining_fraction]`, derived from the decision point within the pinned episode's exact natural source horizon and exposed before every decision so natural-end termination remains fully observable. Its exact denominator, endpoint semantics, clipping, and element order are versioned environment configuration. `last_action` accepts the `ACTION_COUNT` legal action IDs plus the observation-only `NO_PREVIOUS_ACTION = ACTION_COUNT` sentinel returned after reset; the policy can never emit that sentinel because `action_space` remains `Discrete(ACTION_COUNT)`. The exact feature definitions, normalization constants, `MAX_TRACKS`, and ordering are versioned environment configuration, not hidden conventions.
 
 `info` is diagnostic evidence, not a second observation channel. It should include `episode_id`, `frame_index`, `source_time_ms`, `action_id`, `action_spec`, actual cost, budget remaining, prediction reference, component revisions, cache key, reward components/availability, violation flags, and terminal reason. A policy must not require `info` to act.
 
