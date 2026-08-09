@@ -1,0 +1,38 @@
+schema_version = 1
+episodes = [
+    "../data/episodes/MOT17-09",
+]
+output_dir = "../runs/m0-validation-baselines"
+budget_rates = [0.10, 0.25, 0.50, 0.75, 1.00]
+seed = 0
+
+[observation_scales]
+active_tracks = 256.0
+age_s = 2.0
+motion_px_s = 200.0
+time_since_detector_s = 2.0
+
+[tracker]
+factory = "python:squint_rl.reference.bytetrack:tracker_factory"
+
+[[policies]]
+id = "greedy"
+factory = "python:squint_rl.policies:greedy_factory"
+
+[[policies]]
+id = "periodic"
+factory = "python:squint_rl.policies:periodic_factory"
+
+[[policies]]
+id = "scene-change"
+factory = "python:squint_rl.policies:scene_change_factory"
+
+[policies.parameters]
+threshold = 0.20
+
+[[policies]]
+id = "staleness"
+factory = "python:squint_rl.policies:staleness_factory"
+
+[policies.parameters]
+threshold = 0.50
