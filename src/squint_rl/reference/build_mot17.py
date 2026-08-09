@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import re
 import struct
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from squint_rl.artifacts import AtomicRun
 from squint_rl.budget import BudgetConfig, TokenBucket
 from squint_rl.episode import seal_episode
 from squint_rl.reference.bytetrack import ByteTrackAdapter
@@ -28,9 +31,17 @@ from squint_rl.reference.dfine import (
     MODEL_REVISION,
     THRESHOLD,
     WEIGHTS_SHA256,
+    DFineDetector,
+    Precision,
     scene_change_grid,
 )
-from squint_rl.reference.mot17 import Mot17Sequence, sequence_ids
+from squint_rl.reference.mot17 import (
+    Mot17FormatError,
+    Mot17MissingFileError,
+    Mot17Sequence,
+    load_sequence,
+    sequence_ids,
+)
 from squint_rl.tracker import DetectionBatch, TrackBatch, Tracker, TrackerSummary
 
 _ARRAY_NAMES = (
@@ -1388,3 +1399,152 @@ def build_sequence(
         "telemetry": telemetry,
     }
     return RawTrace(sequence.identifier, packed, manifest)
+
+
+class _BuildUsageError(ValueError):
+    """A caller-controlled build request is invalid."""
+
+
+class _BuildDestinationError(FileExistsError):
+    """The outer AtomicRun rejected publication ownership."""
+
+
+def build_partition(
+    mot17_root: str | Path,
+    destination: str | Path,
+    *,
+    partition: str,
+    device: str = "cuda",
+    precision: Precision = "float32",
+    profile: ReferenceProfile | None = None,
+    warmup_frames: int = 10,
+) -> Path:
+    if type(partition) is not str:
+        raise _BuildUsageError("partition must be train, validation, or test")
+    try:
+        identifiers = sequence_ids(partition)
+    except ValueError as error:
+        raise _BuildUsageError(str(error)) from error
+    valid_device = type(device) is str and (
+        device == "cpu" or re.fullmatch(r"cuda(?::(?:0|[1-9][0-9]*))?", device)
+    )
+    if not valid_device:
+        raise _BuildUsageError("device must be cpu, cuda, or cuda:N")
+    if type(precision) is not str or precision not in ("float32", "float16"):
+        raise _BuildUsageError("precision must be float32 or float16")
+    if device == "cpu" and precision == "float16":
+        raise _BuildUsageError("float16 inference is not supported on CPU")
+    if type(warmup_frames) is not int or warmup_frames < 0:
+        raise _BuildUsageError("warmup_frames must be a nonnegative integer")
+    if partition == "train" and profile is not None:
+        raise _BuildUsageError("train partition forbids a reference profile")
+    if partition != "train" and type(profile) is not ReferenceProfile:
+        raise _BuildUsageError(
+            "validation and test partitions require a loaded ReferenceProfile"
+        )
+    detector_identity = _pinned_detector_identity(precision)
+    if profile is not None and _canonical_json(
+        cast(ReferenceProfile, profile).detector_identity
+    ) != _canonical_json(detector_identity):
+        raise _BuildUsageError(
+            "reference profile detector identity does not match requested precision"
+        )
+    transaction = AtomicRun(destination)
+    inside_work = False
+    try:
+        with transaction as work:
+            inside_work = True
+            session = _HardwareSession.create(device)
+            try:
+                if profile is not None:
+                    _validate_identity_matrix(detector_identity, session.hardware_identity)
+                    if _canonical_json(profile.hardware_identity) != _canonical_json(
+                        session.hardware_identity
+                    ):
+                        raise _BuildUsageError(
+                            "reference profile hardware identity does not match runtime"
+                        )
+                sources = [load_sequence(mot17_root, item) for item in identifiers]
+                detector = DFineDetector.load(device=device, precision=precision)
+                traces = [
+                    build_sequence(
+                        source,
+                        detector,
+                        warmup_frames,
+                        detector_identity=detector_identity,
+                        hardware_identity=session.hardware_identity,
+                        telemetry_session=session,
+                    )
+                    for source in sources
+                ]
+                if partition == "train":
+                    selected_profile = profile_training_traces(traces)
+                    selected_profile.write(work / "training-profile.json")
+                else:
+                    selected_profile = cast(ReferenceProfile, profile)
+                for trace in traces:
+                    _seal_trace(
+                        work / f"MOT17-{trace.sequence_id}", trace=trace,
+                        profile=selected_profile, partition=partition,
+                    )
+            except BaseException:
+                with suppress(BaseException):
+                    session.close()
+                raise
+            session.close()
+            inside_work = False
+    except FileExistsError as error:
+        if not inside_work:
+            raise _BuildDestinationError(str(error)) from error
+        raise
+    return transaction.destination
+
+
+def _load_cli_profile(
+    partition: str, manifest: str | None
+) -> tuple[ReferenceProfile | None, Path | None]:
+    if partition == "train":
+        if manifest is not None:
+            raise _BuildUsageError("train partition forbids --profile-manifest")
+        return None, None
+    if manifest is None:
+        raise _BuildUsageError(f"{partition} partition requires --profile-manifest")
+    path = Path(manifest).absolute()
+    try:
+        return ReferenceProfile.load(path), path
+    except ValueError as error:
+        raise _BuildUsageError(str(error)) from error
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m squint_rl.reference.build_mot17")
+    parser.add_argument("--mot17-root", required=True, metavar="PATH")
+    parser.add_argument("--output", required=True, metavar="PATH")
+    parser.add_argument("--partition", required=True, choices=("train", "validation", "test"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precision", choices=("float32", "float16"), default="float32")
+    parser.add_argument("--warmup-frames", type=int, default=10, metavar="N")
+    parser.add_argument("--profile-manifest", metavar="PATH")
+    args = parser.parse_args(argv)
+    try:
+        profile, profile_path = _load_cli_profile(args.partition, args.profile_manifest)
+        output = build_partition(
+            args.mot17_root, args.output, partition=args.partition, device=args.device,
+            precision=args.precision, profile=profile, warmup_frames=args.warmup_frames,
+        )
+    except (_BuildUsageError, _BuildDestinationError, Mot17FormatError, Mot17MissingFileError) as error:
+        message = str(error).replace("\r", r"\r").replace("\n", r"\n")
+        print(f"error: {message}", file=sys.stderr)
+        return 2
+    except Exception as error:  # noqa: BLE001 - runtime boundaries are heterogeneous.
+        message = str(error).replace("\r", r"\r").replace("\n", r"\n")
+        print(f"error: {message}", file=sys.stderr)
+        return 1
+    receipt_profile = output / "training-profile.json" if profile_path is None else profile_path
+    receipt = {"output_dir": str(output), "partition": args.partition, "profile_manifest": str(receipt_profile), "status": "complete"}
+    print(json.dumps(receipt, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

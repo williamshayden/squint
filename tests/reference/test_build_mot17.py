@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from squint_rl.artifacts import AtomicRun
 from squint_rl.episode import Episode
 from squint_rl.episode import seal_episode as real_seal_episode
 from squint_rl.reference import build_mot17 as build_mot17_module
@@ -29,7 +31,7 @@ from squint_rl.reference.build_mot17 import (
     pack_episode_arrays,
     profile_training_traces,
 )
-from squint_rl.reference.mot17 import Mot17Sequence
+from squint_rl.reference.mot17 import Mot17FormatError, Mot17Sequence
 from squint_rl.tracker import (
     DetectionBatch,
     GroundTruthBatch,
@@ -2843,3 +2845,1260 @@ def test_import_does_not_load_heavy_or_hardware_modules() -> None:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def _partition_profile(
+    tmp_path: Path,
+    *,
+    precision: str = "float32",
+    device_type: str = "cpu",
+) -> ReferenceProfile:
+    detector = _detector_identity()
+    detector["precision"] = precision
+    hardware = _hardware_identity(device_type=device_type)
+    return _profile(
+        [
+            _profile_trace(
+                tmp_path,
+                identifier,
+                detector=detector,
+                hardware=hardware,
+                frame_count=2,
+            )
+            for identifier in ("02", "04", "05", "10")
+        ]
+    )
+
+
+def _install_real_partition_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hardware: dict[str, object] | None = None,
+    events: list[str] | None = None,
+) -> list[Any]:
+    identity = _hardware_identity() if hardware is None else hardware
+    sessions: list[Any] = []
+
+    def create_session(_cls: type[object], device: str) -> Any:
+        if events is not None:
+            events.append(f"session:{device}")
+        session = build_mot17_module._HardwareSession(identity)
+        sessions.append(session)
+        return session
+
+    def load_source(root: str | Path, identifier: str) -> Mot17Sequence:
+        if events is not None:
+            events.append(f"source:{identifier}")
+        return _sequence(tmp_path / "sources", frame_count=2, identifier=identifier)
+
+    def load_detector(
+        _cls: type[object],
+        *,
+        device: str,
+        precision: str,
+    ) -> _ConstantDetector:
+        if events is not None:
+            events.append(f"detector:{device}:{precision}")
+        return _ConstantDetector()
+
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession,
+        "create",
+        classmethod(create_session),
+    )
+    monkeypatch.setattr(build_mot17_module, "load_sequence", load_source)
+    monkeypatch.setattr(
+        build_mot17_module.DFineDetector,
+        "load",
+        classmethod(load_detector),
+    )
+    return sessions
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(root).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in sorted(root.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "parameters", "defaults"),
+    [
+        (
+            "build_partition",
+            [
+                "mot17_root",
+                "destination",
+                "partition",
+                "device",
+                "precision",
+                "profile",
+                "warmup_frames",
+            ],
+            {"device": "cuda", "precision": "float32", "profile": None, "warmup_frames": 10},
+        ),
+        ("main", ["argv"], {"argv": None}),
+    ],
+)
+def test_partition_builder_exposes_only_the_binding_callable_contract(
+    name: str,
+    parameters: list[str],
+    defaults: dict[str, object],
+) -> None:
+    function = getattr(build_mot17_module, name)
+    signature = inspect.signature(function)
+    assert list(signature.parameters) == parameters
+    assert {
+        parameter: signature.parameters[parameter].default
+        for parameter in defaults
+    } == defaults
+    if name == "build_partition":
+        assert all(
+            signature.parameters[parameter].kind is inspect.Parameter.KEYWORD_ONLY
+            for parameter in parameters[2:]
+        )
+
+
+def test_train_partition_real_transaction_publishes_exact_replay_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = _install_real_partition_boundaries(tmp_path, monkeypatch)
+    destination = tmp_path / "published" / "train"
+
+    returned = build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        destination,
+        partition="train",
+        device="cpu",
+        warmup_frames=0,
+    )
+
+    assert returned == destination.absolute()
+    assert len(sessions) == 1
+    assert sessions[0].closed is True
+    assert {path.name for path in destination.iterdir()} == {
+        "training-profile.json",
+        "MOT17-02",
+        "MOT17-04",
+        "MOT17-05",
+        "MOT17-10",
+    }
+    profile_path = destination / "training-profile.json"
+    profile = ReferenceProfile.load(profile_path)
+    assert profile_path.read_bytes() == profile.canonical_json.encode("utf-8")
+    for identifier in ("02", "04", "05", "10"):
+        episode_path = destination / f"MOT17-{identifier}"
+        assert {path.name for path in episode_path.iterdir()} == {
+            "manifest.json",
+            "arrays.npz",
+        }
+        episode = Episode.open(episode_path)
+        assert episode.manifest["episode"] == {
+            "id": f"MOT17-{identifier}-FRCNN"
+        }
+        assert episode.manifest["source"]["split"] == "train"  # type: ignore[index]
+        assert episode.manifest["cost_profile"]["profile_sha256"] == (  # type: ignore[index]
+            profile.profile_sha256
+        )
+        np.testing.assert_array_equal(episode.arrays["timestamps_s"], [0.0, 0.04])
+        np.testing.assert_array_equal(
+            episode.arrays["detector_latency_ms"], [5.0, 5.0]
+        )
+        np.testing.assert_array_equal(
+            episode.arrays["det_frame_offsets"], [0, 1, 2]
+        )
+    assert not tuple(destination.parent.glob(f".{destination.name}.*.incomplete"))
+    assert not (destination.parent / f".{destination.name}.publish.lock").exists()
+
+
+def test_partition_order_cardinality_and_shared_objects_are_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    destination = tmp_path / "partition"
+    real_atomic_run = AtomicRun
+
+    class RecordingAtomicRun:
+        def __init__(self, target: str | Path) -> None:
+            self._run = real_atomic_run(target)
+            self.destination = self._run.destination
+
+        def __enter__(self) -> Path:
+            events.append("atomic-enter")
+            return self._run.__enter__()
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object,
+        ) -> bool:
+            events.append("atomic-exit")
+            return self._run.__exit__(exc_type, exc_value, traceback)  # type: ignore[arg-type]
+
+    hardware = _hardware_identity()
+
+    class Session:
+        def __init__(self) -> None:
+            self.hardware_identity = hardware
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append("close")
+
+    session = Session()
+    detector = object()
+    traces = [
+        _sealable_trace(tmp_path, identifier)
+        for identifier in ("02", "04", "05", "10")
+    ]
+    selected_profile = _profile(traces)
+    source_objects = {identifier: object() for identifier in ("02", "04", "05", "10")}
+    detector_identity: object | None = None
+
+    def create_session(_cls: type[object], device: str) -> Session:
+        assert device == "cpu"
+        events.append("session-create")
+        return session
+
+    def load_source(root: str | Path, identifier: str) -> object:
+        assert Path(root) == tmp_path / "MOT17"
+        events.append(f"load:{identifier}")
+        return source_objects[identifier]
+
+    def load_detector(
+        _cls: type[object], *, device: str, precision: str
+    ) -> object:
+        assert (device, precision) == ("cpu", "float32")
+        events.append("detector-load")
+        return detector
+
+    def build_trace(
+        source: object,
+        actual_detector: object,
+        warmup_frames: int,
+        *,
+        detector_identity: Mapping[str, object],
+        hardware_identity: Mapping[str, object],
+        telemetry_session: object,
+    ) -> RawTrace:
+        nonlocal detector_identity_object
+        index = list(source_objects.values()).index(source)
+        identifier = ("02", "04", "05", "10")[index]
+        assert actual_detector is detector
+        assert warmup_frames == 7
+        if detector_identity_object is None:
+            detector_identity_object = detector_identity
+        assert detector_identity is detector_identity_object
+        assert hardware_identity is hardware
+        assert telemetry_session is session
+        events.append(f"build:{identifier}")
+        return traces[index]
+
+    def derive(actual_traces: Sequence[RawTrace]) -> ReferenceProfile:
+        assert list(actual_traces) == traces
+        events.append("profile-derive")
+        return selected_profile
+
+    def write_profile(self: ReferenceProfile, path: str | Path) -> None:
+        assert self is selected_profile
+        assert Path(path).name == "training-profile.json"
+        events.append("profile-write")
+
+    def seal(
+        path: str | Path,
+        *,
+        trace: RawTrace,
+        profile: ReferenceProfile,
+        partition: str,
+    ) -> Path:
+        assert profile is selected_profile
+        assert partition == "train"
+        assert Path(path).name == f"MOT17-{trace.sequence_id}"
+        events.append(f"seal:{trace.sequence_id}")
+        return Path(path)
+
+    def forbidden_direct_seal(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise AssertionError("build_partition must call only _seal_trace")
+
+    detector_identity_object: Mapping[str, object] | None = detector_identity
+    monkeypatch.setattr(build_mot17_module, "AtomicRun", RecordingAtomicRun)
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession, "create", classmethod(create_session)
+    )
+    monkeypatch.setattr(build_mot17_module, "load_sequence", load_source)
+    monkeypatch.setattr(
+        build_mot17_module.DFineDetector, "load", classmethod(load_detector)
+    )
+    monkeypatch.setattr(build_mot17_module, "build_sequence", build_trace)
+    monkeypatch.setattr(build_mot17_module, "profile_training_traces", derive)
+    monkeypatch.setattr(ReferenceProfile, "write", write_profile)
+    monkeypatch.setattr(build_mot17_module, "_seal_trace", seal)
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_direct_seal)
+
+    assert build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        destination,
+        partition="train",
+        device="cpu",
+        warmup_frames=7,
+    ) == destination.absolute()
+    assert session.close_calls == 1
+    assert events == [
+        "atomic-enter",
+        "session-create",
+        "load:02",
+        "load:04",
+        "load:05",
+        "load:10",
+        "detector-load",
+        "build:02",
+        "build:04",
+        "build:05",
+        "build:10",
+        "profile-derive",
+        "profile-write",
+        "seal:02",
+        "seal:04",
+        "seal:05",
+        "seal:10",
+        "close",
+        "atomic-exit",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("partition", "identifiers"),
+    [("validation", ("09",)), ("test", ("11", "13"))],
+)
+def test_frozen_partitions_use_canonical_order_without_copying_or_changing_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    partition: str,
+    identifiers: tuple[str, ...],
+) -> None:
+    profile = _partition_profile(tmp_path / "profile")
+    profile_bytes = profile.canonical_json.encode("utf-8")
+    events: list[str] = []
+    sessions = _install_real_partition_boundaries(
+        tmp_path, monkeypatch, events=events
+    )
+
+    def forbidden_profile(*args: object, **kwargs: object) -> ReferenceProfile:
+        del args, kwargs
+        raise AssertionError("frozen partitions must not derive a profile")
+
+    def forbidden_write(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("frozen partitions must not write a profile")
+
+    monkeypatch.setattr(
+        build_mot17_module, "profile_training_traces", forbidden_profile
+    )
+    monkeypatch.setattr(ReferenceProfile, "write", forbidden_write)
+    destination = tmp_path / partition
+
+    assert build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        destination,
+        partition=partition,
+        device="cpu",
+        profile=profile,
+        warmup_frames=0,
+    ) == destination.absolute()
+
+    assert events == [
+        "session:cpu",
+        *(f"source:{identifier}" for identifier in identifiers),
+        "detector:cpu:float32",
+    ]
+    assert len(sessions) == 1
+    assert sessions[0].closed is True
+    assert {path.name for path in destination.iterdir()} == {
+        f"MOT17-{identifier}" for identifier in identifiers
+    }
+    assert not (destination / "training-profile.json").exists()
+    assert profile.canonical_json.encode("utf-8") == profile_bytes
+    for identifier in identifiers:
+        episode = Episode.open(destination / f"MOT17-{identifier}")
+        assert episode.manifest["source"]["split"] == partition  # type: ignore[index]
+        assert episode.manifest["cost_profile"]["profile_sha256"] == (  # type: ignore[index]
+            profile.profile_sha256
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"partition": "dev"},
+        {"partition": 1},
+        {"partition": "train", "device": "CPU"},
+        {"partition": "train", "device": "cuda:00"},
+        {"partition": "train", "device": "cuda:01"},
+        {"partition": "train", "device": "cuda:-1"},
+        {"partition": "train", "device": "cuda:"},
+        {"partition": "train", "device": 0},
+        {"partition": "train", "precision": "bfloat16"},
+        {"partition": "train", "precision": 32},
+        {"partition": "train", "device": "cpu", "precision": "float16"},
+        {"partition": "train", "warmup_frames": True},
+        {"partition": "train", "warmup_frames": -1},
+        {"partition": "train", "warmup_frames": 1.0},
+        {"partition": "train", "profile": object()},
+        {"partition": "validation", "profile": None},
+        {"partition": "validation", "profile": object()},
+    ],
+)
+def test_invalid_partition_arguments_reject_before_atomic_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, object],
+) -> None:
+    atomic_calls = 0
+
+    def forbidden_atomic_run(destination: str | Path) -> AtomicRun:
+        del destination
+        nonlocal atomic_calls
+        atomic_calls += 1
+        raise AssertionError("validation must precede AtomicRun")
+
+    monkeypatch.setattr(build_mot17_module, "AtomicRun", forbidden_atomic_run)
+    with pytest.raises(ValueError):
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            tmp_path / "destination",
+            **arguments,
+        )
+    assert atomic_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("device", "precision", "device_type"),
+    [
+        ("cpu", "float32", "cpu"),
+        ("cuda", "float32", "cuda"),
+        ("cuda:0", "float16", "cuda"),
+        ("cuda:17", "float32", "cuda"),
+    ],
+)
+def test_fake_device_precision_matrix_builds_without_real_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    precision: str,
+    device_type: str,
+) -> None:
+    hardware = _hardware_identity(device_type=device_type)
+    sessions = _install_real_partition_boundaries(
+        tmp_path, monkeypatch, hardware=hardware
+    )
+    destination = tmp_path / f"{device.replace(':', '-')}-{precision}"
+
+    assert build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        destination,
+        partition="train",
+        device=device,
+        precision=precision,
+        warmup_frames=0,
+    ) == destination.absolute()
+    assert len(sessions) == 1
+    assert sessions[0].closed is True
+
+
+def test_frozen_detector_mismatch_rejects_before_atomic_or_hardware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _partition_profile(tmp_path / "profile")
+    calls: list[str] = []
+
+    def forbidden_atomic(destination: str | Path) -> AtomicRun:
+        del destination
+        calls.append("atomic")
+        raise AssertionError
+
+    def forbidden_session(_cls: type[object], device: str) -> object:
+        del device
+        calls.append("session")
+        raise AssertionError
+
+    monkeypatch.setattr(build_mot17_module, "AtomicRun", forbidden_atomic)
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession,
+        "create",
+        classmethod(forbidden_session),
+    )
+
+    with pytest.raises(ValueError, match="detector"):
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            tmp_path / "destination",
+            partition="validation",
+            device="cuda",
+            precision="float16",
+            profile=profile,
+        )
+    assert calls == []
+
+
+def test_frozen_hardware_mismatch_closes_before_source_model_or_prediction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _partition_profile(tmp_path / "profile")
+    events: list[str] = []
+    sessions = _install_real_partition_boundaries(
+        tmp_path,
+        monkeypatch,
+        hardware=_hardware_identity(device_type="cuda"),
+        events=events,
+    )
+    destination = tmp_path / "destination"
+
+    with pytest.raises(ValueError, match="hardware"):
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            destination,
+            partition="validation",
+            device="cuda",
+            profile=profile,
+        )
+
+    assert events == ["session:cuda"]
+    assert len(sessions) == 1
+    assert sessions[0].closed is True
+    assert not destination.exists()
+
+
+class _PartitionSessionDouble:
+    def __init__(
+        self,
+        hardware_identity: Mapping[str, object],
+        *,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.hardware_identity = hardware_identity
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _install_stub_partition_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session: _PartitionSessionDouble,
+    *,
+    failure_phase: str | None = None,
+    failure: BaseException | None = None,
+    failure_index: int = 0,
+) -> None:
+    identifiers = ("02", "04", "05", "10")
+    traces = [_sealable_trace(tmp_path, identifier) for identifier in identifiers]
+    profile = _profile(traces)
+    sources = {identifier: object() for identifier in identifiers}
+    real_profile_write = ReferenceProfile.write
+    counts = {"source": 0, "trace": 0, "seal": 0}
+
+    def maybe_raise(phase: str, index: int = 0) -> None:
+        if failure_phase == phase and index == failure_index:
+            assert failure is not None
+            raise failure
+
+    def create_session(_cls: type[object], device: str) -> _PartitionSessionDouble:
+        assert device == "cpu"
+        return session
+
+    def load_source(root: str | Path, identifier: str) -> object:
+        del root
+        index = counts["source"]
+        counts["source"] += 1
+        maybe_raise("source", index)
+        return sources[identifier]
+
+    def load_detector(
+        _cls: type[object], *, device: str, precision: str
+    ) -> object:
+        assert (device, precision) == ("cpu", "float32")
+        maybe_raise("model")
+        return object()
+
+    def build_trace(
+        source: object,
+        detector: object,
+        warmup_frames: int,
+        **kwargs: object,
+    ) -> RawTrace:
+        del detector, warmup_frames, kwargs
+        index = counts["trace"]
+        counts["trace"] += 1
+        maybe_raise("trace", index)
+        identifier = next(name for name, value in sources.items() if value is source)
+        return traces[identifiers.index(identifier)]
+
+    def derive(actual_traces: Sequence[RawTrace]) -> ReferenceProfile:
+        assert list(actual_traces) == traces
+        maybe_raise("profile")
+        return profile
+
+    def write_profile(self: ReferenceProfile, path: str | Path) -> None:
+        maybe_raise("write")
+        real_profile_write(self, path)
+
+    def seal(
+        path: str | Path,
+        *,
+        trace: RawTrace,
+        profile: ReferenceProfile,
+        partition: str,
+    ) -> Path:
+        del trace, profile, partition
+        index = counts["seal"]
+        counts["seal"] += 1
+        maybe_raise("seal", index)
+        destination = Path(path)
+        destination.mkdir()
+        (destination / "sentinel").write_bytes(b"sealed")
+        return destination
+
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession, "create", classmethod(create_session)
+    )
+    monkeypatch.setattr(build_mot17_module, "load_sequence", load_source)
+    monkeypatch.setattr(
+        build_mot17_module.DFineDetector, "load", classmethod(load_detector)
+    )
+    monkeypatch.setattr(build_mot17_module, "build_sequence", build_trace)
+    monkeypatch.setattr(build_mot17_module, "profile_training_traces", derive)
+    monkeypatch.setattr(ReferenceProfile, "write", write_profile)
+    monkeypatch.setattr(build_mot17_module, "_seal_trace", seal)
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure_index"),
+    [
+        ("source", 0),
+        ("source", 2),
+        ("model", 0),
+        ("trace", 0),
+        ("trace", 2),
+        ("profile", 0),
+        ("write", 0),
+        ("seal", 0),
+        ("seal", 2),
+    ],
+)
+def test_every_post_create_failure_closes_once_and_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    failure_index: int,
+) -> None:
+    session = _PartitionSessionDouble(_hardware_identity())
+    primary = RuntimeError(f"{phase}-primary")
+    _install_stub_partition_pipeline(
+        tmp_path,
+        monkeypatch,
+        session,
+        failure_phase=phase,
+        failure=primary,
+        failure_index=failure_index,
+    )
+    destination = tmp_path / "destination"
+
+    with pytest.raises(RuntimeError) as caught:
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            destination,
+            partition="train",
+            device="cpu",
+        )
+    assert caught.value is primary
+    assert session.close_calls == 1
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("primary", [RuntimeError("primary"), KeyboardInterrupt(), SystemExit(9)])
+def test_secondary_close_failure_never_masks_primary_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    secondary = RuntimeError("secondary-close")
+    session = _PartitionSessionDouble(
+        _hardware_identity(), close_error=secondary
+    )
+    _install_stub_partition_pipeline(
+        tmp_path,
+        monkeypatch,
+        session,
+        failure_phase="trace",
+        failure=primary,
+    )
+
+    with pytest.raises(type(primary)) as caught:
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            tmp_path / "destination",
+            partition="train",
+            device="cpu",
+        )
+    assert caught.value is primary
+    assert session.close_calls == 1
+    assert caught.value is not secondary
+
+
+def test_lone_close_failure_is_primary_and_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_error = RuntimeError("close-primary")
+    session = _PartitionSessionDouble(
+        _hardware_identity(), close_error=close_error
+    )
+    _install_stub_partition_pipeline(tmp_path, monkeypatch, session)
+    destination = tmp_path / "destination"
+
+    with pytest.raises(RuntimeError) as caught:
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            destination,
+            partition="train",
+            device="cpu",
+        )
+    assert caught.value is close_error
+    assert session.close_calls == 1
+    assert not destination.exists()
+
+
+def test_publication_failure_occurs_after_one_close_and_does_not_close_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from squint_rl import artifacts
+
+    session = _PartitionSessionDouble(_hardware_identity())
+    _install_stub_partition_pipeline(tmp_path, monkeypatch, session)
+    destination = tmp_path / "destination"
+
+    def fail_publish(source: object, target: object) -> None:
+        del source, target
+        raise OSError("publish-primary")
+
+    monkeypatch.setattr(artifacts.os, "replace", fail_publish)
+    with pytest.raises(OSError, match="publish-primary"):
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            destination,
+            partition="train",
+            device="cpu",
+        )
+    assert session.close_calls == 1
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "broken-symlink"])
+def test_outer_destination_rejection_preserves_target_without_starting_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    destination = tmp_path / "destination"
+    if kind == "directory":
+        destination.mkdir()
+        sentinel = destination / "sentinel"
+        sentinel.write_bytes(b"winner")
+    else:
+        destination.symlink_to(tmp_path / "missing")
+        sentinel = None
+    session_calls = 0
+
+    def forbidden_session(_cls: type[object], device: str) -> object:
+        del device
+        nonlocal session_calls
+        session_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession,
+        "create",
+        classmethod(forbidden_session),
+    )
+    with pytest.raises(FileExistsError):
+        build_mot17_module.build_partition(
+            tmp_path / "MOT17",
+            destination,
+            partition="train",
+            device="cpu",
+        )
+    assert session_calls == 0
+    assert os.path.lexists(destination)
+    if sentinel is not None:
+        assert sentinel.read_bytes() == b"winner"
+
+
+def test_competing_atomic_publisher_is_preserved_without_builder_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "destination"
+    session_calls = 0
+
+    def forbidden_session(_cls: type[object], device: str) -> object:
+        del device
+        nonlocal session_calls
+        session_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession,
+        "create",
+        classmethod(forbidden_session),
+    )
+    with AtomicRun(destination) as winner_work:
+        (winner_work / "sentinel").write_bytes(b"winner")
+        with pytest.raises(FileExistsError):
+            build_mot17_module.build_partition(
+                tmp_path / "MOT17",
+                destination,
+                partition="train",
+                device="cpu",
+            )
+        assert not destination.exists()
+
+    assert session_calls == 0
+    assert (destination / "sentinel").read_bytes() == b"winner"
+
+
+def test_two_fake_train_builds_are_artifact_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = _install_real_partition_boundaries(tmp_path, monkeypatch)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        first,
+        partition="train",
+        device="cpu",
+        warmup_frames=0,
+    )
+    build_mot17_module.build_partition(
+        tmp_path / "MOT17",
+        second,
+        partition="train",
+        device="cpu",
+        warmup_frames=0,
+    )
+
+    assert len(sessions) == 2
+    assert all(session.closed for session in sessions)
+    assert _tree_bytes(first) == _tree_bytes(second)
+
+
+def _cli_arguments(
+    tmp_path: Path,
+    *,
+    partition: str = "train",
+    profile_manifest: Path | None = None,
+) -> list[str]:
+    arguments = [
+        "--mot17-root",
+        str(tmp_path / "MOT17"),
+        "--output",
+        str(tmp_path / partition),
+        "--partition",
+        partition,
+    ]
+    if profile_manifest is not None:
+        arguments.extend(["--profile-manifest", str(profile_manifest)])
+    return arguments
+
+
+def test_cli_train_defaults_and_exact_sorted_success_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def build(
+        mot17_root: str | Path,
+        destination: str | Path,
+        *,
+        partition: str,
+        device: str,
+        precision: str,
+        profile: ReferenceProfile | None,
+        warmup_frames: int,
+    ) -> Path:
+        calls.append(
+            {
+                "mot17_root": Path(mot17_root),
+                "destination": Path(destination),
+                "partition": partition,
+                "device": device,
+                "precision": precision,
+                "profile": profile,
+                "warmup_frames": warmup_frames,
+            }
+        )
+        return Path(destination).absolute()
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", build)
+    assert build_mot17_module.main(_cli_arguments(tmp_path)) == 0
+
+    captured = capsys.readouterr()
+    output = (tmp_path / "train").absolute()
+    assert captured.out == json.dumps(
+        {
+            "output_dir": str(output),
+            "partition": "train",
+            "profile_manifest": str(output / "training-profile.json"),
+            "status": "complete",
+        },
+        sort_keys=True,
+    ) + "\n"
+    assert captured.err == ""
+    assert calls == [
+        {
+            "mot17_root": tmp_path / "MOT17",
+            "destination": tmp_path / "train",
+            "partition": "train",
+            "device": "cuda",
+            "precision": "float32",
+            "profile": None,
+            "warmup_frames": 10,
+        }
+    ]
+
+
+def test_cli_loads_strict_frozen_profile_and_reports_supplied_absolute_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile = _partition_profile(tmp_path / "profile-source")
+    profile_path = tmp_path / "frozen-profile.json"
+    profile.write(profile_path)
+
+    def build(
+        mot17_root: str | Path,
+        destination: str | Path,
+        *,
+        partition: str,
+        device: str,
+        precision: str,
+        profile: ReferenceProfile | None,
+        warmup_frames: int,
+    ) -> Path:
+        assert Path(mot17_root) == tmp_path / "MOT17"
+        assert partition == "validation"
+        assert (device, precision, warmup_frames) == ("cuda:3", "float16", 4)
+        assert isinstance(profile, ReferenceProfile)
+        assert profile.canonical_json == globals_profile.canonical_json
+        return Path(destination).absolute()
+
+    globals_profile = profile
+    monkeypatch.setattr(build_mot17_module, "build_partition", build)
+    arguments = _cli_arguments(
+        tmp_path, partition="validation", profile_manifest=profile_path
+    )
+    arguments.extend(
+        ["--device", "cuda:3", "--precision", "float16", "--warmup-frames", "4"]
+    )
+    assert build_mot17_module.main(arguments) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == json.dumps(
+        {
+            "output_dir": str((tmp_path / "validation").absolute()),
+            "partition": "validation",
+            "profile_manifest": str(profile_path.absolute()),
+            "status": "complete",
+        },
+        sort_keys=True,
+    ) + "\n"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--mot17-root", "root"],
+        [
+            "--mot17-root",
+            "root",
+            "--output",
+            "out",
+            "--partition",
+            "unknown",
+        ],
+        [
+            "--mot17-root",
+            "root",
+            "--output",
+            "out",
+            "--partition",
+            "train",
+            "--precision",
+            "bfloat16",
+        ],
+        [
+            "--mot17-root",
+            "root",
+            "--output",
+            "out",
+            "--partition",
+            "train",
+            "--warmup-frames",
+            "not-an-int",
+        ],
+        ["--unknown-option"],
+    ],
+)
+def test_cli_argparse_errors_propagate_standard_system_exit_two(
+    arguments: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        build_mot17_module.main(arguments)
+    assert caught.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("usage: ")
+
+
+@pytest.mark.parametrize(
+    ("partition", "with_profile"),
+    [("train", True), ("validation", False), ("test", False)],
+)
+def test_cli_conditional_profile_errors_are_one_stderr_line_and_exit_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    partition: str,
+    with_profile: bool,
+) -> None:
+    calls = 0
+
+    def forbidden_build(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", forbidden_build)
+    profile_path = tmp_path / "profile.json" if with_profile else None
+    arguments = _cli_arguments(
+        tmp_path, partition=partition, profile_manifest=profile_path
+    )
+
+    assert build_mot17_module.main(arguments) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert captured.err.count("\n") == 1
+    assert calls == 0
+
+
+def test_cli_noncanonical_profile_is_input_error_without_builder_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}\n", encoding="utf-8")
+    calls = 0
+
+    def forbidden_build(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", forbidden_build)
+    assert build_mot17_module.main(
+        _cli_arguments(
+            tmp_path, partition="validation", profile_manifest=profile_path
+        )
+    ) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert captured.err.count("\n") == 1
+    assert calls == 0
+
+
+def test_cli_strict_mot17_error_is_input_exit_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = Mot17FormatError(
+        "bad source inventory",
+        sequence="02",
+        path=tmp_path / "MOT17",
+    )
+
+    def fail_build(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise error
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", fail_build)
+    assert build_mot17_module.main(_cli_arguments(tmp_path)) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {error}\n"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("runtime-value"), FileExistsError("inner-seal"), RuntimeError("two\nlines")],
+)
+def test_cli_does_not_broadly_misclassify_runtime_value_or_inner_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    def fail_build(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise error
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", fail_build)
+    assert build_mot17_module.main(_cli_arguments(tmp_path)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    expected = str(error).replace("\r", r"\r").replace("\n", r"\n")
+    assert captured.err == f"error: {expected}\n"
+
+
+def test_cli_outer_existing_destination_is_input_exit_two_without_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    destination = tmp_path / "train"
+    destination.mkdir()
+    (destination / "sentinel").write_bytes(b"winner")
+    session_calls = 0
+
+    def forbidden_session(_cls: type[object], device: str) -> object:
+        del device
+        nonlocal session_calls
+        session_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(
+        build_mot17_module._HardwareSession,
+        "create",
+        classmethod(forbidden_session),
+    )
+    assert build_mot17_module.main(
+        [*_cli_arguments(tmp_path), "--device", "cpu"]
+    ) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: completed run already exists:")
+    assert session_calls == 0
+    assert (destination / "sentinel").read_bytes() == b"winner"
+
+
+def test_cli_inner_seal_exists_and_publication_failure_are_runtime_exit_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from squint_rl import artifacts
+
+    session = _PartitionSessionDouble(_hardware_identity())
+    inner_error = FileExistsError("inner-seal")
+    _install_stub_partition_pipeline(
+        tmp_path,
+        monkeypatch,
+        session,
+        failure_phase="seal",
+        failure=inner_error,
+    )
+    assert build_mot17_module.main(
+        [*_cli_arguments(tmp_path), "--device", "cpu"]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: inner-seal\n"
+    assert session.close_calls == 1
+
+    second_root = tmp_path / "publication"
+    second_session = _PartitionSessionDouble(_hardware_identity())
+    _install_stub_partition_pipeline(second_root, monkeypatch, second_session)
+
+    def fail_publish(source: object, target: object) -> None:
+        del source, target
+        raise OSError("publish-failed")
+
+    monkeypatch.setattr(artifacts.os, "replace", fail_publish)
+    assert build_mot17_module.main(
+        [*_cli_arguments(second_root), "--device", "cpu"]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: publish-failed\n"
+    assert second_session.close_calls == 1
+
+
+@pytest.mark.parametrize("primary", [KeyboardInterrupt(), SystemExit(7)])
+def test_cli_process_control_exceptions_propagate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    def fail_build(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise primary
+
+    monkeypatch.setattr(build_mot17_module, "build_partition", fail_build)
+    with pytest.raises(type(primary)) as caught:
+        build_mot17_module.main(_cli_arguments(tmp_path))
+    assert caught.value is primary
+
+
+def test_python_m_module_guard_exposes_only_the_binding_parser() -> None:
+    root = Path(__file__).parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(root / "src")
+    completed = subprocess.run(
+        [sys.executable, "-m", "squint_rl.reference.build_mot17", "--help"],
+        cwd=root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    for option in (
+        "--mot17-root",
+        "--output",
+        "--partition",
+        "--device",
+        "--precision",
+        "--warmup-frames",
+        "--profile-manifest",
+    ):
+        assert option in completed.stdout
+    assert "episode" not in completed.stdout
+    assert "benchmark" not in completed.stdout
