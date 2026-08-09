@@ -35,11 +35,12 @@ def _observation_prefix_digest(observations: list[dict[str, np.ndarray]]) -> str
         for key in _OBSERVATION_KEYS:
             value = observation[key]
             assert type(value) is np.ndarray
-            assert value.dtype == np.dtype("<f4")
+            assert value.dtype.kind == "f"
+            assert value.dtype.itemsize == 4
             assert value.shape == _OBSERVATION_SHAPES[key]
-            assert value.flags.c_contiguous
+            canonical_value = np.asarray(value, dtype="<f4", order="C")
             key_bytes = key.encode("utf-8")
-            payload = value.tobytes(order="C")
+            payload = canonical_value.tobytes(order="C")
             digest.update(struct.pack(">Q", len(key_bytes)))
             digest.update(key_bytes)
             digest.update(struct.pack(">Q", len(payload)))
@@ -73,6 +74,50 @@ def test_canonical_observation_prefix_zero_fixture() -> None:
     assert _observation_prefix_digest([zero_observation]) == (
         "76b144cbc5dc5e7a000c1d1545cf3471f655ef290eff7a4710bdc62e1585c8d1"
     )
+
+
+def test_observation_digest_canonicalizes_float32_layout_and_endianness() -> None:
+    native_zero = {
+        "scene_change": np.zeros((3, 3), dtype=np.float32),
+        "tracker_state": np.zeros(6, dtype=np.float32),
+        "compute_budget": np.zeros(5, dtype=np.float32),
+    }
+    equivalent_zero = {
+        "scene_change": np.zeros((3, 3), dtype=np.float32, order="F"),
+        "tracker_state": np.zeros(6, dtype=">f4"),
+        "compute_budget": np.zeros(5, dtype=np.float32),
+    }
+
+    assert _observation_prefix_digest([equivalent_zero]) == _observation_prefix_digest(
+        [native_zero]
+    )
+
+
+def test_observation_digest_rejects_non_float32_or_malformed_values() -> None:
+    def zero_observation() -> dict[str, np.ndarray]:
+        return {
+            "scene_change": np.zeros((3, 3), dtype=np.float32),
+            "tracker_state": np.zeros(6, dtype=np.float32),
+            "compute_budget": np.zeros(5, dtype=np.float32),
+        }
+
+    invalid_observations = []
+    float64_observation = zero_observation()
+    float64_observation["scene_change"] = np.zeros((3, 3), dtype=np.float64)
+    invalid_observations.append(float64_observation)
+    object_observation = zero_observation()
+    object_observation["tracker_state"] = np.zeros(6, dtype=object)
+    invalid_observations.append(object_observation)
+    wrong_shape_observation = zero_observation()
+    wrong_shape_observation["compute_budget"] = np.zeros(4, dtype=np.float32)
+    invalid_observations.append(wrong_shape_observation)
+    wrong_type_observation = zero_observation()
+    wrong_type_observation["scene_change"] = [[0.0] * 3] * 3  # type: ignore[assignment]
+    invalid_observations.append(wrong_type_observation)
+
+    for invalid_observation in invalid_observations:
+        with pytest.raises(AssertionError):
+            _observation_prefix_digest([invalid_observation])
 
 
 def test_canonical_requested_action_prefix_111_fixture() -> None:
@@ -130,6 +175,23 @@ def _rollout_prefix(
         applied_actions=tuple(applied_actions),
         rewards=tuple(rewards),
     )
+
+
+def _byte_identical(left: np.ndarray, right: np.ndarray) -> bool:
+    return (
+        left.dtype == right.dtype
+        and left.shape == right.shape
+        and left.nbytes == right.nbytes
+        and left.tobytes(order="C") == right.tobytes(order="C")
+    )
+
+
+def test_numeric_equality_does_not_imply_byte_identity() -> None:
+    float_values = np.array([1], dtype=np.float32)
+    integer_values = np.array([1], dtype=np.int32)
+
+    assert np.array_equal(float_values, integer_values)
+    assert not _byte_identical(float_values, integer_values)
 
 
 def _valid_gt_rows(arrays: dict[str, np.ndarray], frames: range) -> np.ndarray:
@@ -197,14 +259,12 @@ def paired_prefix_envs(tmp_path: Path) -> tuple[tuple[Any, Any, Episode, Episode
         assert left_source.content_sha256 != right_source.content_sha256
         assert set(left_source.arrays) == set(right_source.arrays)
         for array_name in left_source.arrays:
-            if array_name == changed_array:
-                assert not np.array_equal(
-                    left_source.arrays[array_name], right_source.arrays[array_name]
-                )
-            else:
-                np.testing.assert_array_equal(
-                    left_source.arrays[array_name], right_source.arrays[array_name]
-                )
+            left_array = left_source.arrays[array_name]
+            right_array = right_source.arrays[array_name]
+            assert left_array.dtype == right_array.dtype
+            assert left_array.shape == right_array.shape
+            assert left_array.nbytes == right_array.nbytes
+            assert _byte_identical(left_array, right_array) is (array_name != changed_array)
         left_episode: Any = left_source.slice(2, 5) if use_view else left_source
         right_episode: Any = right_source.slice(2, 5) if use_view else right_source
         assert left_episode.content_sha256 != right_episode.content_sha256
