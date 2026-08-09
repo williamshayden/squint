@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -209,6 +210,175 @@ def test_metadata_is_strict_and_paths_are_contained(tmp_path: Path) -> None:
         with pytest.raises(Mot17FormatError, match=field):
             load_sequence(tmp_path, "02")
         seqinfo.write_text(original, encoding="utf-8")
+
+
+def test_sequence_fields_cannot_be_inherited_from_defaults(tmp_path: Path) -> None:
+    source = _write_sequence(tmp_path)
+    (source / "seqinfo.ini").write_text(
+        "[DEFAULT]\n"
+        "name=MOT17-02-FRCNN\n"
+        "imDir=img1\n"
+        "frameRate=30\n"
+        "seqLength=3\n"
+        "imWidth=100\n"
+        "imHeight=80\n"
+        "imExt=.jpg\n"
+        "[Sequence]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(tmp_path, "02")
+    assert caught.value.field == "DEFAULT"
+    assert caught.value.path == source / "seqinfo.ini"
+
+
+@pytest.mark.parametrize("image_dir", (r"D:img1", r"D:\img1", r"\img1"))
+def test_windows_anchored_image_directories_are_not_portable(
+    tmp_path: Path, image_dir: str
+) -> None:
+    source = _write_sequence(tmp_path)
+    seqinfo = source / "seqinfo.ini"
+    seqinfo.write_text(
+        seqinfo.read_text(encoding="utf-8").replace("imDir=img1", f"imDir={image_dir}"),
+        encoding="utf-8",
+    )
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(tmp_path, "02")
+    assert caught.value.field == "imDir"
+    assert caught.value.value == image_dir
+
+
+def test_identity_must_fit_the_output_int64_representation(tmp_path: Path) -> None:
+    too_large = np.iinfo(np.int64).max + 1
+    _write_sequence(
+        tmp_path,
+        length=1,
+        rows=(f"1,{too_large},10,20,30,40,1,1,1",),
+    )
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(tmp_path, "02")
+    assert caught.value.field == "identity"
+    assert caught.value.line == 1
+    assert caught.value.value == str(too_large)
+
+
+def test_geometry_must_fit_the_output_float32_representation(tmp_path: Path) -> None:
+    _write_sequence(
+        tmp_path,
+        length=1,
+        width=10**40,
+        rows=("1,1,1,1,1e39,1,1,1,1",),
+    )
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(tmp_path, "02")
+    assert caught.value.field == "geometry"
+    assert caught.value.line == 1
+
+
+@pytest.mark.parametrize("failure", (RuntimeError("loop"), OSError("unreadable")))
+def test_image_directory_resolution_errors_are_contextual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    _write_sequence(tmp_path)
+    real_resolve = Path.resolve
+
+    def fail_image_resolution(path: Path, strict: bool = False) -> Path:
+        if path.name == "img1":
+            raise failure
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_image_resolution)
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(tmp_path, "02")
+    assert caught.value.field == "imDir"
+    assert caught.value.value == "img1"
+
+
+@pytest.mark.parametrize("failure_point", ("open", "read"))
+def test_gt_io_errors_are_contextual(
+    mot17_fixture: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    gt = mot17_fixture / "train" / "MOT17-02-FRCNN" / "gt" / "gt.txt"
+    real_open = Path.open
+
+    class BrokenReader(StringIO):
+        def __next__(self) -> str:
+            raise OSError("read failed")
+
+    def fail_gt_io(path: Path, *args: object, **kwargs: object):
+        if path == gt:
+            if failure_point == "open":
+                raise OSError("open failed")
+            return BrokenReader("1,1,10,20,30,40,1,1,1\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_gt_io)
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(mot17_fixture, "02")
+    assert caught.value.path == gt
+    assert caught.value.field == "gt"
+
+
+@pytest.mark.parametrize("operation", ("directory-stat", "image-stat"))
+def test_image_stat_errors_are_contextual(
+    mot17_fixture: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    if operation == "directory-stat":
+        real_is_dir = Path.is_dir
+
+        def fail_image_directory_stat(path: Path) -> bool:
+            if path.name == "img1":
+                raise OSError("directory stat failed")
+            return real_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", fail_image_directory_stat)
+    else:
+        real_is_file = Path.is_file
+
+        def fail_source_image_stat(path: Path) -> bool:
+            if path.name == "000001.jpg":
+                raise OSError("image stat failed")
+            return real_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", fail_source_image_stat)
+
+    with pytest.raises(Mot17FormatError) as caught:
+        load_sequence(mot17_fixture, "02")
+    assert caught.value.field in {"imDir", "images"}
+
+
+@pytest.mark.parametrize("operation", ("directory-stat", "image-stat"))
+def test_image_stat_disappearance_uses_missing_file_contract(
+    mot17_fixture: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    if operation == "directory-stat":
+        real_is_dir = Path.is_dir
+
+        def lose_image_directory(path: Path) -> bool:
+            if path.name == "img1":
+                raise FileNotFoundError("image directory disappeared")
+            return real_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", lose_image_directory)
+    else:
+        real_is_file = Path.is_file
+
+        def lose_source_image(path: Path) -> bool:
+            if path.name == "000001.jpg":
+                raise FileNotFoundError("source image disappeared")
+            return real_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", lose_source_image)
+
+    with pytest.raises(Mot17MissingFileError) as caught:
+        load_sequence(mot17_fixture, "02")
+    assert caught.value.field in {"imDir", "images"}
 
 
 def test_noncanonical_identifiers_are_rejected(tmp_path: Path) -> None:

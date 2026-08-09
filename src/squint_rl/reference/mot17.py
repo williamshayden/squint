@@ -22,6 +22,7 @@ _PARTITIONS: Final[dict[str, tuple[str, ...]]] = {
     "test": TEST,
 }
 _IDENTIFIERS: Final[frozenset[str]] = frozenset(TRAIN + VALIDATION + TEST)
+_INT64_MAX: Final[int] = int(np.iinfo(np.int64).max)
 _DECIMAL_INTEGER = re.compile(r"^[+-]?[0-9]+$")
 _EXTENSION = re.compile(r"^\.[A-Za-z0-9]+$")
 _REQUIRED_SEQUENCE_FIELDS: Final[tuple[str, ...]] = (
@@ -116,7 +117,6 @@ class Mot17Sequence:
 
 @dataclass(frozen=True, slots=True)
 class _GroundTruthRow:
-    line: int
     identity: int
     class_id: int
     box: FloatArray
@@ -271,6 +271,12 @@ def _read_sequence_info(
     try:
         with path.open(encoding="utf-8") as stream:
             parser.read_file(stream)
+    except FileNotFoundError as error:
+        raise _missing(
+            "missing seqinfo.ini",
+            sequence=identifier,
+            path=path,
+        ) from error
     except (configparser.Error, OSError, UnicodeError) as error:
         raise _format(
             "invalid seqinfo.ini",
@@ -282,6 +288,15 @@ def _read_sequence_info(
             "seqinfo.ini must contain exactly one [Sequence] section",
             sequence=identifier,
             path=path,
+        )
+    defaults = parser.defaults()
+    if defaults:
+        raise _format(
+            "seqinfo.ini must not define inherited DEFAULT values",
+            sequence=identifier,
+            path=path,
+            field="DEFAULT",
+            value=",".join(sorted(defaults)),
         )
     info = parser["Sequence"]
     for field in _REQUIRED_SEQUENCE_FIELDS:
@@ -309,6 +324,8 @@ def _read_sequence_info(
         not image_dir_value
         or posix_dir.is_absolute()
         or windows_dir.is_absolute()
+        or bool(windows_dir.drive)
+        or bool(windows_dir.root)
         or ".." in posix_dir.parts
         or ".." in windows_dir.parts
     ):
@@ -322,9 +339,10 @@ def _read_sequence_info(
     image_dir = source_dir / Path(image_dir_value)
     try:
         image_dir.relative_to(source_dir)
+        source_dir_resolved = source_dir.resolve(strict=False)
         image_dir_resolved = image_dir.resolve(strict=False)
-        image_dir_resolved.relative_to(source_dir.resolve(strict=False))
-    except ValueError as error:
+        image_dir_resolved.relative_to(source_dir_resolved)
+    except (ValueError, RuntimeError, OSError) as error:
         raise _format(
             "imDir must remain contained by the sequence directory",
             sequence=identifier,
@@ -332,7 +350,7 @@ def _read_sequence_info(
             field="imDir",
             value=image_dir_value,
         ) from error
-    if image_dir_resolved == source_dir.resolve(strict=False):
+    if image_dir_resolved == source_dir_resolved:
         raise _format(
             "imDir must name a contained image directory",
             sequence=identifier,
@@ -340,7 +358,25 @@ def _read_sequence_info(
             field="imDir",
             value=image_dir_value,
         )
-    if not image_dir.is_dir():
+    try:
+        image_dir_exists = image_dir.is_dir()
+    except FileNotFoundError as error:
+        raise _missing(
+            "missing image directory",
+            sequence=identifier,
+            path=image_dir,
+            field="imDir",
+            value=image_dir_value,
+        ) from error
+    except (RuntimeError, OSError) as error:
+        raise _format(
+            "unable to inspect image directory",
+            sequence=identifier,
+            path=image_dir,
+            field="imDir",
+            value=image_dir_value,
+        ) from error
+    if not image_dir_exists:
         raise _missing(
             "missing image directory",
             sequence=identifier,
@@ -400,8 +436,15 @@ def _read_images(
     expected_names = {f"{frame:06d}{extension}" for frame in range(1, length + 1)}
     try:
         entries = tuple(image_dir.iterdir())
-    except OSError as error:
+    except FileNotFoundError as error:
         raise _missing(
+            "missing image directory",
+            sequence=sequence,
+            path=image_dir,
+            field="imDir",
+        ) from error
+    except (RuntimeError, OSError) as error:
+        raise _format(
             "unable to enumerate image directory",
             sequence=sequence,
             path=image_dir,
@@ -429,7 +472,25 @@ def _read_images(
             value=missing[0],
         )
     for entry in entries:
-        if not entry.is_file():
+        try:
+            is_file = entry.is_file()
+        except FileNotFoundError as error:
+            raise _missing(
+                "missing expected source frame",
+                sequence=sequence,
+                path=entry,
+                field="images",
+                value=entry.name,
+            ) from error
+        except (RuntimeError, OSError) as error:
+            raise _format(
+                "unable to inspect source image",
+                sequence=sequence,
+                path=entry,
+                field="images",
+                value=entry.name,
+            ) from error
+        if not is_file:
             raise _format(
                 "source image inventory entry is not a file",
                 sequence=sequence,
@@ -448,15 +509,26 @@ def _read_ground_truth(
     frame_width: int,
     frame_height: int,
 ) -> tuple[GroundTruthBatch, ...]:
-    if not path.is_file():
+    try:
+        gt_exists = path.is_file()
+    except (RuntimeError, OSError) as error:
+        raise _format(
+            "unable to inspect gt.txt",
+            sequence=identifier,
+            path=path,
+            field="gt",
+        ) from error
+    if not gt_exists:
         raise _missing("missing gt.txt", sequence=identifier, path=path)
     rows: list[list[_GroundTruthRow]] = [[] for _ in range(length)]
     seen: dict[tuple[int, int], int] = {}
+    last_line = 0
     try:
         with path.open(newline="", encoding="utf-8") as stream:
             reader = csv.reader(stream)
             for row in reader:
                 line = reader.line_num
+                last_line = line
                 if len(row) != 9:
                     raise _format(
                         "gt.txt rows must contain exactly 9 columns",
@@ -490,6 +562,15 @@ def _read_ground_truth(
                 if identity < 1:
                     raise _format(
                         "identity must be positive",
+                        sequence=identifier,
+                        path=path,
+                        line=line,
+                        field="identity",
+                        value=row[1],
+                    )
+                if identity > _INT64_MAX:
+                    raise _format(
+                        "identity exceeds the int64 output representation",
                         sequence=identifier,
                         path=path,
                         line=line,
@@ -571,10 +652,24 @@ def _read_ground_truth(
                         value=f"{frame},{identity}; line {previous_line}",
                     )
                 seen[key] = line
-                box = cast(FloatArray, np.array([x1, y1, x2, y2], dtype=np.float32))
+                with np.errstate(over="ignore", invalid="ignore"):
+                    box = cast(
+                        FloatArray,
+                        np.array([x1, y1, x2, y2], dtype=np.float32),
+                    )
+                if not np.all(np.isfinite(box)) or not (
+                    box[0] < box[2] and box[1] < box[3]
+                ):
+                    raise _format(
+                        "geometry cannot be represented as a finite float32 box",
+                        sequence=identifier,
+                        path=path,
+                        line=line,
+                        field="geometry",
+                        value=",".join(row[2:6]),
+                    )
                 rows[frame - 1].append(
                     _GroundTruthRow(
-                        line=line,
                         identity=identity,
                         class_id=class_id,
                         box=box,
@@ -583,8 +678,24 @@ def _read_ground_truth(
                         ignore=mark == 1 and class_id in DISTRACTOR_CLASSES,
                     )
                 )
+    except FileNotFoundError as error:
+        raise _missing("missing gt.txt", sequence=identifier, path=path) from error
+    except OSError as error:
+        raise _format(
+            "unable to read gt.txt",
+            sequence=identifier,
+            path=path,
+            line=last_line + 1,
+            field="gt",
+        ) from error
     except csv.Error as error:
-        raise _format("invalid CSV in gt.txt", sequence=identifier, path=path) from error
+        raise _format(
+            "invalid CSV in gt.txt",
+            sequence=identifier,
+            path=path,
+            line=last_line + 1,
+            field="gt",
+        ) from error
     except UnicodeError as error:
         raise _format("gt.txt is not valid UTF-8", sequence=identifier, path=path) from error
     return tuple(_batch(frame_rows) for frame_rows in rows)
