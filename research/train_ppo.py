@@ -11,10 +11,10 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 
-from squint_rl.budget import BudgetConfig  # type: ignore[import-untyped]
-from squint_rl.env import Info, SquintEnv  # type: ignore[import-untyped]
-from squint_rl.episode import Episode  # type: ignore[import-untyped]
-from squint_rl.tracker import (  # type: ignore[import-untyped]
+from squint_rl.budget import BudgetConfig
+from squint_rl.env import Info, SquintEnv
+from squint_rl.episode import Episode
+from squint_rl.tracker import (
     Observation,
     ObservationScales,
     PolicyContext,
@@ -252,9 +252,7 @@ class WindowSamplerEnv(gym.Env[Observation, int]):
     def step(self, action: int) -> tuple[Observation, float, bool, bool, Info]:
         if self._inner is None:
             raise RuntimeError("reset must be called before step")
-        return cast(
-            tuple[Observation, float, bool, bool, Info], self._inner.step(action)
-        )
+        return self._inner.step(action)
 
 
 class SceneChangeMask(gym.ObservationWrapper[Observation, int, Observation]):
