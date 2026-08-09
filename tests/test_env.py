@@ -53,6 +53,7 @@ def make_env(
     tracker: RecordingTracker | None = None,
     *,
     nominal_rate: float = 0.25,
+    budget: BudgetConfig | None = None,
 ) -> tuple[Any, RecordingTracker]:
     squint_env, _skip, _run_detector = _env_types()
     recording_tracker = tracker if tracker is not None else RecordingTracker()
@@ -60,10 +61,14 @@ def make_env(
         squint_env(
             episode=episode,
             tracker=recording_tracker,
-            budget=BudgetConfig.for_rate(
-                reserve_ms=10.0,
-                source_fps=episode.fps,
-                nominal_rate=nominal_rate,
+            budget=(
+                budget
+                if budget is not None
+                else BudgetConfig.for_rate(
+                    reserve_ms=10.0,
+                    source_fps=episode.fps,
+                    nominal_rate=nominal_rate,
+                )
             ),
             observation_scales=ObservationScales(8.0, 5.0, 20.0, 5.0),
         ),
@@ -129,6 +134,35 @@ def test_reset_returns_only_causal_frame_zero_observation(sealed_episode: Episod
     assert not {"frame_index", "duration", "remaining_frames", "detections", "cost", "ground_truth"} & set(
         observation
     )
+
+
+def test_constructor_accepts_refill_rate_at_observation_upper_bound(
+    sealed_episode: Episode,
+) -> None:
+    budget = BudgetConfig(
+        reserve_ms=10.0,
+        capacity_ms=20.0,
+        refill_ms_per_s=sealed_episode.fps * 10.0,
+    )
+    env, _tracker = make_env(sealed_episode, budget=budget)
+
+    observation, _info = env.reset(seed=0)
+
+    assert observation["compute_budget"][1] == 1.0
+    assert env.observation_space.contains(observation)
+
+
+def test_constructor_rejects_refill_rate_above_observation_upper_bound(
+    sealed_episode: Episode,
+) -> None:
+    budget = BudgetConfig(
+        reserve_ms=10.0,
+        capacity_ms=20.0,
+        refill_ms_per_s=sealed_episode.fps * 10.0 + 0.01,
+    )
+
+    with pytest.raises(ValueError, match="normalized refill rate"):
+        make_env(sealed_episode, budget=budget)
 
 
 def test_admitted_run_steps_tracker_then_charges_actual_latency(sealed_episode: Episode) -> None:
@@ -203,11 +237,14 @@ def test_skip_passes_none_and_empty_detector_result_stays_a_measurement(tmp_path
     _squint_env, skip, run_detector = _env_types()
     env.reset(seed=0)
     env.step(skip)
-    env.step(run_detector)
+    _observation, _reward, _terminated, _truncated, info = env.step(run_detector)
 
     assert tracker.measurements[0] is None
     assert tracker.measurements[1] is not None
     assert len(tracker.measurements[1]) == 0
+    assert info["applied_action"] == run_detector
+    assert info["charged_ms"] == 10.0
+    assert info["detector_calls"] == 1
 
 
 def test_reset_clears_tracker_reward_and_histories(sealed_episode: Episode) -> None:
@@ -267,7 +304,8 @@ def test_episode_terminates_after_every_frame_without_truncation(sealed_episode:
 
 def test_invalid_actions_and_lifecycle_errors_do_not_mutate_state(sealed_episode: Episode) -> None:
     env, tracker = make_env(sealed_episode)
-    _squint_env, skip, _run_detector = _env_types()
+    control, control_tracker = make_env(sealed_episode)
+    _squint_env, skip, run_detector = _env_types()
 
     with pytest.raises(RuntimeError, match="reset"):
         env.step(skip)
@@ -275,13 +313,40 @@ def test_invalid_actions_and_lifecycle_errors_do_not_mutate_state(sealed_episode
     assert tracker.measurements == []
 
     env.reset(seed=0)
+    control.reset(seed=0)
     for action in (-1, 2, 0.0, True, "run"):
         with pytest.raises(ValueError, match="action"):
             env.step(action)
-    assert env.action_history == []
-    assert tracker.measurements == []
 
-    for _frame_index in range(sealed_episode.frame_count):
+    observation, reward, terminated, truncated, info = env.step(run_detector)
+    control_observation, control_reward, control_terminated, control_truncated, control_info = control.step(
+        run_detector
+    )
+    for key, value in observation.items():
+        np.testing.assert_array_equal(value, control_observation[key])
+    assert reward == control_reward
+    assert terminated == control_terminated
+    assert truncated == control_truncated
+    assert info == control_info
+    assert env.action_history == control.action_history
+    assert len(env.track_history) == len(control.track_history)
+    for tracks, control_tracks in zip(env.track_history, control.track_history, strict=True):
+        np.testing.assert_array_equal(tracks.boxes_xyxy, control_tracks.boxes_xyxy)
+        np.testing.assert_array_equal(tracks.track_ids, control_tracks.track_ids)
+        np.testing.assert_array_equal(tracks.class_ids, control_tracks.class_ids)
+        np.testing.assert_array_equal(tracks.scores, control_tracks.scores)
+    assert len(tracker.measurements) == len(control_tracker.measurements)
+    for measurement, control_measurement in zip(
+        tracker.measurements, control_tracker.measurements, strict=True
+    ):
+        assert (measurement is None) == (control_measurement is None)
+        if measurement is not None:
+            assert control_measurement is not None
+            np.testing.assert_array_equal(measurement.boxes_xyxy, control_measurement.boxes_xyxy)
+            np.testing.assert_array_equal(measurement.scores, control_measurement.scores)
+            np.testing.assert_array_equal(measurement.class_ids, control_measurement.class_ids)
+
+    for _frame_index in range(sealed_episode.frame_count - 1):
         _observation, _reward, terminated, _truncated, _info = env.step(skip)
     assert terminated
     history = list(env.action_history)

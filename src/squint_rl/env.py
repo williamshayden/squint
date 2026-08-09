@@ -27,6 +27,9 @@ class SquintEnv(gym.Env[Observation, int]):
         budget: BudgetConfig,
         observation_scales: ObservationScales,
     ) -> None:
+        normalized_refill_rate = budget.refill_ms_per_s / (episode.fps * budget.reserve_ms)
+        if normalized_refill_rate > 1.0:
+            raise ValueError("normalized refill rate must not exceed 1.0")
         self.metadata = {"render_modes": []}
         self.episode = episode
         self.tracker = tracker
