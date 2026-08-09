@@ -6,7 +6,7 @@ import gymnasium as gym
 import numpy as np
 
 from .budget import BudgetConfig, TokenBucket
-from .episode import Episode
+from .episode import Episode, EpisodeView
 from .reward import MatchCounts, RewardState
 from .tracker import FloatArray, Observation, ObservationScales, TrackBatch, Tracker
 
@@ -22,7 +22,7 @@ class SquintEnv(gym.Env[Observation, int]):
     def __init__(
         self,
         *,
-        episode: Episode,
+        episode: Episode | EpisodeView,
         tracker: Tracker,
         budget: BudgetConfig,
         observation_scales: ObservationScales,
@@ -78,7 +78,12 @@ class SquintEnv(gym.Env[Observation, int]):
         self._terminated = False
         self._started = True
         self.bucket.reset(timestamp_s=self._current_timestamp_s)
-        return self._observation(self._scene_change_at(self._frame_index)), {}
+        scene_change = (
+            None
+            if isinstance(self.episode, EpisodeView)
+            else self._scene_change_at(self._frame_index)
+        )
+        return self._observation(scene_change), {}
 
     def step(self, action: int) -> tuple[Observation, float, bool, bool, Info]:
         self._validate_step(action)
@@ -131,10 +136,10 @@ class SquintEnv(gym.Env[Observation, int]):
             raise ValueError("action must be SKIP (0) or RUN_DETECTOR (1)")
 
     def _timestamp_at(self, frame_index: int) -> float:
-        return float(self.episode.arrays["timestamps_s"][frame_index])
+        return self.episode.frame(frame_index).timestamp_s
 
     def _scene_change_at(self, frame_index: int) -> FloatArray:
-        return np.array(self.episode.arrays["scene_change"][frame_index], dtype=np.float32, copy=True)
+        return self.episode.frame(frame_index).scene_change
 
     def _tracker_vector(self) -> FloatArray:
         summary = self.tracker.summary()

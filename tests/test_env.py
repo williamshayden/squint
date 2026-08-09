@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -12,7 +13,7 @@ from gymnasium.utils.env_checker import check_env
 
 from conftest import RecordingTracker, reseal_variant
 from squint_rl.budget import BudgetConfig
-from squint_rl.episode import Episode
+from squint_rl.episode import Episode, EpisodeView, ReplayFrame
 from squint_rl.synthetic import make_synthetic_episode
 from squint_rl.tracker import (
     DetectionBatch,
@@ -49,7 +50,7 @@ def _env_types() -> tuple[type[Any], int, int]:
 
 
 def make_env(
-    episode: Episode,
+    episode: Episode | EpisodeView,
     tracker: RecordingTracker | None = None,
     *,
     nominal_rate: float = 0.25,
@@ -74,6 +75,42 @@ def make_env(
         ),
         recording_tracker,
     )
+
+
+class TimestampRecordingTracker(RecordingTracker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timestamps_s: list[float] = []
+
+    def reset(self) -> None:
+        super().reset()
+        self.timestamps_s.clear()
+
+    def step(self, detections: DetectionBatch | None, timestamp_s: float) -> TrackBatch:
+        self.timestamps_s.append(timestamp_s)
+        return super().step(detections, timestamp_s)
+
+
+@pytest.fixture
+def replay_boundary_episode(tmp_path: Path) -> Episode:
+    base = Episode.open(
+        make_synthetic_episode(
+            tmp_path / "boundary-base",
+            frame_count=6,
+            fps=2.0,
+            change_frames=(0, 2, 3, 4),
+            latency_ms=10.0,
+        )
+    )
+
+    def personalize_frames(arrays: dict[str, np.ndarray]) -> None:
+        arrays["detector_latency_ms"][:] = np.arange(1, 7, dtype=np.float32)
+        arrays["scene_change"][:] = 0.0
+        for frame_index, value in ((0, 0.1), (2, 0.2), (3, 0.3), (4, 0.4)):
+            arrays["scene_change"][frame_index] = value
+        arrays["gt_valid"][6] = False
+
+    return reseal_variant(base, tmp_path / "boundary-episode", personalize_frames)
 
 
 def assert_observation_contract(env: Any, observation: dict[str, np.ndarray]) -> None:
@@ -134,6 +171,144 @@ def test_reset_returns_only_causal_frame_zero_observation(sealed_episode: Episod
     assert not {"frame_index", "duration", "remaining_frames", "detections", "cost", "ground_truth"} & set(
         observation
     )
+
+
+def test_episode_view_reset_starts_at_a_fresh_replay_boundary(
+    replay_boundary_episode: Episode,
+) -> None:
+    tracker = TimestampRecordingTracker()
+    env, _tracker = make_env(replay_boundary_episode.slice(2, 5), tracker, nominal_rate=1.0)
+    _squint_env, _skip, run_detector = _env_types()
+
+    observation, info = env.reset(seed=7)
+
+    assert info == {}
+    np.testing.assert_array_equal(observation["scene_change"], np.zeros((3, 3), np.float32))
+    np.testing.assert_array_equal(observation["tracker_state"], np.zeros(6, np.float32))
+    np.testing.assert_array_equal(
+        observation["compute_budget"], np.array([0.5, 1.0, 1.0, 1.0, 0.0], np.float32)
+    )
+
+    next_observation, reward, terminated, truncated, step_info = env.step(run_detector)
+
+    assert tracker.timestamps_s == [1.0]
+    assert tracker.measurements[0] is not None
+    np.testing.assert_array_equal(
+        tracker.measurements[0].boxes_xyxy,
+        np.array([[14.0, 10.0, 34.0, 40.0]], np.float32),
+    )
+    assert reward == 1.0
+    assert not terminated
+    assert not truncated
+    assert step_info["charged_ms"] == 3.0
+    np.testing.assert_allclose(
+        next_observation["compute_budget"],
+        np.array([0.85, 1.0, 1.0, 0.1, 1.0], np.float32),
+    )
+    np.testing.assert_allclose(next_observation["scene_change"], np.full((3, 3), 0.3, np.float32))
+
+
+def test_episode_view_matches_parent_segment_without_out_of_slice_access(
+    replay_boundary_episode: Episode,
+) -> None:
+    frame_calls: list[int] = []
+
+    class GuardedEpisodeView(EpisodeView):
+        def frame(self, index: int) -> ReplayFrame:
+            assert 0 <= index < self.frame_count
+            frame_calls.append(index)
+            return super().frame(index)
+
+    view = GuardedEpisodeView(replay_boundary_episode, 2, 5)
+    view_tracker = TimestampRecordingTracker()
+    parent_tracker = TimestampRecordingTracker()
+    view_env, _ = make_env(view, view_tracker, nominal_rate=1.0)
+    parent_env, _ = make_env(replay_boundary_episode, parent_tracker, nominal_rate=1.0)
+    _squint_env, skip, run_detector = _env_types()
+    view_env.reset(seed=3)
+    parent_env.reset(seed=3)
+    parent_env.step(skip)
+    parent_env.step(skip)
+
+    actions = (run_detector, skip, run_detector)
+    view_results = [view_env.step(action) for action in actions]
+    parent_results = [parent_env.step(action) for action in actions]
+
+    assert view_tracker.timestamps_s == [1.0, 1.5, 2.0]
+    assert parent_tracker.timestamps_s[2:] == view_tracker.timestamps_s
+    assert [result[1] for result in view_results] == [1.0, 0.0, 1.0]
+    assert [result[1] for result in parent_results] == [1.0, 0.0, 1.0]
+    assert [result[2] for result in view_results] == [False, False, True]
+    assert [result[2] for result in parent_results] == [False, False, False]
+    assert [result[4]["charged_ms"] for result in view_results] == [3.0, 0.0, 5.0]
+    assert [result[4]["charged_ms"] for result in parent_results] == [3.0, 0.0, 5.0]
+    for view_measurement, parent_measurement in zip(
+        view_tracker.measurements, parent_tracker.measurements[2:], strict=True
+    ):
+        assert (view_measurement is None) == (parent_measurement is None)
+        if view_measurement is not None:
+            assert parent_measurement is not None
+            np.testing.assert_array_equal(view_measurement.boxes_xyxy, parent_measurement.boxes_xyxy)
+
+    assert set(frame_calls) == {0, 1, 2}
+    view_results[0][0]["scene_change"][:] = 0.9
+    np.testing.assert_allclose(view.frame(1).scene_change, np.full((3, 3), 0.3, np.float32))
+
+
+def test_episode_view_termination_reset_and_lifecycle_are_slice_local(
+    replay_boundary_episode: Episode,
+) -> None:
+    tracker = TimestampRecordingTracker()
+    view = replay_boundary_episode.slice(2, 4)
+    env, _ = make_env(view, tracker, nominal_rate=1.0)
+    _squint_env, skip, _run_detector = _env_types()
+    env.reset(seed=5)
+
+    with pytest.raises(ValueError, match="action"):
+        env.step(2)
+    assert env.action_history == []
+    assert tracker.timestamps_s == []
+
+    _observation, _reward, terminated, _truncated, _info = env.step(skip)
+    assert not terminated
+    _observation, _reward, terminated, _truncated, _info = env.step(skip)
+    assert terminated
+    terminal_state = (
+        list(env.action_history),
+        list(tracker.timestamps_s),
+        len(env.track_history),
+        env.bucket.balance_ms,
+    )
+
+    with pytest.raises(RuntimeError, match="terminated"):
+        env.step(skip)
+    assert (
+        env.action_history,
+        tracker.timestamps_s,
+        len(env.track_history),
+        env.bucket.balance_ms,
+    ) == terminal_state
+
+    reset_observation, reset_info = env.reset(seed=5)
+    assert reset_info == {}
+    assert env.action_history == []
+    assert env.track_history == []
+    assert tracker.timestamps_s == []
+    np.testing.assert_array_equal(
+        reset_observation["scene_change"], np.zeros((3, 3), np.float32)
+    )
+    np.testing.assert_array_equal(
+        reset_observation["compute_budget"],
+        np.array([0.5, 1.0, 1.0, 1.0, 0.0], np.float32),
+    )
+    env.step(skip)
+    assert tracker.timestamps_s == [1.0]
+
+
+def test_squint_env_has_no_direct_replay_array_access() -> None:
+    module = _env_module()
+    assert module is not None
+    assert ".arrays" not in inspect.getsource(module.SquintEnv)
 
 
 def test_constructor_accepts_refill_rate_at_observation_upper_bound(
