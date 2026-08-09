@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 
@@ -14,6 +16,9 @@ from edge_perception.contracts import (
     DetectorIdentity,
     StageTiming,
 )
+from squint_rl.episode import Episode, seal_episode
+from squint_rl.synthetic import make_synthetic_episode
+from squint_rl.tracker import DetectionBatch, TrackBatch, TrackerSummary
 
 
 class FakeDetector:
@@ -85,3 +90,66 @@ def video_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def fake_detector() -> FakeDetector:
     return FakeDetector()
+
+
+class RecordingTracker:
+    """A real tracker-shaped test double that preserves measurement identity."""
+
+    def __init__(self) -> None:
+        self.last = TrackBatch.empty()
+        self.measurements: list[DetectionBatch | None] = []
+        self.reset_calls = 0
+
+    def reset(self) -> None:
+        self.last = TrackBatch.empty()
+        self.measurements.clear()
+        self.reset_calls += 1
+
+    def step(self, detections: DetectionBatch | None, timestamp_s: float) -> TrackBatch:
+        del timestamp_s
+        self.measurements.append(detections)
+        if detections is not None:
+            self.last = TrackBatch(
+                detections.boxes_xyxy,
+                np.arange(1, len(detections) + 1, dtype=np.int64),
+                detections.class_ids,
+                detections.scores,
+            )
+        return self.last
+
+    def summary(self) -> TrackerSummary:
+        count = len(self.last)
+        return TrackerSummary(
+            active_tracks=count,
+            confirmed_tracks=count,
+            stale_tracks=0,
+            mean_age_s=0.0,
+            mean_motion_px_s=0.0,
+            mean_confidence=float(np.mean(self.last.scores)) if count else 0.0,
+        )
+
+
+@pytest.fixture
+def sealed_episode(tmp_path: Path) -> Episode:
+    return Episode.open(
+        make_synthetic_episode(
+            tmp_path / "episode",
+            frame_count=4,
+            fps=2.0,
+            change_frames=(0,),
+            latency_ms=10.0,
+        )
+    )
+
+
+def reseal_variant(
+    base: Episode,
+    destination: Path,
+    mutate: Callable[[dict[str, np.ndarray]], None],
+) -> Episode:
+    """Copy a sealed replay, mutate its arrays, and seal a distinct valid replay."""
+    arrays = {name: np.array(value, copy=True) for name, value in base.arrays.items()}
+    mutate(arrays)
+    manifest = json.loads((base.path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["artifacts"] = {}
+    return Episode.open(seal_episode(destination, manifest=manifest, arrays=arrays))
