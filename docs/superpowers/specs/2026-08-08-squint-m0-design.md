@@ -1,6 +1,6 @@
 # Squint M0 Design Specification
 
-**Status:** Proposed written specification for final review  
+**Status:** Approved for implementation
 **Date:** 2026-08-08  
 **Owner:** William Hayden  
 **Product:** Squint  
