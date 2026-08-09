@@ -754,6 +754,30 @@ def test_huge_normalization_integer_has_field_specific_validation_error(
     assert not (tmp_path / "result").exists()
 
 
+def test_huge_reserve_integer_has_field_specific_validation_error(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    for name, frame_count, latency_ms in (("a", 5, 10.0), ("b", 7, 20.0)):
+        _make_episode(
+            tmp_path / f"episode-{name}",
+            frame_count=frame_count,
+            latency_ms=latency_ms,
+            identifier=name,
+            cost_profile_overrides={"reserve_ms": 10**400},
+        )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(
+        EpisodeValidationError,
+        match="manifest cost_profile.reserve_ms must be a positive finite number",
+    ):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
 @pytest.mark.parametrize(
     "policy_factory",
     ["python:tests.fakes:raising_policy_factory"],

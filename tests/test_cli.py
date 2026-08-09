@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,22 @@ def _make_episode(
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     manifest["episode"]["id"] = identifier
     manifest["detector"]["weights_sha256"] = "f" * 64
+    cost_profile: dict[str, object] = {
+        "unit": "detector_ms",
+        "p95_ms": 10.0,
+        "reserve_ms": 10.0,
+        "capacity_ms": 20.0,
+    }
+    profile_payload = json.dumps(
+        {
+            "cost_profile": cost_profile,
+            "normalization": manifest["normalization"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    cost_profile["profile_sha256"] = sha256(profile_payload).hexdigest()
+    manifest["cost_profile"] = cost_profile
     manifest["artifacts"] = {}
     arrays = {
         name: np.array(value, copy=True) for name, value in episode.arrays.items()

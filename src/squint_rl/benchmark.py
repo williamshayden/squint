@@ -360,7 +360,12 @@ def _reserve_ms(episode: Episode) -> float:
         raise EpisodeValidationError(
             "manifest cost_profile.reserve_ms must be a positive finite number"
         )
-    value = float(reserve)
+    try:
+        value = float(reserve)
+    except OverflowError as exc:
+        raise EpisodeValidationError(
+            "manifest cost_profile.reserve_ms must be a positive finite number"
+        ) from exc
     if not math.isfinite(value) or value <= 0.0:
         raise EpisodeValidationError(
             "manifest cost_profile.reserve_ms must be a positive finite number"
