@@ -17,6 +17,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from squint_rl.episode import Episode
+from squint_rl.episode import seal_episode as real_seal_episode
 from squint_rl.reference import build_mot17 as build_mot17_module
 from squint_rl.reference.build_mot17 import (
     RawTrace,
@@ -1026,6 +1028,51 @@ def _profile(traces: Sequence[RawTrace]) -> ReferenceProfile:
     return profile_training_traces(traces, tracker_factory=_empty_tracker_factory)
 
 
+def _telemetry(
+    *, available: bool = False, sample_count: int = 0
+) -> dict[str, object]:
+    populated = sample_count > 0
+    return {
+        "nvml": {"available": available, "error": None},
+        "sample_count": sample_count,
+        "gpu_utilization_percent": {
+            "mean": 10.0 if populated else None,
+            "p95": 12.0 if populated else None,
+            "max": 15.0 if populated else None,
+        },
+        "used_vram_bytes": {
+            "mean": 100.0 if populated else None,
+            "p95": 120.0 if populated else None,
+            "max": 150.0 if populated else None,
+        },
+    }
+
+
+def _sealable_trace(
+    tmp_path: Path,
+    identifier: str,
+    *,
+    detector: dict[str, object] | None = None,
+    hardware: dict[str, object] | None = None,
+    telemetry: dict[str, object] | None = None,
+) -> RawTrace:
+    trace = _profile_trace(
+        tmp_path,
+        identifier,
+        detector=detector,
+        hardware=hardware,
+    )
+    manifest = dict(trace.manifest_fields)
+    manifest.update(
+        {
+            "width": 4,
+            "height": 4,
+            "telemetry": _telemetry() if telemetry is None else telemetry,
+        }
+    )
+    return RawTrace(identifier, trace.arrays, manifest)
+
+
 class _RecordingTracker(_EmptyTracker):
     def __init__(self) -> None:
         self.reset_count = 0
@@ -2017,6 +2064,645 @@ def test_source_hash_is_path_sensitive_and_wraps_io_errors(
     monkeypatch.setattr(Path, "open", fail_open)
     with pytest.raises(ValueError, match=r"renamed\.png.*read|read.*renamed\.png"):
         canonical_source_sha256(renamed_sequence)
+
+
+def test_seal_trace_train_round_trips_exact_manifest_and_arrays(tmp_path: Path) -> None:
+    traces = [
+        _sealable_trace(tmp_path, "02"),
+        *[_profile_trace(tmp_path, identifier) for identifier in ("04", "05", "10")],
+    ]
+    trace = traces[0]
+    profile = _profile(traces)
+    profile_fields = profile.episode_manifest_fields()
+    expected = {
+        "schema": {"name": "squint.replay", "version": 1},
+        "episode": {"id": "MOT17-02-FRCNN"},
+        "source": {
+            "id": "02",
+            "sha256": "a" * 64,
+            "width": 4,
+            "height": 4,
+            "frame_count": 3,
+            "fps": 25.0,
+            "duration_s": 0.08,
+            "dataset": "MOT17",
+            "split": "train",
+            "class_mapping": {"1": "pedestrian"},
+            "ignore_region_rules": (
+                "valid iff mark=1 and class_id=1; ignored iff mark=1 and class_id "
+                "in {2,7,8,12}; otherwise neither valid nor ignored"
+            ),
+        },
+        "detector": _detector_identity(),
+        "hardware": _hardware_identity(),
+        "cost_profile": profile_fields["cost_profile"],
+        "scene_feature": {
+            "name": "mean_absolute_grayscale_change",
+            "shape": [3, 3],
+        },
+        "normalization": profile_fields["normalization"],
+        "telemetry": _telemetry(),
+        "artifacts": {},
+    }
+
+    manifest = build_mot17_module._episode_manifest(
+        trace, profile, partition="train"
+    )
+    assert _plain_json(manifest) == expected
+    destination = tmp_path / "sealed-train"
+    assert build_mot17_module._seal_trace(
+        destination,
+        trace=trace,
+        profile=profile,
+        partition="train",
+    ) == destination.resolve()
+
+    episode = Episode.open(destination)
+    sealed_manifest = _plain_json(episode.manifest)
+    assert isinstance(sealed_manifest, dict)
+    artifacts = sealed_manifest.pop("artifacts")
+    assert sealed_manifest == {key: value for key, value in expected.items() if key != "artifacts"}
+    assert isinstance(artifacts, dict)
+    assert set(artifacts) == {"arrays.npz_sha256", "content_sha256"}
+    assert episode.content_sha256 == artifacts["content_sha256"]
+    assert episode.manifest["cost_profile"]["profile_sha256"] == profile.profile_sha256  # type: ignore[index]
+    assert set(destination.iterdir()) == {
+        destination / "manifest.json",
+        destination / "arrays.npz",
+    }
+    for name, expected_array in trace.arrays.items():
+        np.testing.assert_array_equal(episode.arrays[name], expected_array)
+
+
+@pytest.mark.parametrize(
+    ("identifier", "partition"),
+    [("09", "validation"), ("11", "test"), ("13", "test")],
+)
+def test_synthetic_heldout_trace_seals_without_recomputing_training_profile(
+    tmp_path: Path, identifier: str, partition: str
+) -> None:
+    training = [
+        _sealable_trace(tmp_path / "training", "02"),
+        *[
+            _profile_trace(tmp_path / "training", name)
+            for name in ("04", "05", "10")
+        ],
+    ]
+    profile = _profile(training)
+    profile_bytes = profile.canonical_json.encode()
+    heldout = _sealable_trace(tmp_path / "synthetic-heldout", identifier)
+    assert all(
+        item["causal_trace_sha256"]
+        != heldout.manifest_fields["causal_trace_sha256"]
+        or item["sequence_id"] != identifier
+        for item in profile.training_traces
+    )
+
+    episode = Episode.open(
+        build_mot17_module._seal_trace(
+            tmp_path / f"heldout-{identifier}",
+            trace=heldout,
+            profile=profile,
+            partition=partition,
+        )
+    )
+
+    assert profile.canonical_json.encode() == profile_bytes
+    assert episode.manifest["episode"] == {"id": f"MOT17-{identifier}-FRCNN"}
+    assert episode.manifest["source"]["split"] == partition  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("identifier", "partition"),
+    [
+        ("09", "train"),
+        ("11", "validation"),
+        ("09", "test"),
+        ("03", "validation"),
+        ("09", "development"),
+    ],
+)
+def test_partition_and_sequence_membership_fail_before_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identifier: str,
+    partition: str,
+) -> None:
+    training = [
+        _sealable_trace(tmp_path / "training", "02"),
+        *[
+            _profile_trace(tmp_path / "training", name)
+            for name in ("04", "05", "10")
+        ],
+    ]
+    profile = _profile(training)
+    trace = _sealable_trace(tmp_path / "candidate", identifier)
+    destination = tmp_path / "must-not-exist"
+    seal_calls = 0
+
+    def forbidden_seal(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal seal_calls
+        seal_calls += 1
+        raise AssertionError("partition validation must precede seal_episode")
+
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_seal)
+    with pytest.raises(ValueError, match="partition|sequence"):
+        build_mot17_module._seal_trace(
+            destination,
+            trace=trace,
+            profile=profile,
+            partition=partition,
+        )
+
+    assert seal_calls == 0
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("mutation", ["detector", "hardware"])
+def test_identity_mismatch_fails_before_manifest_or_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    hardware = _hardware_identity(device_type="cuda")
+    trace = _sealable_trace(tmp_path, "02", hardware=hardware)
+    traces = [
+        trace,
+        *[
+            _profile_trace(tmp_path, identifier, hardware=hardware)
+            for identifier in ("04", "05", "10")
+        ],
+    ]
+    profile = _profile(traces)
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    if mutation == "detector":
+        detector = manifest["detector"]
+        assert isinstance(detector, dict)
+        detector["precision"] = "float16"
+    else:
+        candidate_hardware = manifest["hardware"]
+        assert isinstance(candidate_hardware, dict)
+        platform = candidate_hardware["platform"]
+        assert isinstance(platform, dict)
+        platform["machine"] = "aarch64"
+    candidate = RawTrace("02", trace.arrays, manifest)
+    manifest_calls = 0
+    seal_calls = 0
+
+    def forbidden_manifest(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        nonlocal manifest_calls
+        manifest_calls += 1
+        raise AssertionError("identity validation must precede manifest construction")
+
+    def forbidden_seal(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal seal_calls
+        seal_calls += 1
+        raise AssertionError("identity validation must precede seal_episode")
+
+    monkeypatch.setattr(build_mot17_module, "_episode_manifest", forbidden_manifest)
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_seal)
+    with pytest.raises(ValueError, match=mutation):
+        build_mot17_module._seal_trace(
+            tmp_path / "must-not-exist",
+            trace=candidate,
+            profile=profile,
+            partition="train",
+        )
+
+    assert manifest_calls == seal_calls == 0
+    assert not (tmp_path / "must-not-exist").exists()
+
+
+@pytest.mark.parametrize("mutation", ["detection", "latency", "scene"])
+def test_coherent_causal_mutation_requires_a_different_training_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    traces = [
+        trace,
+        *[_profile_trace(tmp_path, identifier) for identifier in ("04", "05", "10")],
+    ]
+    profile = _profile(traces)
+    arrays = {name: np.array(value, copy=True) for name, value in trace.arrays.items()}
+    if mutation == "detection":
+        arrays["det_scores"][0] = 0.5
+    elif mutation == "latency":
+        arrays["detector_latency_ms"][0] += 1.0
+    else:
+        arrays["scene_change"][0, 0, 0] = 0.5
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    manifest["causal_trace_sha256"] = causal_trace_sha256(arrays)
+    candidate = RawTrace("02", arrays, manifest)
+    assert (
+        candidate.manifest_fields["causal_trace_sha256"]
+        != trace.manifest_fields["causal_trace_sha256"]
+    )
+    changed_profile = _profile([candidate, *traces[1:]])
+    assert changed_profile.profile_sha256 != profile.profile_sha256
+    publication_calls = 0
+
+    def forbidden_publication(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        nonlocal publication_calls
+        publication_calls += 1
+        raise AssertionError("training hash validation must precede publication")
+
+    monkeypatch.setattr(build_mot17_module, "_episode_manifest", forbidden_publication)
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_publication)
+    with pytest.raises(ValueError, match="causal|training"):
+        build_mot17_module._seal_trace(
+            tmp_path / "must-not-exist",
+            trace=candidate,
+            profile=profile,
+            partition="train",
+        )
+
+    assert publication_calls == 0
+    assert not (tmp_path / "must-not-exist").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("width", _DELETE),
+        ("width", True),
+        ("width", 0),
+        ("height", _DELETE),
+        ("height", 1.0),
+        ("source_sha256", _DELETE),
+        ("source_sha256", "A" * 64),
+        ("source_sha256", "a" * 63),
+        ("detector", _DELETE),
+        ("hardware", _DELETE),
+        ("telemetry", _DELETE),
+        ("fps", np.float64(25.0)),
+    ],
+)
+def test_missing_or_ill_typed_provenance_fails_before_manifest_or_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    if value is _DELETE:
+        manifest.pop(field)
+    else:
+        manifest[field] = value
+    candidate = RawTrace("02", trace.arrays, manifest)
+    publication_calls = 0
+
+    def forbidden_publication(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        nonlocal publication_calls
+        publication_calls += 1
+        raise AssertionError("provenance validation must precede publication")
+
+    monkeypatch.setattr(build_mot17_module, "_episode_manifest", forbidden_publication)
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_publication)
+    with pytest.raises(ValueError, match=field):
+        build_mot17_module._seal_trace(
+            tmp_path / "must-not-exist",
+            trace=candidate,
+            profile=profile,
+            partition="train",
+        )
+
+    assert publication_calls == 0
+    assert not (tmp_path / "must-not-exist").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "root-type",
+        "root-extra",
+        "nvml-extra",
+        "available-type",
+        "error-code",
+        "count-bool",
+        "count-negative",
+        "count-over-frames",
+        "empty-values",
+        "nonempty-null",
+        "nonempty-integer",
+        "gpu-range",
+        "vram-negative",
+        "mean-over-max",
+        "p95-over-max",
+        "unavailable-samples",
+        "unavailable-error",
+        "statistics-extra",
+    ],
+)
+def test_malformed_aggregate_telemetry_fails_before_manifest_or_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    telemetry: object = deepcopy(_telemetry())
+    if mutation == "root-type":
+        telemetry = []
+    else:
+        assert isinstance(telemetry, dict)
+        if mutation == "root-extra":
+            telemetry["extra"] = None
+        elif mutation == "nvml-extra":
+            nvml = telemetry["nvml"]
+            assert isinstance(nvml, dict)
+            nvml["extra"] = None
+        elif mutation == "available-type":
+            telemetry["nvml"] = {"available": 1, "error": None}
+        elif mutation == "error-code":
+            telemetry["nvml"] = {"available": True, "error": "unknown"}
+        elif mutation == "count-bool":
+            telemetry["sample_count"] = True
+        elif mutation == "count-negative":
+            telemetry["sample_count"] = -1
+        elif mutation == "count-over-frames":
+            telemetry["sample_count"] = 4
+        elif mutation == "empty-values":
+            telemetry["gpu_utilization_percent"] = {
+                "mean": 0.0,
+                "p95": None,
+                "max": None,
+            }
+        else:
+            telemetry = deepcopy(_telemetry(available=True, sample_count=1))
+            assert isinstance(telemetry, dict)
+            gpu = telemetry["gpu_utilization_percent"]
+            vram = telemetry["used_vram_bytes"]
+            assert isinstance(gpu, dict)
+            assert isinstance(vram, dict)
+            if mutation == "nonempty-null":
+                gpu["mean"] = None
+            elif mutation == "nonempty-integer":
+                gpu["mean"] = 10
+            elif mutation == "gpu-range":
+                gpu["max"] = 101.0
+            elif mutation == "vram-negative":
+                vram["mean"] = -1.0
+            elif mutation == "mean-over-max":
+                gpu["mean"] = 16.0
+            elif mutation == "p95-over-max":
+                gpu["p95"] = 16.0
+            elif mutation == "unavailable-samples":
+                telemetry["nvml"] = {"available": False, "error": None}
+            elif mutation == "unavailable-error":
+                telemetry["sample_count"] = 0
+                telemetry["nvml"] = {
+                    "available": False,
+                    "error": "sample_failed",
+                }
+                telemetry["gpu_utilization_percent"] = {
+                    "mean": None,
+                    "p95": None,
+                    "max": None,
+                }
+                telemetry["used_vram_bytes"] = {
+                    "mean": None,
+                    "p95": None,
+                    "max": None,
+                }
+            else:
+                gpu["extra"] = 10.0
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    manifest["telemetry"] = telemetry
+    candidate = RawTrace("02", trace.arrays, manifest)
+    publication_calls = 0
+
+    def forbidden_publication(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        nonlocal publication_calls
+        publication_calls += 1
+        raise AssertionError("telemetry validation must precede publication")
+
+    monkeypatch.setattr(build_mot17_module, "_episode_manifest", forbidden_publication)
+    monkeypatch.setattr(build_mot17_module, "seal_episode", forbidden_publication)
+    with pytest.raises(ValueError, match="telemetry|nvml|sample_count|utilization|vram"):
+        build_mot17_module._seal_trace(
+            tmp_path / "must-not-exist",
+            trace=candidate,
+            profile=profile,
+            partition="train",
+        )
+
+    assert publication_calls == 0
+    assert not (tmp_path / "must-not-exist").exists()
+
+
+def test_seal_trace_calls_compatibility_manifest_then_seal_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    destination = tmp_path / "destination"
+    returned = tmp_path / "returned"
+    manifest = {"sentinel": "manifest"}
+    events: list[str] = []
+
+    def require(
+        actual_trace: RawTrace,
+        actual_profile: ReferenceProfile,
+        *,
+        partition: str,
+    ) -> None:
+        assert (actual_trace, actual_profile, partition) == (trace, profile, "train")
+        events.append("require")
+
+    def episode_manifest(
+        actual_trace: RawTrace,
+        actual_profile: ReferenceProfile,
+        *,
+        partition: str,
+    ) -> dict[str, object]:
+        assert (actual_trace, actual_profile, partition) == (trace, profile, "train")
+        events.append("manifest")
+        return manifest
+
+    def seal(
+        actual_destination: str | Path,
+        *,
+        manifest: Mapping[str, object],
+        arrays: Mapping[str, np.ndarray[Any, Any]],
+    ) -> Path:
+        assert Path(actual_destination) == destination
+        assert manifest is globals_manifest
+        assert arrays is trace.arrays
+        events.append("seal")
+        return returned
+
+    globals_manifest = manifest
+    monkeypatch.setattr(
+        build_mot17_module, "_require_profile_compatible", require, raising=False
+    )
+    monkeypatch.setattr(
+        build_mot17_module, "_episode_manifest", episode_manifest, raising=False
+    )
+    monkeypatch.setattr(build_mot17_module, "seal_episode", seal, raising=False)
+
+    assert build_mot17_module._seal_trace(
+        destination,
+        trace=trace,
+        profile=profile,
+        partition="train",
+    ) == returned
+    assert events == ["require", "manifest", "seal"]
+
+
+def test_existing_destination_rejection_is_owned_by_one_real_seal_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    destination = tmp_path / "existing"
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_bytes(b"unchanged")
+    calls: list[Path] = []
+
+    def counted_real_seal(
+        actual_destination: str | Path,
+        *,
+        manifest: Mapping[str, object],
+        arrays: Mapping[str, np.ndarray[Any, Any]],
+    ) -> Path:
+        calls.append(Path(actual_destination))
+        return real_seal_episode(
+            actual_destination,
+            manifest=manifest,
+            arrays=arrays,
+        )
+
+    monkeypatch.setattr(
+        build_mot17_module, "seal_episode", counted_real_seal, raising=False
+    )
+    with pytest.raises(FileExistsError):
+        build_mot17_module._seal_trace(
+            destination,
+            trace=trace,
+            profile=profile,
+            partition="train",
+        )
+
+    assert calls == [destination]
+    assert set(destination.iterdir()) == {sentinel}
+    assert sentinel.read_bytes() == b"unchanged"
+
+
+@pytest.mark.parametrize("mutation", ["ground-truth", "source", "telemetry"])
+def test_noncausal_mutations_preserve_profile_bytes_but_change_episode_identity(
+    tmp_path: Path, mutation: str
+) -> None:
+    hardware = _hardware_identity(device_type="cuda")
+    trace = _sealable_trace(
+        tmp_path,
+        "02",
+        hardware=hardware,
+        telemetry=_telemetry(available=True, sample_count=1),
+    )
+    traces = [
+        trace,
+        *[
+            _profile_trace(tmp_path, identifier, hardware=hardware)
+            for identifier in ("04", "05", "10")
+        ],
+    ]
+    profile = _profile(traces)
+    arrays = {name: np.array(value, copy=True) for name, value in trace.arrays.items()}
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    if mutation == "ground-truth":
+        arrays["gt_boxes_xyxy"][0, 0] += 0.25
+    elif mutation == "source":
+        manifest["source_sha256"] = "b" * 64
+    else:
+        manifest["telemetry"] = {
+            "nvml": {"available": True, "error": None},
+            "sample_count": 1,
+            "gpu_utilization_percent": {"mean": 11.0, "p95": 13.0, "max": 16.0},
+            "used_vram_bytes": {"mean": 100.0, "p95": 120.0, "max": 150.0},
+        }
+    manifest["causal_trace_sha256"] = causal_trace_sha256(arrays)
+    changed = RawTrace("02", arrays, manifest)
+
+    changed_profile = _profile([changed, *traces[1:]])
+    assert changed_profile.canonical_json.encode() == profile.canonical_json.encode()
+    original_episode = Episode.open(
+        build_mot17_module._seal_trace(
+            tmp_path / f"{mutation}-original",
+            trace=trace,
+            profile=profile,
+            partition="train",
+        )
+    )
+    changed_episode = Episode.open(
+        build_mot17_module._seal_trace(
+            tmp_path / f"{mutation}-changed",
+            trace=changed,
+            profile=profile,
+            partition="train",
+        )
+    )
+    assert changed_episode.content_sha256 != original_episode.content_sha256
+
+
+def test_resealing_is_deterministic_and_profile_has_no_content_circularity(
+    tmp_path: Path,
+) -> None:
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    first_path = build_mot17_module._seal_trace(
+        tmp_path / "first",
+        trace=trace,
+        profile=profile,
+        partition="train",
+    )
+    second_path = build_mot17_module._seal_trace(
+        tmp_path / "second",
+        trace=trace,
+        profile=profile,
+        partition="train",
+    )
+    first = Episode.open(first_path)
+    second = Episode.open(second_path)
+
+    assert first.content_sha256 == second.content_sha256
+    assert (first_path / "manifest.json").read_bytes() == (
+        second_path / "manifest.json"
+    ).read_bytes()
+    assert (first_path / "arrays.npz").read_bytes() == (
+        second_path / "arrays.npz"
+    ).read_bytes()
+    assert "causal_trace_sha256" in profile.canonical_json
+    assert all(
+        f'"{field}":' not in profile.canonical_json
+        for field in ("content_sha256", "source_sha256", "telemetry")
+    )
+    assert first.content_sha256 not in profile.canonical_json
 
 
 def test_import_does_not_load_heavy_or_hardware_modules() -> None:

@@ -21,6 +21,7 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from squint_rl.budget import BudgetConfig, TokenBucket
+from squint_rl.episode import seal_episode
 from squint_rl.reference.bytetrack import ByteTrackAdapter
 from squint_rl.reference.dfine import (
     MODEL_ID,
@@ -29,7 +30,7 @@ from squint_rl.reference.dfine import (
     WEIGHTS_SHA256,
     scene_change_grid,
 )
-from squint_rl.reference.mot17 import Mot17Sequence
+from squint_rl.reference.mot17 import Mot17Sequence, sequence_ids
 from squint_rl.tracker import DetectionBatch, TrackBatch, Tracker, TrackerSummary
 
 _ARRAY_NAMES = (
@@ -890,6 +891,141 @@ class ReferenceProfile:
         if text != profile.canonical_json:
             raise ValueError("reference profile JSON is not canonical")
         return profile
+
+
+def _require_profile_compatible(
+    trace: RawTrace, profile: ReferenceProfile, *, partition: str
+) -> None:
+    if type(partition) is not str:
+        raise ValueError("partition must be train, validation, or test")
+    if trace.sequence_id not in sequence_ids(partition):
+        raise ValueError(
+            f"sequence {trace.sequence_id} does not belong to partition {partition}"
+        )
+    manifest = trace.manifest_fields
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest_fields must be a mapping")  # noqa: TRY004
+    _validate_arrays(trace.arrays)
+    _validate_trace_manifest(trace.sequence_id, trace.arrays, manifest)
+    frame_count = manifest.get("frame_count")
+    fps = manifest.get("fps")
+    if type(frame_count) is not int or frame_count <= 0:
+        raise ValueError("manifest_fields frame_count must be a positive built-in integer")
+    if type(fps) not in (int, float):
+        raise ValueError("manifest_fields fps must be a positive finite built-in number")
+    fps_number = cast(int | float, fps)
+    if not math.isfinite(fps_number) or fps_number <= 0.0:
+        raise ValueError("manifest_fields fps must be a positive finite built-in number")
+    for name in ("width", "height"):
+        value = manifest.get(name)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"manifest_fields {name} must be a positive built-in integer")
+    _lowercase_sha256(manifest.get("source_sha256"), "manifest_fields source_sha256")
+    causal_hash = _lowercase_sha256(
+        manifest.get("causal_trace_sha256"), "manifest_fields causal_trace_sha256"
+    )
+    if causal_hash != causal_trace_sha256(trace.arrays):
+        raise ValueError("manifest_fields causal_trace_sha256 does not match arrays")
+
+    detector = _validate_detector_identity(manifest.get("detector"))
+    hardware = _validate_hardware_identity(manifest.get("hardware"))
+    _validate_identity_matrix(detector, hardware)
+    if _canonical_json(detector) != _canonical_json(profile.detector_identity):
+        raise ValueError("trace detector identity does not match reference profile")
+    if _canonical_json(hardware) != _canonical_json(profile.hardware_identity):
+        raise ValueError("trace hardware identity does not match reference profile")
+    if partition == "train" and not any(
+        item["sequence_id"] == trace.sequence_id
+        and item["causal_trace_sha256"] == causal_hash
+        for item in profile.training_traces
+    ):
+        raise ValueError("training trace causal hash does not match reference profile")
+
+    telemetry = _nested_object(
+        manifest.get("telemetry"),
+        "telemetry",
+        {"nvml", "sample_count", "gpu_utilization_percent", "used_vram_bytes"},
+    )
+    nvml = _nested_object(telemetry["nvml"], "telemetry.nvml", {"available", "error"})
+    available, error = nvml["available"], nvml["error"]
+    if type(available) is not bool:
+        raise ValueError("telemetry.nvml.available must be a bool")
+    if error is not None and error not in ("sample_failed", "invalid_sample"):
+        raise ValueError("telemetry.nvml.error is invalid")
+    sample_count = telemetry["sample_count"]
+    if type(sample_count) is not int or not 0 <= sample_count <= frame_count:
+        raise ValueError("telemetry.sample_count must be in [0, frame_count]")
+    for name in ("gpu_utilization_percent", "used_vram_bytes"):
+        statistics = _nested_object(
+            telemetry[name], f"telemetry.{name}", {"mean", "p95", "max"}
+        )
+        values = (statistics["mean"], statistics["p95"], statistics["max"])
+        if sample_count == 0:
+            if any(value is not None for value in values):
+                raise ValueError(f"telemetry.{name} values must be null without samples")
+            continue
+        if any(type(value) is not float or not math.isfinite(value) for value in values):
+            raise ValueError(f"telemetry.{name} values must be finite built-in floats")
+        mean, p95, maximum = cast(tuple[float, float, float], values)
+        if any(value < 0.0 for value in (mean, p95, maximum)):
+            raise ValueError(f"telemetry.{name} values must be nonnegative")
+        if name == "gpu_utilization_percent" and maximum > 100.0:
+            raise ValueError("telemetry.gpu_utilization_percent values must be in [0, 100]")
+        if mean > maximum or p95 > maximum:
+            raise ValueError(f"telemetry.{name} mean and p95 cannot exceed max")
+    if not available and (sample_count != 0 or error is not None):
+        raise ValueError("unavailable telemetry must have zero samples and no error")
+
+
+def _episode_manifest(
+    trace: RawTrace, profile: ReferenceProfile, *, partition: str
+) -> dict[str, object]:
+    fields = trace.manifest_fields
+    frame_count = cast(int, fields["frame_count"])
+    fps = float(cast(int | float, fields["fps"]))
+    profile_fields = profile.episode_manifest_fields()
+    return {
+        "schema": {"name": "squint.replay", "version": 1},
+        "episode": {"id": f"MOT17-{trace.sequence_id}-FRCNN"},
+        "source": {
+            "id": trace.sequence_id,
+            "sha256": fields["source_sha256"],
+            "width": fields["width"],
+            "height": fields["height"],
+            "frame_count": frame_count,
+            "fps": fps,
+            "duration_s": float((frame_count - 1) / fps),
+            "dataset": "MOT17",
+            "split": partition,
+            "class_mapping": {"1": "pedestrian"},
+            "ignore_region_rules": (
+                "valid iff mark=1 and class_id=1; ignored iff mark=1 and class_id "
+                "in {2,7,8,12}; otherwise neither valid nor ignored"
+            ),
+        },
+        "detector": _jsonable(profile.detector_identity),
+        "hardware": _jsonable(profile.hardware_identity),
+        "cost_profile": profile_fields["cost_profile"],
+        "scene_feature": {
+            "name": "mean_absolute_grayscale_change",
+            "shape": [3, 3],
+        },
+        "normalization": profile_fields["normalization"],
+        "telemetry": _jsonable(fields["telemetry"]),
+        "artifacts": {},
+    }
+
+
+def _seal_trace(
+    destination: str | Path,
+    *,
+    trace: RawTrace,
+    profile: ReferenceProfile,
+    partition: str,
+) -> Path:
+    _require_profile_compatible(trace, profile, partition=partition)
+    manifest = _episode_manifest(trace, profile, partition=partition)
+    return seal_episode(destination, manifest=manifest, arrays=trace.arrays)
 
 
 def _profile_percentile(
