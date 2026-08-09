@@ -29,7 +29,10 @@ def test_atomic_run_publishes_json_only_after_clean_exit(tmp_path: Path) -> None
     with AtomicRun(destination) as work:
         write_json(work / "result.json", {"b": 2, "a": 1})
 
-    assert destination.joinpath("result.json").read_bytes() == b'{\n  "a": 1,\n  "b": 2\n}\n'
+    assert (
+        destination.joinpath("result.json").read_bytes()
+        == b'{\n  "a": 1,\n  "b": 2\n}\n'
+    )
 
 
 def test_atomic_run_serializes_concurrent_publishers_without_overwriting_winner(
@@ -101,7 +104,9 @@ def test_atomic_run_retains_interrupted_work(tmp_path: Path) -> None:
     assert incomplete[0].joinpath("result.json").exists()
 
 
-def test_atomic_run_rejects_existing_destination_and_broken_symlink(tmp_path: Path) -> None:
+def test_atomic_run_rejects_existing_destination_and_broken_symlink(
+    tmp_path: Path,
+) -> None:
     from squint_rl.artifacts import AtomicRun
 
     destination = tmp_path / "run"
@@ -115,7 +120,9 @@ def test_atomic_run_rejects_existing_destination_and_broken_symlink(tmp_path: Pa
         pass
 
 
-def test_atomic_run_retains_work_when_publish_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_atomic_run_retains_work_when_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from squint_rl import artifacts
 
     destination = tmp_path / "run"
@@ -125,7 +132,10 @@ def test_atomic_run_retains_work_when_publish_fails(tmp_path: Path, monkeypatch:
         raise OSError("publish failed")
 
     monkeypatch.setattr(artifacts.os, "replace", fail_publish)
-    with pytest.raises(OSError, match="publish failed"), artifacts.AtomicRun(destination) as work:
+    with (
+        pytest.raises(OSError, match="publish failed"),
+        artifacts.AtomicRun(destination) as work,
+    ):
         artifacts.write_json(work / "result.json", {})
 
     assert not destination.exists()
@@ -149,7 +159,9 @@ def test_write_json_is_canonical_and_rejects_nonfinite_values(tmp_path: Path) ->
         write_json(path, {"value": float("nan")})
 
 
-def test_write_mot_tracks_uses_one_based_coordinates_ids_and_sorted_rows(tmp_path: Path) -> None:
+def test_write_mot_tracks_uses_one_based_coordinates_ids_and_sorted_rows(
+    tmp_path: Path,
+) -> None:
     from squint_rl.artifacts import write_mot_tracks
     from squint_rl.tracker import TrackBatch
 
@@ -220,7 +232,11 @@ def test_write_mot_ground_truth_keeps_only_supported_records(tmp_path: Path) -> 
 
 @pytest.mark.parametrize(
     ("class_id", "valid", "ignore", "message"),
-    [(7, True, False, "valid"), (3, False, True, "ignored"), (1, False, True, "ignored")],
+    [
+        (7, True, False, "valid"),
+        (3, False, True, "ignored"),
+        (1, False, True, "ignored"),
+    ],
 )
 def test_write_mot_ground_truth_rejects_inconsistent_classes(
     tmp_path: Path, class_id: int, valid: bool, ignore: bool, message: str
@@ -256,7 +272,9 @@ def test_write_mot_ground_truth_rejects_nonpositive_ids(tmp_path: Path) -> None:
         write_mot_ground_truth(tmp_path / "gt.txt", _GroundTruthEpisode(truth))
 
 
-def test_write_curve_csv_sorts_full_rows_and_hashes_emitted_bytes(tmp_path: Path) -> None:
+def test_write_curve_csv_sorts_full_rows_and_hashes_emitted_bytes(
+    tmp_path: Path,
+) -> None:
     from squint_rl.artifacts import CurveRow, write_curve_csv
 
     path = tmp_path / "curve.csv"
@@ -270,12 +288,33 @@ def test_write_curve_csv_sorts_full_rows_and_hashes_emitted_bytes(tmp_path: Path
     )
     expected = (
         b"policy_id,nominal_rate,realized_compute,hota\n"
-        b"a,0.400000,0.200000000,0.600000000\n"
-        b"a,0.800000,0.200000000,0.600000000\n"
-        b"b,0.800000,0.200000000,0.500000000\n"
+        b"a,0.4,0.200000000,0.600000000\n"
+        b"a,0.8,0.200000000,0.600000000\n"
+        b"b,0.8,0.200000000,0.500000000\n"
     )
     assert path.read_bytes() == expected
     assert digest == sha256(expected).hexdigest()
+
+
+def test_write_curve_csv_preserves_close_nominal_rates_losslessly(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.artifacts import CurveRow, write_curve_csv
+
+    path = tmp_path / "curve.csv"
+    write_curve_csv(
+        path,
+        (
+            CurveRow("policy", 0.1000002, 0.2, 0.5),
+            CurveRow("policy", 0.1000001, 0.1, 0.4),
+        ),
+    )
+
+    assert path.read_bytes() == (
+        b"policy_id,nominal_rate,realized_compute,hota\n"
+        b"policy,0.1000001,0.100000000,0.400000000\n"
+        b"policy,0.1000002,0.200000000,0.500000000\n"
+    )
 
 
 @pytest.mark.parametrize(

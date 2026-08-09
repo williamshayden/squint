@@ -39,7 +39,9 @@ class AtomicRun:
         self._acquire_claim()
         try:
             if os.path.lexists(self.destination):
-                raise FileExistsError(f"completed run already exists: {self.destination}")
+                raise FileExistsError(
+                    f"completed run already exists: {self.destination}"
+                )
             self.working.mkdir()
         except BaseException:
             self._release_claim()
@@ -56,11 +58,15 @@ class AtomicRun:
         try:
             if exc_type is not None:
                 return False
-            for item in sorted(path for path in self.working.rglob("*") if path.is_file()):
+            for item in sorted(
+                path for path in self.working.rglob("*") if path.is_file()
+            ):
                 with item.open("rb") as stream:
                     os.fsync(stream.fileno())
             if os.path.lexists(self.destination):
-                raise FileExistsError(f"completed run already exists: {self.destination}")
+                raise FileExistsError(
+                    f"completed run already exists: {self.destination}"
+                )
             os.replace(self.working, self.destination)
             return False
         finally:
@@ -112,7 +118,9 @@ class CurveRow:
 
 
 def write_json(path: Path, value: object) -> None:
-    payload = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    payload = (
+        json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
 
@@ -130,7 +138,9 @@ def _write_hashed(path: Path, rows: Sequence[Sequence[str]]) -> str:
 def write_mot_tracks(path: Path, frames: Sequence[TrackBatch]) -> str:
     rows: list[list[str]] = []
     for frame_index, tracks in enumerate(frames, start=1):
-        for index in sorted(range(len(tracks)), key=lambda item: int(tracks.track_ids[item])):
+        for index in sorted(
+            range(len(tracks)), key=lambda item: int(tracks.track_ids[item])
+        ):
             if int(tracks.class_ids[index]) != 1:
                 raise ValueError("MOT17 tracker output must use pedestrian class 1")
             x1, y1, x2, y2 = tracks.boxes_xyxy[index]
@@ -155,7 +165,9 @@ def write_mot_ground_truth(path: Path, episode: Episode) -> str:
     rows: list[list[str]] = []
     for frame_index in range(episode.frame_count):
         truth = episode.frame(frame_index).ground_truth
-        for index in sorted(range(len(truth)), key=lambda item: int(truth.track_ids[item])):
+        for index in sorted(
+            range(len(truth)), key=lambda item: int(truth.track_ids[item])
+        ):
             valid = bool(truth.valid[index])
             ignored = bool(truth.ignore[index])
             if not valid and not ignored:
@@ -164,7 +176,9 @@ def write_mot_ground_truth(path: Path, episode: Episode) -> str:
             if valid and class_id != 1:
                 raise ValueError("valid MOT17 ground truth must use pedestrian class 1")
             if ignored and class_id not in _IGNORED_MOT17_CLASSES:
-                raise ValueError("ignored MOT17 ground truth must use a supported distractor class")
+                raise ValueError(
+                    "ignored MOT17 ground truth must use a supported distractor class"
+                )
             track_id = int(truth.track_ids[index])
             if track_id <= 0:
                 raise ValueError("MOT ground-truth track IDs must be positive")
@@ -200,7 +214,7 @@ def write_curve_csv(path: Path, points: Sequence[CurveRow]) -> str:
     rows.extend(
         [
             point.policy_id,
-            f"{point.nominal_rate:.6f}",
+            repr(point.nominal_rate),
             f"{point.realized_compute:.9f}",
             f"{point.hota:.9f}",
         ]

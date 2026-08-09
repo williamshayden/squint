@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import replace
 from hashlib import sha256
@@ -248,7 +249,7 @@ def test_policy_identifier_rejection_happens_before_atomic_publication(
 
 
 @pytest.mark.parametrize(
-    "identifier", ["all-frame", "first-frame-only", "anchors", "/tmp/x"]
+    "identifier", ["all-frame", "first-frame-only", "anchors", "ANCHORS", "/tmp/x"]
 )
 def test_reserved_and_path_like_policy_identifiers_are_rejected(
     synthetic_config: Path, identifier: str
@@ -266,6 +267,106 @@ def test_reserved_and_path_like_policy_identifiers_are_rejected(
     with pytest.raises(ConfigurationError, match=r"policies\[0\].id"):
         evaluate(unsafe)
     assert not unsafe.output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "CON",
+        "PRN.log",
+        "aux",
+        "NUL",
+        "COM1.txt",
+        "lpt9.csv",
+        "foo.",
+        "scene:1",
+        "name-space ",
+    ],
+)
+def test_windows_reserved_and_ambiguous_policy_identifiers_are_rejected(
+    synthetic_config: Path, identifier: str
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    invalid = replace(
+        config,
+        policies=(
+            PolicySpec(identifier, "python:tests.fakes:never_detect_factory", {}),
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"policies\[0\].id"):
+        evaluate(invalid)
+    assert not invalid.output_dir.exists()
+    assert not list(
+        invalid.output_dir.parent.glob(f".{invalid.output_dir.name}.*.incomplete")
+    )
+
+
+def test_policy_identifier_case_collisions_are_rejected_before_atomic_run(
+    synthetic_config: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    collision = replace(
+        config,
+        policies=(
+            PolicySpec("foo", "python:tests.fakes:never_detect_factory", {}),
+            PolicySpec("FOO", "python:tests.fakes:never_detect_factory", {}),
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"policies\[1\].id"):
+        evaluate(collision)
+    assert not collision.output_dir.exists()
+    assert not list(
+        collision.output_dir.parent.glob(f".{collision.output_dir.name}.*.incomplete")
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier", ["CON", "COM1.txt", "foo.", "scene:1", "name-space "]
+)
+def test_unsafe_episode_identifier_is_rejected_before_atomic_run(
+    tmp_path: Path, identifier: str
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    _make_episode(
+        tmp_path / "episode-a", frame_count=5, latency_ms=10.0, identifier=identifier
+    )
+    _make_episode(
+        tmp_path / "episode-b", frame_count=7, latency_ms=20.0, identifier="other"
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match="episode.id"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+    assert not list(tmp_path.glob(".result.*.incomplete"))
+
+
+def test_episode_identifier_case_collisions_are_rejected_before_atomic_run(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    _make_episode(
+        tmp_path / "episode-a", frame_count=5, latency_ms=10.0, identifier="foo"
+    )
+    _make_episode(
+        tmp_path / "episode-b", frame_count=7, latency_ms=20.0, identifier="FOO"
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match="episode.id"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+    assert not list(tmp_path.glob(".result.*.incomplete"))
 
 
 def test_track_paths_distinguish_constrained_all_frame_named_policy(
@@ -320,6 +421,12 @@ def test_close_rates_keep_distinct_track_files_and_metric_inputs(
         == 4
     )
     assert result.metric_input_sha256
+    with result.output_dir.joinpath("curve.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        rates = [row["nominal_rate"] for row in csv.DictReader(stream)]
+    assert rates == ["0.1000001", "0.1000002"]
+    assert {float(rate) for rate in rates} == {0.1000001, 0.1000002}
 
 
 def test_manual_factory_validation_happens_before_atomic_publication(

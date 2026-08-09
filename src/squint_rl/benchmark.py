@@ -35,6 +35,16 @@ from .tracker import Observation, PolicyContext, TrackBatch, Tracker
 _ACTION_FORMAT = b"squint.action.v1"
 _METRIC_FORMAT = b"squint.metric-input.v1"
 _RESERVED_POLICY_IDENTIFIERS = frozenset({"all-frame", "first-frame-only", "anchors"})
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+)
 
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
@@ -140,9 +150,10 @@ def _validate_benchmark_configuration(
     for index, policy in enumerate(policy_specs):
         field = f"policies[{index}]"
         _validate_policy_identifier(policy.identifier, field)
-        if policy.identifier in identifiers:
+        identifier_key = policy.identifier.casefold()
+        if identifier_key in identifiers:
             raise ConfigurationError(f"{field}.id must be unique")
-        identifiers.add(policy.identifier)
+        identifiers.add(identifier_key)
         if policy.factory != "<callable>":
             _validate_factory_path(policy.factory, f"{field}.factory")
 
@@ -155,22 +166,26 @@ def _validate_factory_path(path: str, field: str) -> None:
 
 
 def _validate_policy_identifier(identifier: object, field: str) -> None:
-    if not isinstance(identifier, str) or not identifier:
+    if (
+        not _portable_component(identifier)
+        or cast(str, identifier).casefold() in _RESERVED_POLICY_IDENTIFIERS
+    ):
         raise ConfigurationError(
             f"{field}.id must be a nonempty artifact-safe identifier"
         )
-    safe = all(
+
+
+def _portable_component(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if value[0] in ". " or value[-1] in ". ":
+        return False
+    if not all(
         character.isascii() and (character.isalnum() or character in "._-")
-        for character in identifier
-    )
-    if (
-        not safe
-        or identifier.startswith(".")
-        or identifier in _RESERVED_POLICY_IDENTIFIERS
+        for character in value
     ):
-        raise ConfigurationError(
-            f"{field}.id must be an artifact-safe nonreserved identifier"
-        )
+        return False
+    return value.split(".", 1)[0].casefold() not in _WINDOWS_RESERVED_COMPONENTS
 
 
 def _validate_episodes(episodes: Sequence[Episode]) -> None:
@@ -184,19 +199,16 @@ def _validate_episodes(episodes: Sequence[Episode]) -> None:
         manifest = episode.manifest
         episode_object = _manifest_mapping(manifest, "episode")
         identifier = episode_object.get("id")
-        if not isinstance(identifier, str) or not identifier:
+        if not _portable_component(identifier):
             raise EpisodeValidationError(
-                "manifest episode.id must be a nonempty string"
+                "manifest episode.id must be an artifact-safe portable component"
             )
-        if identifier in {".", ".."} or any(
-            part in identifier for part in ("/", "\\", "\x00")
-        ):
-            raise EpisodeValidationError("manifest episode.id must be a safe filename")
-        if identifier in identifiers:
+        identifier_key = cast(str, identifier).casefold()
+        if identifier_key in identifiers:
             raise EpisodeValidationError(
                 "manifest episode.id must be unique across the benchmark"
             )
-        identifiers.add(identifier)
+        identifiers.add(identifier_key)
         detector = _manifest_mapping(manifest, "detector")
         profile = json.dumps(_jsonable(detector), sort_keys=True, separators=(",", ":"))
         if detector_profile is None:
