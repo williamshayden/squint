@@ -896,13 +896,20 @@ class ReferenceProfile:
 def _require_profile_compatible(
     trace: RawTrace, profile: ReferenceProfile, *, partition: str
 ) -> None:
+    if type(trace.sequence_id) is not str:
+        raise ValueError("RawTrace sequence_id must be a built-in string")
+    manifest = trace.manifest_fields
+    manifest_sequence_id = manifest.get("sequence_id")
+    if type(manifest_sequence_id) is not str:
+        raise ValueError("manifest_fields sequence_id must be a built-in string")
+    if trace.sequence_id != manifest_sequence_id:
+        raise ValueError("manifest_fields sequence_id must match RawTrace sequence_id")
     if type(partition) is not str:
         raise ValueError("partition must be train, validation, or test")
     if trace.sequence_id not in sequence_ids(partition):
         raise ValueError(
             f"sequence {trace.sequence_id} does not belong to partition {partition}"
         )
-    manifest = trace.manifest_fields
     if not isinstance(manifest, Mapping):
         raise ValueError("manifest_fields must be a mapping")  # noqa: TRY004
     _validate_arrays(trace.arrays)
@@ -950,6 +957,8 @@ def _require_profile_compatible(
     available, error = nvml["available"], nvml["error"]
     if type(available) is not bool:
         raise ValueError("telemetry.nvml.available must be a bool")
+    if error is not None and type(error) is not str:
+        raise ValueError("telemetry.nvml.error must be a built-in string or null")
     if error is not None and error not in ("sample_failed", "invalid_sample"):
         raise ValueError("telemetry.nvml.error is invalid")
     sample_count = telemetry["sample_count"]

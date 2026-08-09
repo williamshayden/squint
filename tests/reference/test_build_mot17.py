@@ -2219,6 +2219,71 @@ def test_partition_and_sequence_membership_fail_before_seal(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("location", ["trace", "manifest"])
+def test_non_builtin_sequence_ids_fail_before_membership_or_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    class EqualitySpoof:
+        def __init__(self) -> None:
+            self.comparisons = 0
+
+        def __eq__(self, other: object) -> bool:
+            del other
+            self.comparisons += 1
+            return True
+
+        def __str__(self) -> str:
+            return "02"
+
+    class SequenceIdSubclass(str):
+        pass
+
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    spoof = EqualitySpoof()
+    if location == "trace":
+        object.__setattr__(trace, "sequence_id", spoof)
+    else:
+        manifest = dict(trace.manifest_fields)
+        manifest["sequence_id"] = SequenceIdSubclass("02")
+        trace = RawTrace("02", trace.arrays, manifest)
+    destination = tmp_path / "published"
+    before = {
+        path.relative_to(tmp_path): None if path.is_dir() else path.read_bytes()
+        for path in tmp_path.rglob("*")
+    }
+    seal_calls = 0
+
+    def record_seal(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal seal_calls
+        seal_calls += 1
+        return destination
+
+    monkeypatch.setattr(build_mot17_module, "seal_episode", record_seal)
+    with pytest.raises(ValueError, match="sequence_id"):
+        build_mot17_module._seal_trace(
+            destination,
+            trace=trace,
+            profile=profile,
+            partition="train",
+        )
+
+    after = {
+        path.relative_to(tmp_path): None if path.is_dir() else path.read_bytes()
+        for path in tmp_path.rglob("*")
+    }
+    assert spoof.comparisons == 0
+    assert seal_calls == 0
+    assert before == after
+    assert not destination.exists()
+    assert not tuple(destination.parent.glob(f".{destination.name}.*.incomplete"))
+
+
 @pytest.mark.parametrize("mutation", ["detector", "hardware"])
 def test_identity_mismatch_fails_before_manifest_or_seal(
     tmp_path: Path,
@@ -2506,6 +2571,60 @@ def test_malformed_aggregate_telemetry_fails_before_manifest_or_seal(
 
     assert publication_calls == 0
     assert not (tmp_path / "must-not-exist").exists()
+
+
+@pytest.mark.parametrize("error_code", ["sample_failed", "invalid_sample"])
+def test_telemetry_error_str_subclass_fails_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    class ErrorCodeSubclass(str):
+        pass
+
+    trace = _sealable_trace(tmp_path, "02")
+    profile = _profile(
+        [trace, *[_profile_trace(tmp_path, name) for name in ("04", "05", "10")]]
+    )
+    manifest = _plain_json(trace.manifest_fields)
+    assert isinstance(manifest, dict)
+    telemetry = _telemetry()
+    telemetry["nvml"] = {
+        "available": True,
+        "error": ErrorCodeSubclass(error_code),
+    }
+    manifest["telemetry"] = telemetry
+    candidate = RawTrace("02", trace.arrays, manifest)
+    destination = tmp_path / "published"
+    before = {
+        path.relative_to(tmp_path): None if path.is_dir() else path.read_bytes()
+        for path in tmp_path.rglob("*")
+    }
+    seal_calls = 0
+
+    def record_seal(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        nonlocal seal_calls
+        seal_calls += 1
+        return destination
+
+    monkeypatch.setattr(build_mot17_module, "seal_episode", record_seal)
+    with pytest.raises(ValueError, match=r"nvml\.error"):
+        build_mot17_module._seal_trace(
+            destination,
+            trace=candidate,
+            profile=profile,
+            partition="train",
+        )
+
+    after = {
+        path.relative_to(tmp_path): None if path.is_dir() else path.read_bytes()
+        for path in tmp_path.rglob("*")
+    }
+    assert seal_calls == 0
+    assert before == after
+    assert not destination.exists()
+    assert not tuple(destination.parent.glob(f".{destination.name}.*.incomplete"))
 
 
 def test_seal_trace_calls_compatibility_manifest_then_seal_exactly_once(
