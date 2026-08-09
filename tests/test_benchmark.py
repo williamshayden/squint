@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from squint_rl.config import BenchmarkConfig
-from squint_rl.episode import Episode, seal_episode
+from squint_rl.config import (
+    BenchmarkConfig,
+    ConfigurationError,
+    PolicySpec,
+    TrackerSpec,
+)
+from squint_rl.episode import Episode, EpisodeValidationError, seal_episode
 from squint_rl.synthetic import make_synthetic_episode
 
 
@@ -27,12 +33,15 @@ def _tree_hash(path: Path) -> str:
 
 
 def _config_text(
-    *, output_dir: str, policy_factory: str = "python:tests.fakes:greedy_factory"
+    *,
+    output_dir: str,
+    policy_factory: str = "python:tests.fakes:greedy_factory",
+    budget_rates: str = "[0.10, 0.50]",
 ) -> str:
     return f'''schema_version = 1
 episodes = ["episode-a", "episode-b"]
 output_dir = "{output_dir}"
-budget_rates = [0.10, 0.50]
+budget_rates = {budget_rates}
 seed = 17
 
 [observation_scales]
@@ -51,7 +60,12 @@ factory = "{policy_factory}"
 
 
 def _make_episode(
-    path: Path, *, frame_count: int, latency_ms: float, identifier: str
+    path: Path,
+    *,
+    frame_count: int,
+    latency_ms: float,
+    identifier: str,
+    detector_overrides: dict[str, object] | None = None,
 ) -> Path:
     source = make_synthetic_episode(
         path.with_name(f"{path.name}-source"),
@@ -63,6 +77,9 @@ def _make_episode(
     episode = Episode.open(source)
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     manifest["episode"]["id"] = identifier
+    manifest["detector"]["weights_sha256"] = "f" * 64
+    if detector_overrides is not None:
+        manifest["detector"].update(detector_overrides)
     manifest["artifacts"] = {}
     arrays = {
         name: np.array(value, copy=True) for name, value in episode.arrays.items()
@@ -161,6 +178,303 @@ def test_import_path_override_replaces_configured_policies(
     )
 
 
+def test_direct_callable_override_is_truthful_in_config_and_provenance(
+    synthetic_config: Path,
+) -> None:
+    from tests.fakes import never_detect_factory
+
+    from squint_rl.benchmark import evaluate
+
+    result = evaluate(
+        BenchmarkConfig.load(synthetic_config), policy_factory=never_detect_factory
+    )
+    config = json.loads(result.output_dir.joinpath("config.json").read_text())
+    provenance = json.loads(result.output_dir.joinpath("provenance.json").read_text())
+
+    assert config["policies"] == [
+        {"id": "external", "factory": "<callable>", "parameters": {}}
+    ]
+    assert provenance["policy_factories"] == ["<callable>"]
+    assert (
+        provenance["config_sha256"]
+        == sha256(result.output_dir.joinpath("config.json").read_bytes()).hexdigest()
+    )
+    assert (
+        provenance["config_sha256"]
+        != sha256(
+            BenchmarkConfig.load(synthetic_config).source_path.read_bytes()
+        ).hexdigest()
+    )
+
+
+def test_effective_config_hash_does_not_require_a_readable_source_file(
+    synthetic_config: Path, tmp_path: Path
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = replace(
+        BenchmarkConfig.load(synthetic_config), source_path=tmp_path / "missing.toml"
+    )
+    result = evaluate(config)
+    provenance = json.loads(result.output_dir.joinpath("provenance.json").read_text())
+
+    assert (
+        provenance["config_sha256"]
+        == sha256(result.output_dir.joinpath("config.json").read_bytes()).hexdigest()
+    )
+
+
+def test_policy_identifier_rejection_happens_before_atomic_publication(
+    synthetic_config: Path, tmp_path: Path
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    unsafe = replace(
+        config,
+        policies=(
+            PolicySpec("../../escaped", "python:tests.fakes:never_detect_factory", {}),
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"policies\[0\].id"):
+        evaluate(unsafe)
+
+    assert not unsafe.output_dir.exists()
+    assert not (tmp_path / "escaped").exists()
+    assert not list(
+        unsafe.output_dir.parent.glob(f".{unsafe.output_dir.name}.*.incomplete")
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier", ["all-frame", "first-frame-only", "anchors", "/tmp/x"]
+)
+def test_reserved_and_path_like_policy_identifiers_are_rejected(
+    synthetic_config: Path, identifier: str
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    unsafe = replace(
+        config,
+        policies=(
+            PolicySpec(identifier, "python:tests.fakes:never_detect_factory", {}),
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"policies\[0\].id"):
+        evaluate(unsafe)
+    assert not unsafe.output_dir.exists()
+
+
+def test_track_paths_distinguish_constrained_all_frame_named_policy(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.benchmark import _rate_directory, _track_path
+
+    assert _track_path(tmp_path, "all-frame", 0.1, "sequence") == (
+        tmp_path / "tracks" / "all-frame" / _rate_directory(0.1) / "sequence.txt"
+    )
+
+
+def test_close_rates_use_distinct_track_directories(tmp_path: Path) -> None:
+    from squint_rl.benchmark import _rate_directory
+
+    first = _rate_directory(0.1000001)
+    second = _rate_directory(0.1000002)
+
+    assert first != second
+    assert first.startswith("rho-") and second.startswith("rho-")
+
+
+def test_close_rates_keep_distinct_track_files_and_metric_inputs(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.benchmark import _rate_directory, evaluate
+
+    _make_episode(
+        tmp_path / "episode-a", frame_count=5, latency_ms=10.0, identifier="a"
+    )
+    _make_episode(
+        tmp_path / "episode-b", frame_count=7, latency_ms=20.0, identifier="b"
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(
+        _config_text(
+            output_dir="result",
+            budget_rates="[0.1000001, 0.1000002]",
+        ),
+        encoding="utf-8",
+    )
+
+    result = evaluate(config_path)
+    directories = {
+        item.name
+        for item in result.output_dir.joinpath("tracks", "configured").iterdir()
+    }
+
+    assert directories == {_rate_directory(0.1000001), _rate_directory(0.1000002)}
+    assert (
+        len(list(result.output_dir.joinpath("tracks", "configured").rglob("*.txt")))
+        == 4
+    )
+    assert result.metric_input_sha256
+
+
+def test_manual_factory_validation_happens_before_atomic_publication(
+    synthetic_config: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    invalid = replace(config, tracker=TrackerSpec("python:not_real_module:factory", {}))
+
+    with pytest.raises(ConfigurationError, match="tracker.factory"):
+        evaluate(invalid)
+    assert not invalid.output_dir.exists()
+    assert not list(
+        invalid.output_dir.parent.glob(f".{invalid.output_dir.name}.*.incomplete")
+    )
+
+
+def test_manual_effective_policy_factory_validation_happens_before_atomic_publication(
+    synthetic_config: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    invalid = replace(
+        config,
+        policies=(PolicySpec("valid", "python:not_real_module:factory", {}),),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"policies\[0\].factory"):
+        evaluate(invalid)
+    assert not invalid.output_dir.exists()
+    assert not list(
+        invalid.output_dir.parent.glob(f".{invalid.output_dir.name}.*.incomplete")
+    )
+
+
+def test_tracker_constructor_failure_retains_incomplete_output(
+    synthetic_config: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    runtime = replace(
+        config,
+        tracker=TrackerSpec("python:tests.fakes:raising_tracker_factory", {}),
+    )
+
+    with pytest.raises(RuntimeError, match="tracker construction failed"):
+        evaluate(runtime)
+    assert not runtime.output_dir.exists()
+    assert (
+        len(
+            list(
+                runtime.output_dir.parent.glob(
+                    f".{runtime.output_dir.name}.*.incomplete"
+                )
+            )
+        )
+        == 1
+    )
+
+
+def test_stateful_factories_are_fresh_and_seeded_per_constrained_unit(
+    synthetic_config: Path,
+) -> None:
+    from tests import fakes
+
+    from squint_rl.benchmark import evaluate
+
+    config = BenchmarkConfig.load(synthetic_config)
+    config = replace(
+        config,
+        tracker=TrackerSpec("python:tests.fakes:stateful_tracker_factory", {}),
+        policies=(
+            PolicySpec("stateful", "python:tests.fakes:stateful_policy_factory", {}),
+        ),
+    )
+    fakes.reset_stateful_records()
+    first = evaluate(config)
+    first_seeds = list(fakes.stateful_policy_seeds)
+    first_tracker_instances = list(fakes.stateful_tracker_instances)
+    first_policy_instances = list(fakes.stateful_policy_instances)
+
+    fakes.reset_stateful_records()
+    evaluate(config.with_output_dir(config.output_dir.with_name("repeat")))
+
+    assert (
+        len(first_policy_instances)
+        == len({id(item) for item in first_policy_instances})
+        == 4
+    )
+    assert (
+        len(first_tracker_instances)
+        == len({id(item) for item in first_tracker_instances})
+        == 8
+    )
+    assert len(first_seeds) == len(set(first_seeds)) == 4
+    assert fakes.stateful_policy_seeds == first_seeds
+    assert first.action_sha256
+
+
+def test_unequal_episode_costs_use_one_summed_denominator_and_common_support(
+    synthetic_config: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    result = evaluate(synthetic_config)
+    anchors = result.results["anchors"]
+    points = result.results["policies"]["configured"]["points"]
+
+    assert anchors["all_frame"]["charged_detector_ms"] == pytest.approx(190.0)
+    assert anchors["first_frame_only"]["realized_compute"] == pytest.approx(
+        30.0 / 190.0
+    )
+    assert result.results["curve_areas"]["support"] == pytest.approx(
+        [
+            min(point["realized_compute"] for point in points),
+            max(point["realized_compute"] for point in points),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "detector_overrides",
+    [
+        {"threshold": 0.2},
+        {"input_size": [64, 64]},
+        {"precision": "float16"},
+        {"weights_sha256": "a" * 64},
+    ],
+)
+def test_complete_detector_profile_must_match_before_atomic_publication(
+    tmp_path: Path, detector_overrides: dict[str, object]
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    _make_episode(
+        tmp_path / "episode-a", frame_count=5, latency_ms=10.0, identifier="a"
+    )
+    _make_episode(
+        tmp_path / "episode-b",
+        frame_count=7,
+        latency_ms=20.0,
+        identifier="b",
+        detector_overrides=detector_overrides,
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match="detector profile"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
 @pytest.mark.parametrize(
     "policy_factory",
     ["python:tests.fakes:raising_policy_factory"],
@@ -192,3 +506,15 @@ def test_results_are_canonical_json(synthetic_config: Path) -> None:
     payload = result.output_dir.joinpath("results.json").read_bytes()
     assert payload.endswith(b"\n")
     assert json.loads(payload) == result.results
+
+
+def test_public_exports_have_the_documented_order() -> None:
+    import squint_rl
+
+    assert squint_rl.__all__ == [
+        "Episode",
+        "Tracker",
+        "SquintEnv",
+        "evaluate",
+        "__version__",
+    ]

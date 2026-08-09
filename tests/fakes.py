@@ -5,6 +5,16 @@ import numpy as np
 from squint_rl.env import RUN_DETECTOR, SKIP
 from squint_rl.tracker import DetectionBatch, TrackBatch, TrackerSummary
 
+stateful_tracker_instances: list[object] = []
+stateful_policy_instances: list[object] = []
+stateful_policy_seeds: list[int] = []
+
+
+def reset_stateful_records() -> None:
+    stateful_tracker_instances.clear()
+    stateful_policy_instances.clear()
+    stateful_policy_seeds.clear()
+
 
 class EchoTracker:
     """Small tracker-shaped double for replay benchmark contracts."""
@@ -48,6 +58,17 @@ def raising_tracker_factory(*, episode: object) -> EchoTracker:
     raise RuntimeError("tracker construction failed")
 
 
+class StatefulTracker(EchoTracker):
+    def __init__(self) -> None:
+        super().__init__()
+        stateful_tracker_instances.append(self)
+
+
+def stateful_tracker_factory(*, episode: object) -> StatefulTracker:
+    del episode
+    return StatefulTracker()
+
+
 def greedy_factory(*, context: object) -> object:
     del context
 
@@ -73,3 +94,19 @@ def raising_policy_factory(*, context: object) -> object:
         raise RuntimeError("policy execution failed")
 
     return choose
+
+
+class StatefulPolicy:
+    def __init__(self) -> None:
+        stateful_policy_instances.append(self)
+
+    def reset(self, *, seed: int) -> None:
+        stateful_policy_seeds.append(seed)
+
+    def __call__(self, _observation: object) -> int:
+        return SKIP
+
+
+def stateful_policy_factory(*, context: object) -> StatefulPolicy:
+    del context
+    return StatefulPolicy()

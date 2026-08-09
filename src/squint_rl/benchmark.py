@@ -34,6 +34,7 @@ from .tracker import Observation, PolicyContext, TrackBatch, Tracker
 
 _ACTION_FORMAT = b"squint.action.v1"
 _METRIC_FORMAT = b"squint.metric-input.v1"
+_RESERVED_POLICY_IDENTIFIERS = frozenset({"all-frame", "first-frame-only", "anchors"})
 
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
@@ -90,12 +91,26 @@ def evaluate(
         config = BenchmarkConfig.load(config)
     episodes = tuple(Episode.open(path) for path in config.episodes)
     _validate_episodes(episodes)
-    _validate_policy_override(policy_factory)
+    policy_specs = _effective_policy_specs(config, policy_factory)
+    _validate_benchmark_configuration(config, policy_specs)
 
     with AtomicRun(config.output_dir) as work:
         started_at = datetime.now(timezone.utc)
-        result = _run_all(config, episodes, work, policy_factory=policy_factory)
-        _write_complete_artifacts(config, episodes, result, work, started_at=started_at)
+        result = _run_all(
+            config,
+            episodes,
+            work,
+            policy_specs=policy_specs,
+            policy_factory=policy_factory,
+        )
+        _write_complete_artifacts(
+            config,
+            episodes,
+            result,
+            work,
+            policy_specs=policy_specs,
+            started_at=started_at,
+        )
 
     return BenchmarkResult(
         output_dir=config.output_dir,
@@ -105,9 +120,57 @@ def evaluate(
     )
 
 
-def _validate_policy_override(factory: Callable[..., Policy] | None) -> None:
-    if factory is not None and not callable(factory):
+def _effective_policy_specs(
+    config: BenchmarkConfig, policy_factory: Callable[..., Policy] | None
+) -> tuple[PolicySpec, ...]:
+    if policy_factory is None:
+        return config.policies
+    if not callable(policy_factory):
         raise ConfigurationError("policy_factory must be callable")
+    return (PolicySpec("external", "<callable>", {}),)
+
+
+def _validate_benchmark_configuration(
+    config: BenchmarkConfig, policy_specs: Sequence[PolicySpec]
+) -> None:
+    _validate_factory_path(config.tracker.factory, "tracker.factory")
+    if not policy_specs:
+        raise ConfigurationError("policies must be nonempty")
+    identifiers: set[str] = set()
+    for index, policy in enumerate(policy_specs):
+        field = f"policies[{index}]"
+        _validate_policy_identifier(policy.identifier, field)
+        if policy.identifier in identifiers:
+            raise ConfigurationError(f"{field}.id must be unique")
+        identifiers.add(policy.identifier)
+        if policy.factory != "<callable>":
+            _validate_factory_path(policy.factory, f"{field}.factory")
+
+
+def _validate_factory_path(path: str, field: str) -> None:
+    try:
+        load_factory(path)
+    except ConfigurationError as exc:
+        raise ConfigurationError(f"{field} is invalid: {exc}") from exc
+
+
+def _validate_policy_identifier(identifier: object, field: str) -> None:
+    if not isinstance(identifier, str) or not identifier:
+        raise ConfigurationError(
+            f"{field}.id must be a nonempty artifact-safe identifier"
+        )
+    safe = all(
+        character.isascii() and (character.isalnum() or character in "._-")
+        for character in identifier
+    )
+    if (
+        not safe
+        or identifier.startswith(".")
+        or identifier in _RESERVED_POLICY_IDENTIFIERS
+    ):
+        raise ConfigurationError(
+            f"{field}.id must be an artifact-safe nonreserved identifier"
+        )
 
 
 def _validate_episodes(episodes: Sequence[Episode]) -> None:
@@ -115,6 +178,7 @@ def _validate_episodes(episodes: Sequence[Episode]) -> None:
         raise EpisodeValidationError("benchmark requires at least one episode")
     identifiers: set[str] = set()
     detector_profile: str | None = None
+    hardware_profile: str | None = None
     cost_unit: str | None = None
     for episode in episodes:
         manifest = episode.manifest
@@ -134,19 +198,23 @@ def _validate_episodes(episodes: Sequence[Episode]) -> None:
             )
         identifiers.add(identifier)
         detector = _manifest_mapping(manifest, "detector")
-        profile = json.dumps(
-            {
-                name: _jsonable(detector.get(name))
-                for name in ("id", "family", "model_id", "revision", "backend")
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        profile = json.dumps(_jsonable(detector), sort_keys=True, separators=(",", ":"))
         if detector_profile is None:
             detector_profile = profile
         elif detector_profile != profile:
             raise EpisodeValidationError(
                 "episodes must share the same detector profile"
+            )
+        hardware = json.dumps(
+            _jsonable(_manifest_mapping(manifest, "hardware")),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if hardware_profile is None:
+            hardware_profile = hardware
+        elif hardware_profile != hardware:
+            raise EpisodeValidationError(
+                "episodes must share the same hardware profile"
             )
         unit = _manifest_mapping(manifest, "cost_profile").get("unit")
         if not isinstance(unit, str) or not unit:
@@ -194,6 +262,7 @@ def _run_all(
     episodes: Sequence[Episode],
     work: Path,
     *,
+    policy_specs: Sequence[PolicySpec],
     policy_factory: Callable[..., Policy] | None,
 ) -> dict[str, object]:
     ordered_episodes = tuple(sorted(episodes, key=_episode_id))
@@ -227,7 +296,6 @@ def _run_all(
     )
     candidates.append(first_frame)
 
-    policy_specs = _policy_specs(config, policy_factory)
     constrained: dict[str, list[_Candidate]] = {}
     for policy in sorted(policy_specs, key=lambda item: item.identifier):
         policy_candidates: list[_Candidate] = []
@@ -327,14 +395,6 @@ def _run_all(
             else None,
         },
     }
-
-
-def _policy_specs(
-    config: BenchmarkConfig, policy_factory: Callable[..., Policy] | None
-) -> tuple[PolicySpec, ...]:
-    if policy_factory is None:
-        return config.policies
-    return (PolicySpec("external", "<callable>", {}),)
 
 
 def _all_frame_candidate(
@@ -550,14 +610,13 @@ def _evaluate_candidate(
 def _track_path(
     work: Path, identifier: str, rate: float | None, episode_id: str
 ) -> Path:
-    if identifier in {"all-frame", "first-frame-only"}:
+    if rate is None:
         return work / "tracks" / "anchors" / identifier / f"{episode_id}.txt"
-    assert rate is not None
     return work / "tracks" / identifier / _rate_directory(rate) / f"{episode_id}.txt"
 
 
 def _rate_directory(rate: float) -> str:
-    return f"rho-{rate:.6f}"
+    return f"rho-{rate.hex()}"
 
 
 def _record_actions(
@@ -667,10 +726,12 @@ def _write_complete_artifacts(
     result: Mapping[str, object],
     work: Path,
     *,
+    policy_specs: Sequence[PolicySpec],
     started_at: datetime,
 ) -> None:
     ended_at = datetime.now(timezone.utc)
-    write_json(work / "config.json", _config_json(config))
+    config_path = work / "config.json"
+    write_json(config_path, _config_json(config, policy_specs))
     write_json(work / "results.json", result["results"])
     write_json(
         work / "provenance.json",
@@ -678,7 +739,7 @@ def _write_complete_artifacts(
             "package_version": _optional_version("squint-rl"),
             "python_version": platform.python_version(),
             "platform": platform.platform(),
-            "config_sha256": sha256(config.source_path.read_bytes()).hexdigest(),
+            "config_sha256": sha256(config_path.read_bytes()).hexdigest(),
             "episodes": [
                 {"id": _episode_id(episode), "content_sha256": episode.content_sha256}
                 for episode in sorted(episodes, key=_episode_id)
@@ -686,7 +747,7 @@ def _write_complete_artifacts(
             "tracker_factory": config.tracker.factory,
             "policy_factories": [
                 policy.factory
-                for policy in sorted(config.policies, key=lambda item: item.identifier)
+                for policy in sorted(policy_specs, key=lambda item: item.identifier)
             ],
             "dependencies": {
                 name: _optional_version(name)
@@ -700,7 +761,9 @@ def _write_complete_artifacts(
     )
 
 
-def _config_json(config: BenchmarkConfig) -> dict[str, JsonValue]:
+def _config_json(
+    config: BenchmarkConfig, policy_specs: Sequence[PolicySpec]
+) -> dict[str, JsonValue]:
     return {
         "schema_version": 1,
         "episodes": [str(path) for path in config.episodes],
@@ -723,7 +786,7 @@ def _config_json(config: BenchmarkConfig) -> dict[str, JsonValue]:
                 "factory": policy.factory,
                 "parameters": _jsonable(policy.parameters),
             }
-            for policy in config.policies
+            for policy in policy_specs
         ],
     }
 

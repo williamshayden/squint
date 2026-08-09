@@ -24,6 +24,7 @@ def _make_episode(
     episode = Episode.open(source)
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     manifest["episode"]["id"] = identifier
+    manifest["detector"]["weights_sha256"] = "f" * 64
     manifest["artifacts"] = {}
     arrays = {
         name: np.array(value, copy=True) for name, value in episode.arrays.items()
@@ -131,6 +132,29 @@ def test_cli_policy_override_uses_external_policy(
         Path(receipt["output_dir"]).joinpath("results.json").read_text()
     )
     assert set(results["policies"]) == {"external"}
+
+
+def test_import_path_override_has_python_cli_results_byte_parity(
+    synthetic_config: Path, capsys
+) -> None:
+    from squint_rl.benchmark import evaluate
+    from squint_rl.config import BenchmarkConfig
+
+    policy = "python:tests.fakes:never_detect_factory"
+    config = BenchmarkConfig.load(synthetic_config)
+    python_result = evaluate(config.with_policy_override(policy))
+    config.source_path.write_text(
+        config.source_path.read_text(encoding="utf-8").replace(
+            'output_dir = "result"', 'output_dir = "cli-override"'
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["benchmark", str(config.source_path), "--policy", policy]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert python_result.output_dir.joinpath("results.json").read_bytes() == (
+        Path(receipt["output_dir"]).joinpath("results.json").read_bytes()
+    )
 
 
 def test_invalid_config_exits_two_before_output_creation(
