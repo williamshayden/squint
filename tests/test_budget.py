@@ -50,6 +50,16 @@ def test_refill_caps_balance_at_capacity() -> None:
     assert bucket.normalized_balance == 1.0
 
 
+def test_sequential_refills_credit_only_each_source_time_delta() -> None:
+    budget_config, token_bucket = _budget_types()
+    bucket = token_bucket(budget_config(10.0, 20.0, 1.0))
+    bucket.reset(timestamp_s=0.0)
+    bucket.refill(timestamp_s=1.0)
+    assert bucket.balance_ms == 11.0
+    bucket.refill(timestamp_s=3.0)
+    assert bucket.balance_ms == 13.0
+
+
 def test_p95_overrun_creates_debt_and_blocks_calls() -> None:
     budget_config, token_bucket = _budget_types()
     bucket = token_bucket(budget_config(10.0, 20.0, 5.0))
