@@ -660,6 +660,8 @@ def test_build_sequence_rejects_invalid_identity_before_prediction(
     [
         (b"GPU-fedcba98-7654-3210-fedc-ba9876543210", "0000:01:00.0", "573.44"),
         (f"GPU-{_FAKE_UUID_BARE}".encode(), "", "573.44"),
+        (f"GPU-{_FAKE_UUID_BARE}".encode(), "0000:01:20.0", "573.44"),
+        (f"GPU-{_FAKE_UUID_BARE}".encode(), "00000000:01:ff.0", "573.44"),
         (f"GPU-{_FAKE_UUID_BARE}".encode(), "0000:01:00.0", b"\x00"),
     ],
 )
@@ -728,6 +730,8 @@ def test_build_sequence_rejects_session_hardware_mismatch_before_prediction(
         ("pci_bus_id", "00000:01:00.0"),
         ("pci_bus_id", "0000:1:00.0"),
         ("pci_bus_id", "0000:01:0.0"),
+        ("pci_bus_id", "0000:01:20.0"),
+        ("pci_bus_id", "00000000:01:ff.0"),
         ("pci_bus_id", "0000:01:00.8"),
         ("pci_bus_id", "0000:0A:00.0"),
         ("pci_bus_id", " 0000:01:00.0"),
@@ -760,7 +764,10 @@ def test_build_sequence_rejects_noncanonical_cuda_identity_before_image_io(
     assert detector.calls == 0
 
 
-@pytest.mark.parametrize("pci_bus_id", ["0000:0a:0b.3", "00000000:0a:0b.3"])
+@pytest.mark.parametrize(
+    "pci_bus_id",
+    ["0000:0a:00.3", "0000:0a:1f.3", "00000000:0a:00.3", "00000000:0a:1f.3"],
+)
 def test_build_sequence_accepts_canonical_cuda_pci_domain_widths(
     tmp_path: Path,
     pci_bus_id: str,
