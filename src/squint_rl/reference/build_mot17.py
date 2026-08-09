@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -46,6 +49,14 @@ _ARRAY_SPECS: dict[str, tuple[np.dtype[Any], tuple[int | str, ...]]] = {
     "gt_frame_offsets": (np.dtype(np.int64), ("F+1",)),
 }
 _SOURCE_HASH_CHUNK_BYTES = 1024 * 1024
+_PROFILE_SCHEMA_NAME = "squint.reference-profile"
+_PROFILE_SCHEMA_VERSION = 1
+_PROFILE_TRAINING_IDS = ("02", "04", "05", "10")
+_PROFILE_COST_FIELDS = ("unit", "p95_ms", "reserve_ms", "capacity_ms", "profile_sha256")
+_PROFILE_NORMALIZATION_FIELDS = (
+    "active_tracks", "age_s", "motion_px_s", "time_since_detector_s"
+)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class Detector(Protocol):
@@ -153,6 +164,107 @@ def _immutable_array(value: NDArray[Any]) -> NDArray[Any]:
     return np.frombuffer(contiguous.tobytes(order="C"), dtype=contiguous.dtype).reshape(
         contiguous.shape
     )
+
+
+def _freeze_json(value: object, *, path: str = "manifest") -> object:
+    """Validate and recursively freeze a JSON value without retaining aliases."""
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings for JSON")  # noqa: TRY004
+            frozen[key] = _freeze_json(item, path=f"{path}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, path=f"{path}[]") for item in value)
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        try:
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{path} contains an overflowing JSON number")
+        except OverflowError as error:
+            raise ValueError(f"{path} contains an overflowing JSON number") from error
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite JSON numbers")
+        return value
+    raise ValueError(f"{path} must contain JSON values")
+
+
+def _jsonable(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(
+            _jsonable(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("value must have a finite JSON representation") from error
+
+
+def _lowercase_sha256(value: object, name: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a 64-character lowercase SHA-256 hash")
+    return value
+
+
+def _positive_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a positive finite number")  # noqa: TRY004
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive finite number") from error
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return normalized
+
+
+def _profile_identity(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} identity must be a JSON object")  # noqa: TRY004
+    frozen = _freeze_json(value, path=name)
+    identity = cast(Mapping[str, object], frozen)
+
+    def validate_hashes(item: object, path: str) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if key.endswith("sha256"):
+                    _lowercase_sha256(child, f"{path}.{key}")
+                validate_hashes(child, f"{path}.{key}")
+        elif isinstance(item, tuple):
+            for index, child in enumerate(item):
+                validate_hashes(child, f"{path}[{index}]")
+
+    validate_hashes(identity, name)
+    return identity
+
+
+def _profile_hash_payload(
+    detector: Mapping[str, object],
+    hardware: Mapping[str, object],
+    cost_profile: Mapping[str, object],
+    normalization: Mapping[str, object],
+    training_traces: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    cost_without_hash = {
+        key: value for key, value in cost_profile.items() if key != "profile_sha256"
+    }
+    return {
+        "detector": _jsonable(detector),
+        "hardware": _jsonable(hardware),
+        "cost_profile": _jsonable(cost_without_hash),
+        "normalization": _jsonable(normalization),
+        "training_traces": _jsonable(tuple(training_traces)),
+    }
 
 
 def pack_episode_arrays(
@@ -277,7 +389,224 @@ class RawTrace:
             name: _immutable_array(self.arrays[name]) for name in _ARRAY_NAMES
         }
         object.__setattr__(self, "arrays", MappingProxyType(frozen_arrays))
-        object.__setattr__(self, "manifest_fields", MappingProxyType(manifest))
+        object.__setattr__(self, "manifest_fields", _freeze_json(manifest))
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceProfile:
+    """Immutable training-only detector, hardware, cost, and scale profile."""
+    detector: Mapping[str, object]
+    hardware: Mapping[str, object]
+    cost_profile: Mapping[str, object]
+    normalization: Mapping[str, object]
+    training_traces: tuple[Mapping[str, object], ...]
+
+    def __post_init__(self) -> None:
+        detector = _profile_identity(self.detector, "detector")
+        hardware = _profile_identity(self.hardware, "hardware")
+        cost = _freeze_json(self.cost_profile, path="cost_profile")
+        normalization = _freeze_json(self.normalization, path="normalization")
+        traces = tuple(_freeze_json(trace, path="training_traces") for trace in self.training_traces)
+        if not isinstance(cost, Mapping):
+            raise ValueError("cost_profile must be a JSON object")  # noqa: TRY004
+        if not isinstance(normalization, Mapping):
+            raise ValueError("normalization must be a JSON object")  # noqa: TRY004
+        if any(not isinstance(trace, Mapping) for trace in traces):
+            raise ValueError("training_traces must contain JSON objects")
+        cost_mapping = cast(Mapping[str, object], cost)
+        normalization_mapping = cast(Mapping[str, object], normalization)
+        if set(cost_mapping) != set(_PROFILE_COST_FIELDS):
+            raise ValueError("cost_profile has missing or unexpected fields")
+        if cost_mapping["unit"] != "detector_ms":
+            raise ValueError("cost_profile.unit must be detector_ms")
+        p95 = _positive_number(cost_mapping["p95_ms"], "cost_profile.p95_ms")
+        reserve = _positive_number(cost_mapping["reserve_ms"], "cost_profile.reserve_ms")
+        capacity = _positive_number(cost_mapping["capacity_ms"], "cost_profile.capacity_ms")
+        if p95 != reserve:
+            raise ValueError("cost_profile.p95_ms must equal reserve_ms")
+        if capacity != 2.0 * reserve:
+            raise ValueError("cost_profile.capacity_ms must equal 2 * reserve_ms")
+        profile_hash = _lowercase_sha256(
+            cost_mapping["profile_sha256"], "cost_profile.profile_sha256"
+        )
+        if set(normalization_mapping) != set(_PROFILE_NORMALIZATION_FIELDS):
+            raise ValueError("normalization has missing or unexpected fields")
+        active_tracks = normalization_mapping["active_tracks"]
+        if isinstance(active_tracks, bool) or not isinstance(active_tracks, int):
+            raise ValueError("normalization.active_tracks must be a positive integer")  # noqa: TRY004
+        if active_tracks <= 0:
+            raise ValueError("normalization.active_tracks must be a positive integer")
+        for name in _PROFILE_NORMALIZATION_FIELDS[1:]:
+            _positive_number(normalization_mapping[name], f"normalization.{name}")
+        if len(traces) != len(_PROFILE_TRAINING_IDS):
+            raise ValueError("training_traces must contain exactly 02, 04, 05, and 10")
+        expected_ids = list(_PROFILE_TRAINING_IDS)
+        actual_ids: list[str] = []
+        for index, trace in enumerate(traces):
+            trace_mapping = cast(Mapping[str, object], trace)
+            if set(trace_mapping) != {"sequence_id", "causal_trace_sha256"}:
+                raise ValueError("training_traces have missing or unexpected fields")
+            identifier = trace_mapping["sequence_id"]
+            if not isinstance(identifier, str):
+                raise ValueError("training trace sequence_id must be a string")  # noqa: TRY004
+            actual_ids.append(identifier)
+            _lowercase_sha256(
+                trace_mapping["causal_trace_sha256"],
+                f"training_traces[{index}].causal_trace_sha256",
+            )
+        if actual_ids != expected_ids:
+            raise ValueError("training_traces must be ordered exactly as 02, 04, 05, and 10")
+
+        hash_payload = _profile_hash_payload(
+            detector, hardware, cost_mapping, normalization_mapping,
+            cast(tuple[Mapping[str, object], ...], traces),
+        )
+        expected_profile_hash = hashlib.sha256(_canonical_json(hash_payload).encode()).hexdigest()
+        if profile_hash != expected_profile_hash:
+            raise ValueError("cost_profile.profile_sha256 does not match canonical profile")
+        object.__setattr__(self, "detector", detector)
+        object.__setattr__(self, "hardware", hardware)
+        object.__setattr__(self, "cost_profile", cost)
+        object.__setattr__(self, "normalization", normalization)
+        object.__setattr__(self, "training_traces", cast(tuple[Mapping[str, object], ...], traces))
+
+    @property
+    def profile_sha256(self) -> str:
+        return cast(str, self.cost_profile["profile_sha256"])
+
+    @property
+    def detector_identity(self) -> Mapping[str, object]:
+        return self.detector
+
+    @property
+    def hardware_identity(self) -> Mapping[str, object]:
+        return self.hardware
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": {"name": _PROFILE_SCHEMA_NAME, "version": _PROFILE_SCHEMA_VERSION},
+            "detector": _jsonable(self.detector),
+            "hardware": _jsonable(self.hardware),
+            "cost_profile": _jsonable(self.cost_profile),
+            "normalization": _jsonable(self.normalization),
+            "training_traces": _jsonable(self.training_traces),
+        }
+
+    @property
+    def canonical_json(self) -> str:
+        return _canonical_json(self.to_dict())
+
+    def to_json(self) -> str:
+        return self.canonical_json
+
+    def episode_manifest_fields(self) -> dict[str, object]:
+        return {
+            "cost_profile": _jsonable(self.cost_profile),
+            "normalization": _jsonable(self.normalization),
+        }
+
+    def cost_profile_manifest(self) -> dict[str, object]:
+        return cast(dict[str, object], _jsonable(self.cost_profile))
+
+    def normalization_manifest(self) -> dict[str, object]:
+        return cast(dict[str, object], _jsonable(self.normalization))
+
+    def write(self, path: str | Path) -> None:
+        destination = Path(path)
+        with destination.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(self.canonical_json)
+
+    @classmethod
+    def load(cls, path: str | Path) -> ReferenceProfile:
+        source = Path(path)
+        try:
+            text = source.read_text(encoding="utf-8")
+            payload = json.loads(text)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"unable to load reference profile {source}") from error
+        if not isinstance(payload, Mapping):
+            raise ValueError("reference profile must be a JSON object")  # noqa: TRY004
+        expected_fields = {
+            "schema", "detector", "hardware", "cost_profile", "normalization", "training_traces"
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("reference profile has missing or unexpected fields")
+        schema = payload["schema"]
+        if not isinstance(schema, Mapping) or set(schema) != {"name", "version"}:
+            raise ValueError("reference profile schema must contain name and version")
+        if schema.get("name") != _PROFILE_SCHEMA_NAME or schema.get("version") != _PROFILE_SCHEMA_VERSION:
+            raise ValueError("unsupported reference profile schema")
+        profile = cls(
+            cast(Mapping[str, object], payload["detector"]),
+            cast(Mapping[str, object], payload["hardware"]),
+            cast(Mapping[str, object], payload["cost_profile"]),
+            cast(Mapping[str, object], payload["normalization"]),
+            tuple(cast(Sequence[Mapping[str, object]], payload["training_traces"])),
+        )
+        if text != profile.canonical_json:
+            raise ValueError("reference profile JSON is not canonical")
+        return profile
+
+
+def profile_training_traces(
+    traces: Sequence[RawTrace],
+    *,
+    reserve_ms: float = 1.0,
+    normalization: Mapping[str, object] | None = None,
+    tracker_factory: object | None = None,
+) -> ReferenceProfile:
+    """Freeze C2a1 profile inputs; schedule profiling is intentionally deferred."""
+    del tracker_factory
+    if len(traces) != len(_PROFILE_TRAINING_IDS):
+        raise ValueError("profile requires exactly training traces 02, 04, 05, and 10")
+    if len({trace.sequence_id for trace in traces}) != len(traces):
+        raise ValueError("profile training traces must not contain duplicates")
+    if {trace.sequence_id for trace in traces} != set(_PROFILE_TRAINING_IDS):
+        raise ValueError("profile requires exactly training traces 02, 04, 05, and 10")
+    ordered = sorted(traces, key=lambda trace: _PROFILE_TRAINING_IDS.index(trace.sequence_id))
+    first_manifest = ordered[0].manifest_fields
+    detector = _profile_identity(first_manifest.get("detector"), "detector")
+    hardware = _profile_identity(first_manifest.get("hardware"), "hardware")
+    detector_json = _canonical_json(detector)
+    hardware_json = _canonical_json(hardware)
+    profile_traces: list[Mapping[str, object]] = []
+    for trace in ordered:
+        current_detector = _profile_identity(trace.manifest_fields.get("detector"), "detector")
+        current_hardware = _profile_identity(trace.manifest_fields.get("hardware"), "hardware")
+        if _canonical_json(current_detector) != detector_json:
+            raise ValueError("training traces must share one detector identity")
+        if _canonical_json(current_hardware) != hardware_json:
+            raise ValueError("training traces must share one hardware identity")
+        causal_hash = _lowercase_sha256(
+            trace.manifest_fields.get("causal_trace_sha256"),
+            f"trace {trace.sequence_id}.causal_trace_sha256",
+        )
+        profile_traces.append(
+            {"sequence_id": trace.sequence_id, "causal_trace_sha256": causal_hash}
+        )
+    if normalization is None:
+        normalization = {
+            "active_tracks": 1,
+            "age_s": 1.0,
+            "motion_px_s": 1.0,
+            "time_since_detector_s": 1.0,
+        }
+    reserve = _positive_number(reserve_ms, "cost_profile.reserve_ms")
+    cost_without_hash: dict[str, object] = {
+        "unit": "detector_ms",
+        "p95_ms": reserve,
+        "reserve_ms": reserve,
+        "capacity_ms": 2.0 * reserve,
+    }
+    normalized = _freeze_json(normalization, path="normalization")
+    if not isinstance(normalized, Mapping):
+        raise ValueError("normalization must be a JSON object")  # noqa: TRY004
+    hash_payload = _profile_hash_payload(
+        detector, hardware, cost_without_hash, cast(Mapping[str, object], normalized), profile_traces
+    )
+    cost = dict(cost_without_hash)
+    cost["profile_sha256"] = hashlib.sha256(_canonical_json(hash_payload).encode()).hexdigest()
+    return ReferenceProfile(detector, hardware, cost, cast(Mapping[str, object], normalized), tuple(profile_traces))
 
 
 def build_sequence(
