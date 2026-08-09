@@ -106,7 +106,7 @@ def test_synthetic_profile_hash_identifies_its_frozen_cost_and_normalization() -
     ).hexdigest()
 
 
-def test_synthetic_profile_is_frozen_across_realized_frame_latencies() -> None:
+def test_synthetic_profile_tracks_its_configured_latency() -> None:
     synthetic_module = _synthetic_module()
     assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
     first = synthetic_module.synthetic_manifest(
@@ -116,7 +116,16 @@ def test_synthetic_profile_is_frozen_across_realized_frame_latencies() -> None:
         frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=20.0
     )
 
-    assert first["cost_profile"] == second["cost_profile"]
+    assert first["cost_profile"]["p95_ms"] == 10.0
+    assert first["cost_profile"]["reserve_ms"] == 10.0
+    assert first["cost_profile"]["capacity_ms"] == 20.0
+    assert second["cost_profile"]["p95_ms"] == 20.0
+    assert second["cost_profile"]["reserve_ms"] == 20.0
+    assert second["cost_profile"]["capacity_ms"] == 40.0
+    assert (
+        first["cost_profile"]["profile_sha256"]
+        != second["cost_profile"]["profile_sha256"]
+    )
     assert first["normalization"] == second["normalization"]
 
 

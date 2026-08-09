@@ -69,6 +69,7 @@ def _make_episode(
     detector_overrides: dict[str, object] | None = None,
     cost_profile_overrides: dict[str, object] | None = None,
     normalization_overrides: dict[str, object] | None = None,
+    normalization_to_remove: str | None = None,
 ) -> Path:
     source = make_synthetic_episode(
         path.with_name(f"{path.name}-source"),
@@ -81,12 +82,30 @@ def _make_episode(
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     manifest["episode"]["id"] = identifier
     manifest["detector"]["weights_sha256"] = "f" * 64
+    cost_profile: dict[str, object] = {
+        "unit": "detector_ms",
+        "p95_ms": 10.0,
+        "reserve_ms": 10.0,
+        "capacity_ms": 20.0,
+    }
+    profile_payload = json.dumps(
+        {
+            "cost_profile": cost_profile,
+            "normalization": manifest["normalization"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    cost_profile["profile_sha256"] = sha256(profile_payload).hexdigest()
+    manifest["cost_profile"] = cost_profile
     if detector_overrides is not None:
         manifest["detector"].update(detector_overrides)
     if cost_profile_overrides is not None:
         manifest["cost_profile"].update(cost_profile_overrides)
     if normalization_overrides is not None:
         manifest["normalization"].update(normalization_overrides)
+    if normalization_to_remove is not None:
+        manifest["normalization"].pop(normalization_to_remove)
     manifest["artifacts"] = {}
     arrays = {
         name: np.array(value, copy=True) for name, value in episode.arrays.items()
@@ -667,6 +686,70 @@ def test_config_observation_scales_must_match_frozen_normalization(
     config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
 
     with pytest.raises(EpisodeValidationError, match="observation_scales.age_s"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
+@pytest.mark.parametrize(
+    ("normalization_overrides", "normalization_to_remove", "message"),
+    [
+        (
+            {"unexpected": 1.0},
+            None,
+            "manifest normalization.unexpected is not supported",
+        ),
+        (None, "age_s", "manifest normalization.age_s is required"),
+    ],
+)
+def test_normalization_requires_exact_observation_scale_keys(
+    tmp_path: Path,
+    normalization_overrides: dict[str, object] | None,
+    normalization_to_remove: str | None,
+    message: str,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    for name, frame_count, latency_ms in (("a", 5, 10.0), ("b", 7, 20.0)):
+        _make_episode(
+            tmp_path / f"episode-{name}",
+            frame_count=frame_count,
+            latency_ms=latency_ms,
+            identifier=name,
+            normalization_overrides=normalization_overrides,
+            normalization_to_remove=normalization_to_remove,
+        )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match=message):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["active_tracks", "age_s", "motion_px_s", "time_since_detector_s"],
+)
+def test_huge_normalization_integer_has_field_specific_validation_error(
+    tmp_path: Path, field: str
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    for name, frame_count, latency_ms in (("a", 5, 10.0), ("b", 7, 20.0)):
+        _make_episode(
+            tmp_path / f"episode-{name}",
+            frame_count=frame_count,
+            latency_ms=latency_ms,
+            identifier=name,
+            normalization_overrides={field: 10**400},
+        )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(
+        EpisodeValidationError,
+        match=rf"manifest normalization\.{field} must be a positive finite number",
+    ):
         evaluate(config_path)
     assert not (tmp_path / "result").exists()
 

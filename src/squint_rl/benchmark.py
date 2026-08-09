@@ -34,6 +34,9 @@ from .tracker import Observation, ObservationScales, PolicyContext, TrackBatch, 
 
 _ACTION_FORMAT = b"squint.action.v1"
 _METRIC_FORMAT = b"squint.metric-input.v1"
+_NORMALIZATION_FIELDS = frozenset(
+    {"active_tracks", "age_s", "motion_px_s", "time_since_detector_s"}
+)
 _RESERVED_POLICY_IDENTIFIERS = frozenset({"all-frame", "first-frame-only", "anchors"})
 _WINDOWS_RESERVED_COMPONENTS = frozenset(
     {
@@ -298,6 +301,16 @@ def _validate_episodes(
 def _validate_observation_scales(
     configured: ObservationScales, frozen: Mapping[str, object]
 ) -> None:
+    missing = sorted(_NORMALIZATION_FIELDS - frozen.keys())
+    if missing:
+        raise EpisodeValidationError(
+            f"manifest normalization.{missing[0]} is required"
+        )
+    unexpected = sorted(frozen.keys() - _NORMALIZATION_FIELDS)
+    if unexpected:
+        raise EpisodeValidationError(
+            f"manifest normalization.{unexpected[0]} is not supported"
+        )
     expected = {
         "active_tracks": configured.active_tracks,
         "age_s": configured.age_s,
@@ -306,16 +319,23 @@ def _validate_observation_scales(
     }
     for name, configured_value in expected.items():
         frozen_value = frozen.get(name)
-        if (
-            isinstance(frozen_value, bool)
-            or not isinstance(frozen_value, (int, float))
-            or not math.isfinite(float(frozen_value))
-            or float(frozen_value) <= 0.0
+        if isinstance(frozen_value, bool) or not isinstance(
+            frozen_value, (int, float)
         ):
             raise EpisodeValidationError(
                 f"manifest normalization.{name} must be a positive finite number"
             )
-        if float(frozen_value) != configured_value:
+        try:
+            value = float(frozen_value)
+        except OverflowError as exc:
+            raise EpisodeValidationError(
+                f"manifest normalization.{name} must be a positive finite number"
+            ) from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise EpisodeValidationError(
+                f"manifest normalization.{name} must be a positive finite number"
+            )
+        if value != configured_value:
             raise EpisodeValidationError(
                 f"benchmark observation_scales.{name} must match manifest normalization.{name}"
             )

@@ -39,9 +39,9 @@ def synthetic_manifest(
     source_hash = sha256(literal_parameters.encode()).hexdigest()
     cost_profile: dict[str, object] = {
         "unit": "detector_ms",
-        "p95_ms": 10.0,
-        "reserve_ms": 10.0,
-        "capacity_ms": 20.0,
+        "p95_ms": latency_ms,
+        "reserve_ms": latency_ms,
+        "capacity_ms": 2.0 * latency_ms,
     }
     normalization = {
         "active_tracks": 8,
