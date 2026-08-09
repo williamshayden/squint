@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -31,6 +32,56 @@ def test_atomic_run_publishes_json_only_after_clean_exit(tmp_path: Path) -> None
     assert destination.joinpath("result.json").read_bytes() == b'{\n  "a": 1,\n  "b": 2\n}\n'
 
 
+def test_atomic_run_serializes_concurrent_publishers_without_overwriting_winner(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.artifacts import AtomicRun, write_json
+
+    destination = tmp_path / "run"
+    first_entered = Event()
+    release_first = Event()
+    outcome_lock = Lock()
+    outcomes: dict[str, str | OSError] = {}
+
+    def publish(label: str) -> None:
+        try:
+            with AtomicRun(destination) as work:
+                write_json(work / "result.json", {"publisher": label})
+                if label == "first":
+                    first_entered.set()
+                    if not release_first.wait(timeout=15):
+                        raise TimeoutError("first publisher was not released")
+            outcome: str | OSError = "success"
+        except OSError as error:
+            outcome = error
+        with outcome_lock:
+            outcomes[label] = outcome
+
+    first = Thread(target=publish, args=("first",))
+    first.start()
+    assert first_entered.wait(timeout=5)
+    assert not destination.exists()
+
+    second = Thread(target=publish, args=("second",))
+    second.start()
+    second.join(timeout=5)
+    second_finished_while_first_staged = not second.is_alive()
+
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert second_finished_while_first_staged
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert outcomes["first"] == "success"
+    assert isinstance(outcomes["second"], FileExistsError)
+    assert destination.joinpath("result.json").read_bytes() == (
+        b'{\n  "publisher": "first"\n}\n'
+    )
+    assert {item.name for item in tmp_path.iterdir()} == {"run"}
+
+
 def test_atomic_run_retains_interrupted_work(tmp_path: Path) -> None:
     from squint_rl.artifacts import AtomicRun, write_json
 
@@ -42,6 +93,11 @@ def test_atomic_run_retains_interrupted_work(tmp_path: Path) -> None:
     assert not destination.exists()
     incomplete = list(tmp_path.glob(".run.*.incomplete"))
     assert len(incomplete) == 1
+    assert incomplete[0].joinpath("result.json").exists()
+
+    with AtomicRun(destination) as work:
+        write_json(work / "result.json", {"retry": True})
+    assert destination.joinpath("result.json").exists()
     assert incomplete[0].joinpath("result.json").exists()
 
 
@@ -63,6 +119,7 @@ def test_atomic_run_retains_work_when_publish_fails(tmp_path: Path, monkeypatch:
     from squint_rl import artifacts
 
     destination = tmp_path / "run"
+    real_replace = artifacts.os.replace
 
     def fail_publish(source: object, target: object) -> None:
         raise OSError("publish failed")
@@ -72,7 +129,14 @@ def test_atomic_run_retains_work_when_publish_fails(tmp_path: Path, monkeypatch:
         artifacts.write_json(work / "result.json", {})
 
     assert not destination.exists()
-    assert len(list(tmp_path.glob(".run.*.incomplete"))) == 1
+    incomplete = list(tmp_path.glob(".run.*.incomplete"))
+    assert len(incomplete) == 1
+
+    monkeypatch.setattr(artifacts.os, "replace", real_replace)
+    with artifacts.AtomicRun(destination) as work:
+        artifacts.write_json(work / "result.json", {"retry": True})
+    assert destination.joinpath("result.json").exists()
+    assert incomplete[0].joinpath("result.json").exists()
 
 
 def test_write_json_is_canonical_and_rejects_nonfinite_values(tmp_path: Path) -> None:

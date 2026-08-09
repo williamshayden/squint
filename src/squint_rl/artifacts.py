@@ -20,19 +20,30 @@ _IGNORED_MOT17_CLASSES = frozenset({2, 7, 8, 12})
 
 
 class AtomicRun:
-    """Stage a run in a sibling directory and publish it only after success."""
+    """Stage and publish without overwriting another AtomicRun publication."""
 
     def __init__(self, destination: str | Path) -> None:
         self.destination = Path(destination).absolute()
+        owner = uuid4().hex
         self.working = self.destination.parent / (
-            f".{self.destination.name}.{uuid4().hex}.incomplete"
+            f".{self.destination.name}.{owner}.incomplete"
         )
+        self._claim = self.destination.parent / f".{self.destination.name}.publish.lock"
+        self._claim_marker = self._claim / owner
+        self._owns_claim = False
 
     def __enter__(self) -> Path:
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
         if os.path.lexists(self.destination):
             raise FileExistsError(f"completed run already exists: {self.destination}")
-        self.destination.parent.mkdir(parents=True, exist_ok=True)
-        self.working.mkdir()
+        self._acquire_claim()
+        try:
+            if os.path.lexists(self.destination):
+                raise FileExistsError(f"completed run already exists: {self.destination}")
+            self.working.mkdir()
+        except BaseException:
+            self._release_claim()
+            raise
         return self.working
 
     def __exit__(
@@ -42,15 +53,44 @@ class AtomicRun:
         traceback: TracebackType | None,
     ) -> Literal[False]:
         del exc_value, traceback
-        if exc_type is not None:
+        try:
+            if exc_type is not None:
+                return False
+            for item in sorted(path for path in self.working.rglob("*") if path.is_file()):
+                with item.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            if os.path.lexists(self.destination):
+                raise FileExistsError(f"completed run already exists: {self.destination}")
+            os.replace(self.working, self.destination)
             return False
-        for item in sorted(path for path in self.working.rglob("*") if path.is_file()):
-            with item.open("rb") as stream:
-                os.fsync(stream.fileno())
-        if os.path.lexists(self.destination):
-            raise FileExistsError(f"completed run already exists: {self.destination}")
-        os.replace(self.working, self.destination)
-        return False
+        finally:
+            self._release_claim()
+
+    def _acquire_claim(self) -> None:
+        try:
+            self._claim.mkdir()
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"run publication already in progress: {self.destination}"
+            ) from error
+        try:
+            self._claim_marker.touch(exist_ok=False)
+        except BaseException:
+            self._claim.rmdir()
+            raise
+        self._owns_claim = True
+
+    def _release_claim(self) -> None:
+        if not self._owns_claim:
+            return
+        try:
+            try:
+                self._claim_marker.unlink()
+            except FileNotFoundError:
+                return
+            self._claim.rmdir()
+        finally:
+            self._owns_claim = False
 
 
 @dataclass(frozen=True, slots=True)
