@@ -1,5 +1,6 @@
 from importlib.metadata import version
 
+from .episode import Episode
 from .tracker import (
     DetectionBatch,
     GroundTruthBatch,
@@ -13,6 +14,7 @@ from .tracker import (
 __version__ = version("squint-rl")
 __all__ = [
     "__version__",
+    "Episode",
     "DetectionBatch",
     "GroundTruthBatch",
     "TrackBatch",
