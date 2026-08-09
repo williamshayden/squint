@@ -206,7 +206,7 @@ def test_summary_and_scales_reject_invalid_values(factory: type[object], args: t
 def test_summary_scales_and_policy_context_are_frozen_value_objects() -> None:
     summary = TrackerSummary.empty()
     scales = ObservationScales(1.0, 2.0, 3.0, 4.0)
-    context = PolicyContext(30.0, 29.97, 5.0, 7)
+    context = PolicyContext(30.0, 29.97, 5.0, 7, 4.0)
 
     with pytest.raises(FrozenInstanceError):
         summary.active_tracks = 1
@@ -214,6 +214,28 @@ def test_summary_scales_and_policy_context_are_frozen_value_objects() -> None:
         scales.age_s = 1.0
     with pytest.raises(FrozenInstanceError):
         context.seed = 8
+
+
+def test_policy_context_validates_positive_normalization_fields() -> None:
+    context = PolicyContext(
+        nominal_rate=0.25,
+        source_fps=10.0,
+        reserve_ms=10.0,
+        seed=3,
+        time_since_detector_scale_s=5.0,
+    )
+    assert context.time_since_detector_scale_s == 5.0
+
+    for field in ("nominal_rate", "source_fps", "reserve_ms", "time_since_detector_scale_s"):
+        values = {
+            "nominal_rate": 0.25,
+            "source_fps": 10.0,
+            "reserve_ms": 10.0,
+            "time_since_detector_scale_s": 5.0,
+        }
+        values[field] = 0.0
+        with pytest.raises(ValueError, match="finite and positive"):
+            PolicyContext(seed=3, **values)
 
 
 def test_tracker_protocol_preserves_skip_vs_empty_measurement() -> None:

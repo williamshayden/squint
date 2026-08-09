@@ -198,6 +198,17 @@ class PolicyContext:
     source_fps: float
     reserve_ms: float
     seed: int
+    time_since_detector_scale_s: float
+
+    def __post_init__(self) -> None:
+        values = (
+            self.nominal_rate,
+            self.source_fps,
+            self.reserve_ms,
+            self.time_since_detector_scale_s,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in values):
+            raise ValueError("policy context normalization fields must be finite and positive")
 
 
 @runtime_checkable
