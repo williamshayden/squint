@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import struct
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from itertools import pairwise
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -27,6 +29,23 @@ _CAUSAL_NAMES = (
     "timestamps_s", "detector_latency_ms", "scene_change", "det_boxes_xyxy",
     "det_scores", "det_class_ids", "det_frame_offsets",
 )
+_ARRAY_SPECS: dict[str, tuple[np.dtype[Any], tuple[int | str, ...]]] = {
+    "timestamps_s": (np.dtype(np.float64), ("F",)),
+    "detector_latency_ms": (np.dtype(np.float32), ("F",)),
+    "scene_change": (np.dtype(np.float32), ("F", 3, 3)),
+    "det_boxes_xyxy": (np.dtype(np.float32), ("D", 4)),
+    "det_scores": (np.dtype(np.float32), ("D",)),
+    "det_class_ids": (np.dtype(np.int64), ("D",)),
+    "det_frame_offsets": (np.dtype(np.int64), ("F+1",)),
+    "gt_boxes_xyxy": (np.dtype(np.float32), ("G", 4)),
+    "gt_track_ids": (np.dtype(np.int64), ("G",)),
+    "gt_class_ids": (np.dtype(np.int64), ("G",)),
+    "gt_visibility": (np.dtype(np.float32), ("G",)),
+    "gt_valid": (np.dtype(np.bool_), ("G",)),
+    "gt_ignore": (np.dtype(np.bool_), ("G",)),
+    "gt_frame_offsets": (np.dtype(np.int64), ("F+1",)),
+}
+_SOURCE_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 class Detector(Protocol):
@@ -47,6 +66,93 @@ def _array(name: str, value: object, dtype: np.dtype[Any], shape: tuple[int, ...
     if not np.all(np.isfinite(result)):
         raise ValueError(f"{name} must contain finite values")
     return np.array(result, dtype=dtype, copy=True)
+
+
+def _validate_offsets(name: str, offsets: NDArray[Any], count: int) -> None:
+    if int(offsets[0]) != 0:
+        raise ValueError(f"{name} must start at zero")
+    if any(int(right) < int(left) for left, right in pairwise(offsets)):
+        raise ValueError(f"{name} must be monotonic")
+    if int(offsets[-1]) != count:
+        raise ValueError(f"{name} final offset must equal value count {count}")
+
+
+def _validate_boxes(name: str, boxes: NDArray[Any]) -> None:
+    if not np.all(np.isfinite(boxes)):
+        raise ValueError(f"{name} must contain finite values")
+    if np.any(boxes[:, 2] <= boxes[:, 0]) or np.any(boxes[:, 3] <= boxes[:, 1]):
+        raise ValueError(f"{name} must have positive-area xyxy boxes")
+
+
+def _validate_unit_interval(name: str, values: NDArray[Any]) -> None:
+    if not np.all(np.isfinite(values)) or np.any((values < 0) | (values > 1)):
+        raise ValueError(f"{name} must contain finite values in [0, 1]")
+
+
+def _validate_arrays(arrays: Mapping[str, NDArray[Any]]) -> None:
+    expected = set(_ARRAY_NAMES)
+    actual = set(arrays)
+    if actual != expected:
+        raise ValueError(
+            "replay-v1 array set mismatch "
+            f"(missing={sorted(expected - actual)}, extra={sorted(actual - expected)})"
+        )
+    for name, (dtype, _) in _ARRAY_SPECS.items():
+        value = arrays[name]
+        if not isinstance(value, np.ndarray):
+            raise ValueError(f"{name} must be a numpy array")  # noqa: TRY004
+        if value.dtype != dtype:
+            raise ValueError(f"{name} must have dtype {dtype}")
+    timestamps = arrays["timestamps_s"]
+    det_boxes = arrays["det_boxes_xyxy"]
+    gt_boxes = arrays["gt_boxes_xyxy"]
+    if timestamps.ndim != 1 or len(timestamps) == 0:
+        raise ValueError("timestamps_s must have nonempty shape (F,)")
+    if det_boxes.ndim != 2 or det_boxes.shape[1:] != (4,):
+        raise ValueError("det_boxes_xyxy must have shape (D, 4)")
+    if gt_boxes.ndim != 2 or gt_boxes.shape[1:] != (4,):
+        raise ValueError("gt_boxes_xyxy must have shape (G, 4)")
+    dimensions = {
+        "F": len(timestamps),
+        "D": len(det_boxes),
+        "G": len(gt_boxes),
+        "F+1": len(timestamps) + 1,
+    }
+    for name, (_, shape_spec) in _ARRAY_SPECS.items():
+        expected_shape = tuple(
+            dimensions[item] if isinstance(item, str) else item for item in shape_spec
+        )
+        if arrays[name].shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}")
+    if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0):
+        raise ValueError("timestamps_s must be finite and strictly increasing")
+    latency = arrays["detector_latency_ms"]
+    if not np.all(np.isfinite(latency)) or np.any(latency < 0):
+        raise ValueError("detector_latency_ms must be finite and nonnegative")
+    _validate_unit_interval("scene_change", arrays["scene_change"])
+    _validate_boxes("det_boxes_xyxy", det_boxes)
+    _validate_unit_interval("det_scores", arrays["det_scores"])
+    _validate_boxes("gt_boxes_xyxy", gt_boxes)
+    _validate_unit_interval("gt_visibility", arrays["gt_visibility"])
+    if np.any(arrays["gt_valid"] & arrays["gt_ignore"]):
+        raise ValueError("gt_valid and gt_ignore cannot both be true")
+    frame_count = dimensions["F"]
+    det_offsets = arrays["det_frame_offsets"]
+    gt_offsets = arrays["gt_frame_offsets"]
+    _validate_offsets("det_frame_offsets", det_offsets, dimensions["D"])
+    _validate_offsets("gt_frame_offsets", gt_offsets, dimensions["G"])
+    for index in range(frame_count):
+        start, stop = int(gt_offsets[index]), int(gt_offsets[index + 1])
+        track_ids = arrays["gt_track_ids"][start:stop]
+        if len(np.unique(track_ids)) != len(track_ids):
+            raise ValueError(f"gt_track_ids must be unique within frame {index}")
+
+
+def _immutable_array(value: NDArray[Any]) -> NDArray[Any]:
+    contiguous = np.ascontiguousarray(value)
+    return np.frombuffer(contiguous.tobytes(order="C"), dtype=contiguous.dtype).reshape(
+        contiguous.shape
+    )
 
 
 def pack_episode_arrays(
@@ -106,13 +212,17 @@ def pack_episode_arrays(
         "gt_ignore": flat(gt_ignore, (), np.dtype(np.bool_)).reshape(-1),
         "gt_frame_offsets": np.asarray(gt_offsets, dtype=np.int64),
     }
-    return {name: arrays[name] for name in _ARRAY_NAMES}
+    ordered = {name: arrays[name] for name in _ARRAY_NAMES}
+    _validate_arrays(ordered)
+    return ordered
 
 
 def causal_trace_sha256(arrays: Mapping[str, NDArray[Any]]) -> str:
     digest = hashlib.sha256()
     _framed(digest, b"squint.replay\x00causal-v1")
     for name in _CAUSAL_NAMES:
+        if name not in arrays or not isinstance(arrays[name], np.ndarray):
+            raise ValueError(f"causal trace requires numpy array {name}")
         value = np.ascontiguousarray(arrays[name])
         _framed(digest, name.encode("utf-8"))
         _framed(digest, value.dtype.str.encode("ascii"))
@@ -125,15 +235,25 @@ def causal_trace_sha256(arrays: Mapping[str, NDArray[Any]]) -> str:
 
 def canonical_source_sha256(sequence: Mot17Sequence) -> str:
     files = [*sequence.image_paths, sequence.source_dir / "seqinfo.ini", sequence.source_dir / "gt" / "gt.txt"]
-    entries: list[tuple[str, bytes]] = []
+    entries: list[tuple[str, Path]] = []
     for path in files:
-        relative = path.relative_to(sequence.source_dir).as_posix().encode("utf-8")
-        entries.append((relative.decode("utf-8"), path.read_bytes()))
+        try:
+            relative = path.relative_to(sequence.source_dir).as_posix()
+        except ValueError as error:
+            raise ValueError(f"canonical source path is outside source_dir: {path}") from error
+        entries.append((relative, path))
     digest = hashlib.sha256()
     _framed(digest, b"squint.mot17-source-v1")
-    for name, content in sorted(entries):
+    for name, path in sorted(entries):
+        file_digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(_SOURCE_HASH_CHUNK_BYTES), b""):
+                    file_digest.update(block)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"unable to read canonical source file {name} ({path})") from error
         _framed(digest, name.encode("utf-8"))
-        _framed(digest, hashlib.sha256(content).digest())
+        _framed(digest, file_digest.digest())
     return digest.hexdigest()
 
 
@@ -144,13 +264,20 @@ class RawTrace:
     manifest_fields: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        frozen_arrays: dict[str, NDArray[Any]] = {}
-        for name, value in self.arrays.items():
-            frozen = np.array(value, copy=True)
-            frozen.setflags(write=False)
-            frozen_arrays[name] = frozen
+        if not isinstance(self.arrays, Mapping):
+            raise ValueError("arrays must be a mapping")  # noqa: TRY004
+        _validate_arrays(self.arrays)
+        if not isinstance(self.manifest_fields, Mapping):
+            raise ValueError("manifest_fields must be a mapping")  # noqa: TRY004
+        manifest = dict(self.manifest_fields)
+        expected_hash = causal_trace_sha256(self.arrays)
+        if manifest.get("causal_trace_sha256") != expected_hash:
+            raise ValueError("manifest_fields causal_trace_sha256 does not match arrays")
+        frozen_arrays = {
+            name: _immutable_array(self.arrays[name]) for name in _ARRAY_NAMES
+        }
         object.__setattr__(self, "arrays", MappingProxyType(frozen_arrays))
-        object.__setattr__(self, "manifest_fields", MappingProxyType(dict(self.manifest_fields)))
+        object.__setattr__(self, "manifest_fields", MappingProxyType(manifest))
 
 
 def build_sequence(
@@ -166,16 +293,11 @@ def build_sequence(
         with Image.open(image_path) as opened:
             detector.predict(opened.convert("RGB"))
 
-    measured_sequence = replace(
-        sequence,
-        image_paths=sequence.image_paths[warmup_frames:],
-        ground_truth=sequence.ground_truth[warmup_frames:],
-    )
     previous: Image.Image | None = None
     detections: list[DetectionBatch] = []
     scenes: list[NDArray[Any]] = []
     latencies: list[float] = []
-    for image_path in measured_sequence.image_paths:
+    for image_path in sequence.image_paths:
         with Image.open(image_path) as opened:
             image = opened.convert("RGB")
             scenes.append(scene_change_grid(previous, image))
@@ -183,22 +305,17 @@ def build_sequence(
             detections.append(batch)
             latencies.append(float(latency))
             previous = image.copy()
-    packed = pack_episode_arrays(measured_sequence, detections, scenes, latencies)
-    frozen_arrays: dict[str, NDArray[Any]] = {}
-    for name, value in packed.items():
-        frozen = np.array(value, copy=True)
-        frozen.setflags(write=False)
-        frozen_arrays[name] = frozen
+    packed = pack_episode_arrays(sequence, detections, scenes, latencies)
     manifest = {
         "schema": "squint.replay",
         "schema_version": 1,
         "sequence_id": sequence.identifier,
-        "frame_count": len(measured_sequence.image_paths),
+        "frame_count": len(sequence.image_paths),
         "fps": float(sequence.fps),
         "width": sequence.width,
         "height": sequence.height,
         "warmup_frames": warmup_frames,
         "source_sha256": canonical_source_sha256(sequence),
-        "causal_trace_sha256": causal_trace_sha256(frozen_arrays),
+        "causal_trace_sha256": causal_trace_sha256(packed),
     }
-    return RawTrace(sequence.identifier, MappingProxyType(frozen_arrays), MappingProxyType(manifest))
+    return RawTrace(sequence.identifier, packed, manifest)

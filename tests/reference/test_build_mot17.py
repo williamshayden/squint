@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -91,7 +96,7 @@ def test_hashes_have_causal_and_source_boundaries(tmp_path: Path) -> None:
     assert canonical_source_sha256(sequence) != source
 
 
-def test_raw_trace_is_frozen_and_build_excludes_warmups(tmp_path: Path) -> None:
+def test_warmups_are_extra_and_the_complete_sequence_is_measured(tmp_path: Path) -> None:
     sequence = _sequence(tmp_path, 4)
 
     class Detector:
@@ -100,16 +105,18 @@ def test_raw_trace_is_frozen_and_build_excludes_warmups(tmp_path: Path) -> None:
 
         def predict(self, image: Image.Image) -> tuple[DetectionBatch, float]:
             self.calls.append(int(image.getpixel((0, 0))[0]))  # type: ignore[index]
-            return _detections(1)[0], 4.0
+            return _detections(1)[0], float(len(self.calls))
 
     detector = Detector()
     trace = build_sequence(sequence, detector, warmup_frames=2)
     assert isinstance(trace, RawTrace)
-    assert detector.calls == [0, 1, 2, 3]
-    assert trace.arrays["timestamps_s"].shape == (2,)
+    assert detector.calls == [0, 1, 0, 1, 2, 3]
+    assert trace.arrays["timestamps_s"].tolist() == [0.0, 0.04, 0.08, 0.12]
+    assert trace.arrays["detector_latency_ms"].tolist() == [3.0, 4.0, 5.0, 6.0]
+    assert trace.arrays["scene_change"].shape == (4, 3, 3)
+    assert trace.arrays["gt_track_ids"].tolist() == [1, 2, 3, 4]
+    assert trace.manifest_fields["frame_count"] == 4
     assert trace.manifest_fields["causal_trace_sha256"] == causal_trace_sha256(trace.arrays)
-    with pytest.raises(TypeError):
-        trace.manifest_fields["new"] = "value"  # type: ignore[index]
     with pytest.raises(TypeError):
         build_sequence(sequence, detector, warmup_frames=True)
     with pytest.raises(ValueError):
@@ -122,3 +129,189 @@ def test_pack_rejects_cardinality_and_nonfinite_inputs(tmp_path: Path) -> None:
         pack_episode_arrays(sequence, _detections(2), [np.zeros((3, 3))] * 3, [1, 2, 3])
     with pytest.raises(ValueError, match="finite"):
         pack_episode_arrays(sequence, _detections(3), [np.zeros((3, 3))] * 3, [1, np.nan, 3])
+
+
+@pytest.mark.parametrize(
+    ("latencies", "scenes", "match"),
+    [
+        ([1.0, -0.1, 3.0], [np.zeros((3, 3))] * 3, "detector_latency_ms"),
+        ([1.0, 2.0, 3.0], [np.full((3, 3), 1.01)] * 3, "scene_change"),
+        ([1.0, 2.0, 3.0], [np.full((3, 3), -0.01)] * 3, "scene_change"),
+    ],
+)
+def test_pack_rejects_negative_latency_and_scene_values_outside_unit_interval(
+    tmp_path: Path,
+    latencies: list[float],
+    scenes: list[np.ndarray[Any, Any]],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        pack_episode_arrays(_sequence(tmp_path), _detections(3), scenes, latencies)
+
+
+def test_empty_detection_and_ground_truth_offsets_cover_every_frame(tmp_path: Path) -> None:
+    sequence = _sequence(tmp_path)
+    sequence = replace(
+        sequence,
+        ground_truth=tuple(GroundTruthBatch.empty() for _ in sequence.image_paths),
+    )
+    arrays = pack_episode_arrays(
+        sequence,
+        tuple(DetectionBatch.empty() for _ in sequence.image_paths),
+        [np.zeros((3, 3), np.float32)] * 3,
+        [0.0, 0.0, 0.0],
+    )
+    assert arrays["det_boxes_xyxy"].shape == (0, 4)
+    assert arrays["gt_boxes_xyxy"].shape == (0, 4)
+    np.testing.assert_array_equal(arrays["det_frame_offsets"], [0, 0, 0, 0])
+    np.testing.assert_array_equal(arrays["gt_frame_offsets"], [0, 0, 0, 0])
+
+
+def test_raw_trace_arrays_are_non_bypassably_immutable_and_detached(tmp_path: Path) -> None:
+    sequence = _sequence(tmp_path)
+    source = pack_episode_arrays(
+        sequence,
+        _detections(3),
+        [np.zeros((3, 3), np.float32)] * 3,
+        [1.0, 2.0, 3.0],
+    )
+    expected_scores = source["det_scores"].copy()
+    trace = RawTrace(
+        sequence.identifier,
+        source,
+        {"causal_trace_sha256": causal_trace_sha256(source)},
+    )
+    source["det_scores"][0] = 0.99
+    np.testing.assert_array_equal(trace.arrays["det_scores"], expected_scores)
+    for value in trace.arrays.values():
+        assert not value.flags.owndata
+        assert not value.flags.writeable
+        with pytest.raises(ValueError):
+            value.setflags(write=True)
+    with pytest.raises(TypeError):
+        trace.manifest_fields["new"] = "value"  # type: ignore[index]
+
+
+def _valid_raw_trace_inputs(tmp_path: Path) -> tuple[dict[str, np.ndarray[Any, Any]], dict[str, object]]:
+    arrays = pack_episode_arrays(
+        _sequence(tmp_path),
+        _detections(3),
+        [np.zeros((3, 3), np.float32)] * 3,
+        [1.0, 2.0, 3.0],
+    )
+    return arrays, {"causal_trace_sha256": causal_trace_sha256(arrays)}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("missing", "array set"),
+        ("extra", "array set"),
+        ("dtype", "det_scores"),
+        ("shape", "scene_change"),
+        ("offset-start", "det_frame_offsets"),
+        ("offset-order", "det_frame_offsets"),
+        ("offset-final", "det_frame_offsets"),
+        ("cardinality", "gt_track_ids"),
+        ("timestamp-order", "timestamps_s"),
+        ("det-score-range", "det_scores"),
+        ("gt-visibility-range", "gt_visibility"),
+    ],
+)
+def test_raw_trace_direct_construction_rejects_malformed_arrays_contextually(
+    tmp_path: Path,
+    mutation: str,
+    match: str,
+) -> None:
+    arrays, manifest = _valid_raw_trace_inputs(tmp_path)
+    if mutation == "missing":
+        arrays.pop("gt_ignore")
+    elif mutation == "extra":
+        arrays["surprise"] = np.empty(0, np.float32)
+    elif mutation == "dtype":
+        arrays["det_scores"] = arrays["det_scores"].astype(np.float64)
+    elif mutation == "shape":
+        arrays["scene_change"] = arrays["scene_change"][:, :, :2]
+    elif mutation == "offset-start":
+        arrays["det_frame_offsets"] = np.array([1, 1, 2, 3], np.int64)
+    elif mutation == "offset-order":
+        arrays["det_frame_offsets"] = np.array([0, 2, 1, 3], np.int64)
+    elif mutation == "offset-final":
+        arrays["det_frame_offsets"] = np.array([0, 1, 2, 2], np.int64)
+    elif mutation == "cardinality":
+        arrays["gt_track_ids"] = arrays["gt_track_ids"][:-1]
+    elif mutation == "timestamp-order":
+        arrays["timestamps_s"] = np.array([0.0, 0.04, 0.04], np.float64)
+    elif mutation == "det-score-range":
+        arrays["det_scores"][0] = 1.01
+    else:
+        arrays["gt_visibility"][0] = -0.01
+    with pytest.raises(ValueError, match=match):
+        RawTrace("02", arrays, manifest)
+
+
+def test_raw_trace_direct_construction_requires_coherent_causal_hash(tmp_path: Path) -> None:
+    arrays, manifest = _valid_raw_trace_inputs(tmp_path)
+    manifest["causal_trace_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="causal_trace_sha256"):
+        RawTrace("02", arrays, manifest)
+    with pytest.raises(ValueError, match="causal_trace_sha256"):
+        RawTrace("02", arrays, {})
+
+
+def test_source_hash_streams_sorted_files_without_path_read_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sequence = _sequence(tmp_path)
+    expected = canonical_source_sha256(sequence)
+    reversed_sequence = replace(sequence, image_paths=tuple(reversed(sequence.image_paths)))
+    assert canonical_source_sha256(reversed_sequence) == expected
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("canonical source hashing must stream files")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    assert canonical_source_sha256(sequence) == expected
+
+
+def test_source_hash_is_path_sensitive_and_wraps_io_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sequence = _sequence(tmp_path)
+    original = canonical_source_sha256(sequence)
+    renamed = sequence.image_paths[0].with_name("renamed.png")
+    sequence.image_paths[0].rename(renamed)
+    renamed_sequence = replace(sequence, image_paths=(renamed, *sequence.image_paths[1:]))
+    assert canonical_source_sha256(renamed_sequence) != original
+
+    real_open = Path.open
+
+    def fail_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == renamed:
+            raise OSError("unreadable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_open)
+    with pytest.raises(ValueError, match=r"renamed\.png.*read|read.*renamed\.png"):
+        canonical_source_sha256(renamed_sequence)
+
+
+def test_import_does_not_load_heavy_or_hardware_modules() -> None:
+    root = Path(__file__).parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(root / "src")
+    script = (
+        "import sys; import squint_rl.reference.build_mot17; "
+        "forbidden={'torch','transformers','pynvml'}; "
+        "loaded={name.split('.')[0] for name in sys.modules}; "
+        "assert forbidden.isdisjoint(loaded), forbidden & loaded"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
