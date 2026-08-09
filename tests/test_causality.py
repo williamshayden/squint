@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,62 @@ def test_canonical_applied_action_prefix_100_fixture() -> None:
     )
 
 
+@dataclass(frozen=True)
+class _PrefixEvidence:
+    observations: tuple[dict[str, np.ndarray], ...]
+    requested_actions: tuple[int, ...]
+    applied_actions: tuple[int, ...]
+    rewards: tuple[float, ...]
+
+    @property
+    def observation_digest(self) -> str:
+        return _observation_prefix_digest(list(self.observations))
+
+    @property
+    def requested_action_digest(self) -> str:
+        return _requested_action_prefix_digest(list(self.requested_actions))
+
+    @property
+    def applied_action_digest(self) -> str:
+        return _applied_action_prefix_digest(list(self.applied_actions))
+
+
+def _rollout_prefix(
+    env: Any, requested_actions: tuple[int, ...], *, t: int
+) -> _PrefixEvidence:
+    assert len(requested_actions) == t + 1
+    observation, _reset_info = env.reset(seed=7)
+    observations = [observation]
+    recorded_requested_actions: list[int] = []
+    applied_actions: list[int] = []
+    rewards: list[float] = []
+    for action_index, requested_action in enumerate(requested_actions):
+        next_observation, reward, _terminated, _truncated, info = env.step(requested_action)
+        recorded_requested_actions.append(info["requested_action"])
+        applied_actions.append(info["applied_action"])
+        rewards.append(reward)
+        if action_index < t:
+            observations.append(next_observation)
+    assert len(observations) == t + 1
+    return _PrefixEvidence(
+        observations=tuple(observations),
+        requested_actions=tuple(recorded_requested_actions),
+        applied_actions=tuple(applied_actions),
+        rewards=tuple(rewards),
+    )
+
+
+def _valid_gt_rows(arrays: dict[str, np.ndarray], frames: range) -> np.ndarray:
+    rows: list[int] = []
+    offsets = arrays["gt_frame_offsets"]
+    for frame in frames:
+        start, stop = (int(value) for value in offsets[frame : frame + 2])
+        rows.extend(
+            index for index in range(start, stop) if bool(arrays["gt_valid"][index])
+        )
+    return np.asarray(rows, dtype=np.int64)
+
+
 def assert_same_observation(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> None:
     assert set(left) == set(right)
     for key, value in left.items():
@@ -100,38 +158,82 @@ def make_base_episode(tmp_path: Path) -> Episode:
 
 
 @pytest.fixture
-def paired_future_envs(tmp_path: Path) -> tuple[Any, Any, int]:
+def paired_prefix_envs(tmp_path: Path) -> tuple[tuple[Any, Any, Episode, Episode, str, int | None], ...]:
     base = make_base_episode(tmp_path)
-    split_frame = 2
+    t = 2
 
-    def mutate_future(arrays: dict[str, np.ndarray]) -> None:
-        start = split_frame + 1
-        arrays["scene_change"][start:] = 0.75
-        arrays["detector_latency_ms"][start:] = 17.0
-        arrays["det_boxes_xyxy"][start:, 0] += 4.0
-        arrays["det_boxes_xyxy"][start:, 2] += 4.0
-        arrays["gt_boxes_xyxy"][2 * start :: 2, 0] += 5.0
-        arrays["gt_boxes_xyxy"][2 * start :: 2, 2] += 5.0
+    def mutate_future_detections(arrays: dict[str, np.ndarray]) -> None:
+        arrays["det_boxes_xyxy"][t + 1 :, (0, 2)] += 4.0
 
-    unchanged = reseal_variant(base, tmp_path / "left", lambda arrays: None)
-    changed = reseal_variant(base, tmp_path / "right", mutate_future)
-    left, _left_tracker = make_env(unchanged)
-    right, _right_tracker = make_env(changed)
-    return left, right, split_frame
+    def mutate_future_latency(arrays: dict[str, np.ndarray]) -> None:
+        arrays["detector_latency_ms"][t + 1 :] = 17.0
+
+    def mutate_future_scene(arrays: dict[str, np.ndarray]) -> None:
+        arrays["scene_change"][t + 1 :] = 0.75
+
+    def mutate_future_valid_ground_truth(arrays: dict[str, np.ndarray]) -> None:
+        rows = _valid_gt_rows(arrays, range(t + 1, 5))
+        arrays["gt_boxes_xyxy"][rows, (0, 2)] += 5.0
+
+    def mutate_current_valid_ground_truth(arrays: dict[str, np.ndarray]) -> None:
+        rows = _valid_gt_rows(arrays, range(t, t + 1))
+        arrays["gt_boxes_xyxy"][rows, (0, 2)] += 50.0
+
+    def mutate_episode_view_boundary_scene(arrays: dict[str, np.ndarray]) -> None:
+        arrays["scene_change"][2] = 0.75
+
+    specs: tuple[tuple[str, str, Callable[[dict[str, np.ndarray]], None], int | None, bool], ...] = (
+        ("future-detections", "det_boxes_xyxy", mutate_future_detections, None, False),
+        ("future-latency", "detector_latency_ms", mutate_future_latency, None, False),
+        ("future-scene", "scene_change", mutate_future_scene, None, False),
+        ("future-valid-ground-truth", "gt_boxes_xyxy", mutate_future_valid_ground_truth, None, False),
+        ("current-valid-ground-truth", "gt_boxes_xyxy", mutate_current_valid_ground_truth, t, False),
+        ("episode-view-boundary-scene", "scene_change", mutate_episode_view_boundary_scene, None, True),
+    )
+    cases: list[tuple[Any, Any, Episode, Episode, str, int | None]] = []
+    for name, changed_array, mutate, reward_diff_at, use_view in specs:
+        left_source = reseal_variant(base, tmp_path / f"{name}-left", lambda arrays: None)
+        right_source = reseal_variant(base, tmp_path / f"{name}-right", mutate)
+        assert left_source.content_sha256 != right_source.content_sha256
+        assert set(left_source.arrays) == set(right_source.arrays)
+        for array_name in left_source.arrays:
+            if array_name == changed_array:
+                assert not np.array_equal(
+                    left_source.arrays[array_name], right_source.arrays[array_name]
+                )
+            else:
+                np.testing.assert_array_equal(
+                    left_source.arrays[array_name], right_source.arrays[array_name]
+                )
+        left_episode: Any = left_source.slice(2, 5) if use_view else left_source
+        right_episode: Any = right_source.slice(2, 5) if use_view else right_source
+        assert left_episode.content_sha256 != right_episode.content_sha256
+        left, _left_tracker = make_env(left_episode)
+        right, _right_tracker = make_env(right_episode)
+        cases.append((left, right, left_source, right_source, changed_array, reward_diff_at))
+    return tuple(cases)
 
 
-def test_future_changes_cannot_change_observations_through_split(
-    paired_future_envs: tuple[Any, Any, int],
+def test_independent_mutations_preserve_canonical_prefixes(
+    paired_prefix_envs: tuple[tuple[Any, Any, Episode, Episode, str, int | None], ...],
 ) -> None:
-    left, right, split_frame = paired_future_envs
-    _squint_env, skip, _run_detector = _env_types()
-    left_observation, _left_info = left.reset(seed=7)
-    right_observation, _right_info = right.reset(seed=7)
-
-    for _frame in range(split_frame + 1):
-        assert_same_observation(left_observation, right_observation)
-        left_observation, _left_reward, _left_terminated, _left_truncated, _left_step_info = left.step(skip)
-        right_observation, _right_reward, _right_terminated, _right_truncated, _right_step_info = right.step(skip)
+    t = 2
+    requested_actions = (1, 1, 1)
+    for left, right, _left_source, _right_source, _changed_array, reward_diff_at in paired_prefix_envs:
+        left_evidence = _rollout_prefix(left, requested_actions, t=t)
+        right_evidence = _rollout_prefix(right, requested_actions, t=t)
+        assert left_evidence.requested_actions == (1, 1, 1)
+        assert right_evidence.requested_actions == (1, 1, 1)
+        assert left_evidence.applied_actions == (1, 0, 0)
+        assert right_evidence.applied_actions == (1, 0, 0)
+        assert left_evidence.observation_digest == right_evidence.observation_digest
+        assert left_evidence.requested_action_digest == right_evidence.requested_action_digest
+        assert left_evidence.applied_action_digest == right_evidence.applied_action_digest
+        if reward_diff_at is None:
+            assert left_evidence.rewards == right_evidence.rewards
+        else:
+            assert left_evidence.rewards[:-1] == right_evidence.rewards[:-1]
+            assert left_evidence.rewards[-1] != right_evidence.rewards[-1]
 
 
 def test_current_cost_is_hidden_until_an_admitted_run(tmp_path: Path) -> None:
