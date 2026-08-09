@@ -298,7 +298,14 @@ class FrozenPPOPolicy:
         if self.mask_scene_change:
             model_observation["scene_change"] = np.zeros_like(observation["scene_change"])
         action, _ = self.model.predict(model_observation, deterministic=True)
-        return int(action)
+        if type(action) is not np.ndarray or action.shape != () or not np.issubdtype(
+            action.dtype, np.integer
+        ):
+            raise TypeError("model action must be a scalar NumPy integer array")
+        value = int(action.item())
+        if value not in (0, 1):
+            raise ValueError("model action must be 0 or 1")
+        return value
 
 
 def frozen_policy_factory(

@@ -669,7 +669,7 @@ def test_build_model_rejects_recipe_subclass(monkeypatch: pytest.MonkeyPatch) ->
 
 
 class PredictModel:
-    def __init__(self, action: object = np.int64(1)) -> None:
+    def __init__(self, action: object = np.array(1, dtype=np.int64)) -> None:
         self.action = action
         self.calls: list[tuple[Mapping[str, np.ndarray[Any, Any]], dict[str, object]]] = []
 
@@ -730,6 +730,72 @@ def test_frozen_policy_loads_cpu_and_predicts_without_mutation(
     else:
         assert model_observation["scene_change"] is observation["scene_change"]
     np.testing.assert_array_equal(observation["scene_change"], original_scene)
+
+
+@pytest.mark.parametrize("value", [0, 1])
+@pytest.mark.parametrize(
+    "dtype",
+    [np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64],
+)
+def test_frozen_policy_accepts_only_exact_scalar_integer_arrays(
+    monkeypatch: pytest.MonkeyPatch, dtype: Any, value: int
+) -> None:
+    monkeypatch.setattr(train_ppo, "PPO", Loader)
+    policy = FrozenPPOPolicy("checkpoint.zip")
+    Loader.models[0].action = np.array(value, dtype=dtype)
+
+    result = policy(_policy_observation())
+
+    assert type(result) is int
+    assert result == value
+
+
+class ActionArraySubclass(np.ndarray):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("action", "error"),
+    [
+        pytest.param(0, TypeError, id="built-in-int-zero"),
+        pytest.param(1, TypeError, id="built-in-int-one"),
+        pytest.param(np.int64(1), TypeError, id="numpy-signed-scalar"),
+        pytest.param(np.uint8(1), TypeError, id="numpy-unsigned-scalar"),
+        pytest.param(False, TypeError, id="built-in-bool"),
+        pytest.param(np.bool_(True), TypeError, id="numpy-bool-scalar"),
+        pytest.param(1.0, TypeError, id="built-in-float"),
+        pytest.param(np.float32(1.0), TypeError, id="numpy-float-scalar"),
+        pytest.param([1], TypeError, id="list"),
+        pytest.param((1,), TypeError, id="tuple"),
+        pytest.param(np.array([1], dtype=np.int64), TypeError, id="integer-vector"),
+        pytest.param(np.array([[1]], dtype=np.int64), TypeError, id="integer-matrix"),
+        pytest.param(np.array(1.0, dtype=np.float32), TypeError, id="float-array"),
+        pytest.param(np.array(True, dtype=np.bool_), TypeError, id="bool-array"),
+        pytest.param(np.array(1, dtype=object), TypeError, id="object-array"),
+        pytest.param(
+            np.array(1, dtype=np.int64).view(ActionArraySubclass),
+            TypeError,
+            id="ndarray-subclass",
+        ),
+        pytest.param(np.array(-1, dtype=np.int64), ValueError, id="negative-integer"),
+        pytest.param(np.array(2, dtype=np.uint64), ValueError, id="integer-two"),
+    ],
+)
+def test_frozen_policy_rejects_malformed_actions_without_mutating_observation(
+    monkeypatch: pytest.MonkeyPatch, action: object, error: type[Exception]
+) -> None:
+    monkeypatch.setattr(train_ppo, "PPO", Loader)
+    policy = FrozenPPOPolicy("checkpoint.zip", mask_scene_change=True)
+    Loader.models[0].action = action
+    observation = _policy_observation()
+    original = {key: value.copy() for key, value in observation.items()}
+
+    with pytest.raises(error):
+        policy(observation)
+
+    assert set(observation) == set(original)
+    for key, value in observation.items():
+        np.testing.assert_array_equal(value, original[key])
 
 
 @pytest.mark.parametrize("mask", [0, 1, None, "yes", np.bool_(True)])
