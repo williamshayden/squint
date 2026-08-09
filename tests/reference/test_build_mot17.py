@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from hashlib import sha256
@@ -26,7 +26,12 @@ from squint_rl.reference.build_mot17 import (
     profile_training_traces,
 )
 from squint_rl.reference.mot17 import Mot17Sequence
-from squint_rl.tracker import DetectionBatch, GroundTruthBatch
+from squint_rl.tracker import (
+    DetectionBatch,
+    GroundTruthBatch,
+    TrackBatch,
+    TrackerSummary,
+)
 
 
 def _sequence(
@@ -61,7 +66,7 @@ def _detections(count: int) -> tuple[DetectionBatch, ...]:
     return tuple(
         DetectionBatch(
             np.array([[index, 0, index + 1, 2]], np.float32),
-            np.array([0.25 + index / 10], np.float32),
+            np.array([min(0.99, 0.25 + index / 10)], np.float32),
             np.array([1], np.int64),
         )
         for index in range(count)
@@ -125,13 +130,14 @@ def _trace_manifest(
     identifier: str = "02",
     detector: dict[str, object] | None = None,
     hardware: dict[str, object] | None = None,
+    fps: float = 25.0,
 ) -> dict[str, object]:
     return {
         "schema": "squint.replay",
         "schema_version": 1,
         "sequence_id": identifier,
         "frame_count": len(arrays["timestamps_s"]),
-        "fps": 25.0,
+        "fps": fps,
         "source_sha256": "a" * 64,
         "causal_trace_sha256": causal_trace_sha256(arrays),
         "detector": _detector_identity() if detector is None else detector,
@@ -156,15 +162,6 @@ def _mutate_identity(
     else:
         target[path[-1]] = value
     return identity
-
-
-def _normalization() -> dict[str, object]:
-    return {
-        "active_tracks": 1,
-        "age_s": 1.0,
-        "motion_px_s": 1.0,
-        "time_since_detector_s": 1.0,
-    }
 
 
 def test_pack_episode_arrays_uses_replay_v1_schema_and_offsets(tmp_path: Path) -> None:
@@ -316,18 +313,125 @@ def _profile_trace(
     *,
     detector: dict[str, object] | None = None,
     hardware: dict[str, object] | None = None,
-    latency: float = 1.0,
+    latency: float | Sequence[float] = 1.0,
+    frame_count: int = 3,
+    fps: float = 25.0,
 ) -> RawTrace:
+    sequence = replace(
+        _sequence(tmp_path / identifier, frame_count, identifier), fps=fps
+    )
+    latencies = (
+        [float(latency)] * frame_count
+        if isinstance(latency, (int, float))
+        else [float(value) for value in latency]
+    )
     arrays = pack_episode_arrays(
-        _sequence(tmp_path / identifier, identifier=identifier),
-        _detections(3),
-        [np.zeros((3, 3), np.float32)] * 3,
-        [latency, latency, latency],
+        sequence,
+        _detections(frame_count),
+        [np.zeros((3, 3), np.float32)] * frame_count,
+        latencies,
     )
     manifest = _trace_manifest(
-        arrays, identifier=identifier, detector=detector, hardware=hardware
+        arrays,
+        identifier=identifier,
+        detector=detector,
+        hardware=hardware,
+        fps=fps,
     )
     return RawTrace(identifier, arrays, manifest)
+
+
+class _EmptyTracker:
+    def reset(self) -> None:
+        pass
+
+    def step(
+        self, detections: DetectionBatch | None, timestamp_s: float
+    ) -> TrackBatch:
+        del detections, timestamp_s
+        return TrackBatch.empty()
+
+    def summary(self) -> TrackerSummary:
+        return TrackerSummary.empty()
+
+
+def _empty_tracker_factory(*, frame_rate: float) -> _EmptyTracker:
+    del frame_rate
+    return _EmptyTracker()
+
+
+def _profile(traces: Sequence[RawTrace]) -> ReferenceProfile:
+    return profile_training_traces(traces, tracker_factory=_empty_tracker_factory)
+
+
+class _RecordingTracker(_EmptyTracker):
+    def __init__(self) -> None:
+        self.reset_count = 0
+        self.actions: list[int] = []
+        self.events: list[str] = []
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        self.events.append("reset")
+
+    def step(
+        self, detections: DetectionBatch | None, timestamp_s: float
+    ) -> TrackBatch:
+        del timestamp_s
+        action = int(detections is not None)
+        self.actions.append(action)
+        self.events.append("detect" if action else "skip")
+        return TrackBatch.empty()
+
+    def summary(self) -> TrackerSummary:
+        self.events.append("summary")
+        return TrackerSummary.empty()
+
+
+class _RecordingFactory:
+    def __init__(self) -> None:
+        self.frame_rates: list[float] = []
+        self.trackers: list[_RecordingTracker] = []
+
+    def __call__(self, *, frame_rate: float) -> _RecordingTracker:
+        tracker = _RecordingTracker()
+        self.frame_rates.append(frame_rate)
+        self.trackers.append(tracker)
+        return tracker
+
+
+class _SummaryFactory:
+    def __init__(self) -> None:
+        self.sample_count = 0
+
+    def __call__(self, *, frame_rate: float) -> _EmptyTracker:
+        del frame_rate
+        owner = self
+
+        class SummaryTracker(_EmptyTracker):
+            def summary(self) -> TrackerSummary:
+                value = owner.sample_count
+                owner.sample_count += 1
+                return TrackerSummary(value, 0, 0, value / 10, value * 2.0, 0.0)
+
+        return SummaryTracker()
+
+
+class _AccessTrap(Mapping[str, object]):
+    def __init__(self, values: Mapping[str, object], allowed: set[str]) -> None:
+        self._values = values
+        self._allowed = allowed
+
+    def __getitem__(self, key: str) -> object:
+        if key not in self._allowed:
+            raise AssertionError(f"forbidden profile access: {key}")
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("profile construction must not iterate trace mappings")
+
+    def __len__(self) -> int:
+        raise AssertionError("profile construction must not size trace mappings")
 
 
 @pytest.mark.parametrize(
@@ -383,16 +487,7 @@ def test_raw_trace_schema_fields_are_optional_as_a_pair(tmp_path: Path) -> None:
 
 def test_reference_profile_uses_explicit_canonical_schema_and_hash(tmp_path: Path) -> None:
     traces = [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
-    profile = profile_training_traces(
-        traces,
-        reserve_ms=4.0,
-        normalization={
-            "active_tracks": 3,
-            "age_s": 2.0,
-            "motion_px_s": 5.0,
-            "time_since_detector_s": 2.0,
-        },
-    )
+    profile = _profile(traces)
 
     assert isinstance(profile, ReferenceProfile)
     assert profile.profile_sha256 == profile.cost_profile["profile_sha256"]
@@ -406,13 +501,205 @@ def test_reference_profile_uses_explicit_canonical_schema_and_hash(tmp_path: Pat
     assert ReferenceProfile.load(destination).canonical_json == profile.canonical_json
 
 
+def test_profile_derives_linear_p95_reserve_and_capacity(tmp_path: Path) -> None:
+    traces = [
+        _profile_trace(tmp_path, identifier, latency=latencies)
+        for identifier, latencies in zip(
+            ("02", "04", "05", "10"),
+            ((1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)),
+            strict=True,
+        )
+    ]
+
+    profile = profile_training_traces(
+        traces, tracker_factory=_empty_tracker_factory
+    )
+
+    assert profile.cost_profile["p95_ms"] == pytest.approx(11.45)
+    assert profile.cost_profile["reserve_ms"] == pytest.approx(11.45)
+    assert profile.cost_profile["capacity_ms"] == pytest.approx(22.9)
+
+
+def test_profile_runs_exact_canonical_tracker_lifecycle_and_actions(
+    tmp_path: Path,
+) -> None:
+    frame_count = 11
+    traces = {
+        identifier: _profile_trace(
+            tmp_path,
+            identifier,
+            latency=([20.0] + [10.0] * 10 if identifier == "02" else 10.0),
+            frame_count=frame_count,
+            fps=fps,
+        )
+        for identifier, fps in zip(
+            ("02", "04", "05", "10"), (8.0, 16.0, 32.0, 64.0), strict=True
+        )
+    }
+    factory = _RecordingFactory()
+
+    profile = profile_training_traces(
+        [traces["10"], traces["02"], traces["05"], traces["04"]],
+        tracker_factory=factory,
+    )
+
+    assert profile.cost_profile["reserve_ms"] == 10.0
+    assert factory.frame_rates == [8.0] * 6 + [16.0] * 6 + [32.0] * 6 + [64.0] * 6
+    assert len(factory.trackers) == len({id(tracker) for tracker in factory.trackers}) == 24
+    first_trace_actions = [
+        [1] * 11,
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+        [1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1],
+        [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    ]
+    normal_actions = [
+        [1] * 11,
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+        [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1],
+        [1] * 11,
+    ]
+    expected_actions = first_trace_actions + normal_actions * 3
+    assert [tracker.actions for tracker in factory.trackers] == expected_actions
+    for tracker, actions in zip(factory.trackers, expected_actions, strict=True):
+        expected_events = ["reset"]
+        for action in actions:
+            expected_events.extend(("summary", "detect" if action else "skip"))
+        assert tracker.reset_count == 1
+        assert tracker.events == expected_events
+
+
+def test_profile_derives_p99_scales_from_exact_schedule_domains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import squint_rl.reference.build_mot17 as build_mot17_module
+
+    calls: list[tuple[float, int, str]] = []
+    real_percentile = np.percentile
+
+    def recording_percentile(
+        values: object, q: float, *, method: str
+    ) -> np.floating[Any]:
+        calls.append((float(q), int(np.asarray(values).size), method))
+        return real_percentile(values, q, method=method)
+
+    monkeypatch.setattr(build_mot17_module.np, "percentile", recording_percentile)
+    factory = _SummaryFactory()
+    profile = profile_training_traces(
+        [
+            _profile_trace(tmp_path, identifier, latency=100.0)
+            for identifier in ("02", "04", "05", "10")
+        ],
+        tracker_factory=factory,
+    )
+
+    assert factory.sample_count == 72
+    assert calls == [
+        (95.0, 12, "linear"),
+        (99.0, 72, "linear"),
+        (99.0, 72, "linear"),
+        (99.0, 72, "linear"),
+        (99.0, 48, "linear"),
+    ]
+    assert profile.normalization == {
+        "active_tracks": 71,
+        "age_s": pytest.approx(7.029),
+        "motion_px_s": pytest.approx(140.58),
+        "time_since_detector_s": pytest.approx(0.08),
+    }
+
+
+def test_profile_applies_all_normalization_floors(tmp_path: Path) -> None:
+    profile = _profile(
+        [
+            _profile_trace(tmp_path, identifier, latency=10.0, frame_count=2)
+            for identifier in ("02", "04", "05", "10")
+        ]
+    )
+
+    assert profile.normalization == {
+        "active_tracks": 1,
+        "age_s": pytest.approx(0.04),
+        "motion_px_s": 1.0,
+        "time_since_detector_s": pytest.approx(0.04),
+    }
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "latency", "match"),
+    [
+        (3, 0.0, r"cost_profile\.p95_ms"),
+        (1, 1.0, r"normalization\.time_since_detector_s"),
+    ],
+)
+def test_profile_rejects_invalid_domains_before_tracker_creation(
+    tmp_path: Path, frame_count: int, latency: float, match: str
+) -> None:
+    factory = _RecordingFactory()
+
+    with pytest.raises(ValueError, match=match):
+        profile_training_traces(
+            [
+                _profile_trace(
+                    tmp_path,
+                    identifier,
+                    latency=latency,
+                    frame_count=frame_count,
+                )
+                for identifier in ("02", "04", "05", "10")
+            ],
+            tracker_factory=factory,
+        )
+
+    assert factory.trackers == []
+
+
+def test_profile_is_order_independent_and_avoids_noncausal_trace_access(
+    tmp_path: Path,
+) -> None:
+    traces = [
+        _profile_trace(tmp_path, identifier, latency=10.0)
+        for identifier in ("02", "04", "05", "10")
+    ]
+    expected = _profile(traces)
+    allowed_arrays = {
+        "timestamps_s",
+        "detector_latency_ms",
+        "det_boxes_xyxy",
+        "det_scores",
+        "det_class_ids",
+        "det_frame_offsets",
+    }
+    allowed_manifest = {
+        "sequence_id",
+        "detector",
+        "hardware",
+        "fps",
+        "causal_trace_sha256",
+    }
+    for trace in traces:
+        object.__setattr__(trace, "arrays", _AccessTrap(trace.arrays, allowed_arrays))
+        object.__setattr__(
+            trace,
+            "manifest_fields",
+            _AccessTrap(trace.manifest_fields, allowed_manifest),
+        )
+
+    actual = profile_training_traces(
+        list(reversed(traces)), tracker_factory=_empty_tracker_factory
+    )
+
+    assert actual.canonical_json == expected.canonical_json
+
+
 def test_profile_hash_binds_domain_schema_and_only_nonrecursive_profile_fields(
     tmp_path: Path,
 ) -> None:
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=4.0,
-        normalization=_normalization(),
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     serialized = profile.to_dict()
     cost_profile = deepcopy(serialized["cost_profile"])
@@ -482,12 +769,18 @@ def test_raw_trace_deep_freezes_json_manifest_and_rejects_non_json_values(
 def test_profile_requires_exact_training_ids_and_matching_nested_identities(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ValueError, match="02, 04, 05, and 10"):
-        profile_training_traces(
-            [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05")],
-            reserve_ms=1.0,
-            normalization=_normalization(),
-        )
+    factory = _RecordingFactory()
+    base = {
+        identifier: _profile_trace(tmp_path, identifier)
+        for identifier in ("02", "04", "05", "10", "11")
+    }
+    for traces in (
+        [base[identifier] for identifier in ("02", "04", "05")],
+        [base[identifier] for identifier in ("02", "04", "05", "05")],
+        [base[identifier] for identifier in ("02", "04", "05", "11")],
+    ):
+        with pytest.raises(ValueError):
+            profile_training_traces(traces, tracker_factory=factory)
     mixed_detector_identity = _detector_identity()
     mixed_detector_identity["precision"] = "float16"
     mixed_detector = _profile_trace(
@@ -497,8 +790,7 @@ def test_profile_requires_exact_training_ids_and_matching_nested_identities(
         profile_training_traces(
             [_profile_trace(tmp_path, "02"), mixed_detector]
             + [_profile_trace(tmp_path, identifier) for identifier in ("05", "10")],
-            reserve_ms=1.0,
-            normalization=_normalization(),
+            tracker_factory=factory,
         )
     mixed_hardware_identity = _hardware_identity()
     platform = mixed_hardware_identity["platform"]
@@ -510,9 +802,9 @@ def test_profile_requires_exact_training_ids_and_matching_nested_identities(
     with pytest.raises(ValueError, match="hardware"):
         profile_training_traces(
             [_profile_trace(tmp_path, "02"), _profile_trace(tmp_path, "04"), mixed_hardware, _profile_trace(tmp_path, "10")],
-            reserve_ms=1.0,
-            normalization=_normalization(),
+            tracker_factory=factory,
         )
+    assert factory.trackers == []
 
 
 @pytest.mark.parametrize(
@@ -583,9 +875,7 @@ def test_profile_rejects_invalid_detector_identity(
             _profile_trace(tmp_path, identifier, detector=detector)
             for identifier in ("02", "04", "05", "10")
         ]
-        profile_training_traces(
-            traces, reserve_ms=1.0, normalization=_normalization()
-        )
+        _profile(traces)
 
 
 @pytest.mark.parametrize(
@@ -642,9 +932,7 @@ def test_profile_rejects_invalid_hardware_identity(
             _profile_trace(tmp_path, identifier, hardware=hardware)
             for identifier in ("02", "04", "05", "10")
         ]
-        profile_training_traces(
-            traces, reserve_ms=1.0, normalization=_normalization()
-        )
+        _profile(traces)
 
 
 @pytest.mark.parametrize(
@@ -665,20 +953,16 @@ def test_accelerated_hardware_requires_complete_runtime_and_device_identity(
         for identifier in ("02", "04", "05", "10")
     ]
     with pytest.raises(ValueError, match="hardware"):
-        profile_training_traces(
-            traces, reserve_ms=1.0, normalization=_normalization()
-        )
+        _profile(traces)
 
 
 def test_complete_accelerated_hardware_identity_is_supported(tmp_path: Path) -> None:
     hardware = _hardware_identity(device_type="cuda")
-    profile = profile_training_traces(
+    profile = _profile(
         [
             _profile_trace(tmp_path, identifier, hardware=hardware)
             for identifier in ("02", "04", "05", "10")
         ],
-        reserve_ms=1.0,
-        normalization=_normalization(),
     )
     assert profile.to_dict()["hardware"] == hardware
 
@@ -689,15 +973,13 @@ def test_cuda_detector_allows_float16_with_pinned_person_label_id(
     detector = _detector_identity()
     detector["precision"] = "float16"
     hardware = _hardware_identity(device_type="cuda")
-    profile = profile_training_traces(
+    profile = _profile(
         [
             _profile_trace(
                 tmp_path, identifier, detector=detector, hardware=hardware
             )
             for identifier in ("02", "04", "05", "10")
         ],
-        reserve_ms=1.0,
-        normalization=_normalization(),
     )
     assert profile.to_dict()["detector"] == detector
 
@@ -710,20 +992,16 @@ def test_cpu_profile_rejects_float16_through_every_entry_point(
     detector["precision"] = "float16"
     if entry_point == "training":
         with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
-            profile_training_traces(
+            _profile(
                 [
                     _profile_trace(tmp_path, identifier, detector=detector)
                     for identifier in ("02", "04", "05", "10")
                 ],
-                reserve_ms=1.0,
-                normalization=_normalization(),
             )
         return
 
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=1.0,
-        normalization=_normalization(),
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     if entry_point == "direct":
         with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
@@ -750,13 +1028,7 @@ def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace
     tmp_path: Path,
 ) -> None:
     traces = [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
-    normalization = {
-        "active_tracks": 1,
-        "age_s": 1.0,
-        "motion_px_s": 1.0,
-        "time_since_detector_s": 1.0,
-    }
-    original = profile_training_traces(traces, reserve_ms=1.0, normalization=normalization)
+    original = _profile(traces)
     arrays = dict(traces[0].arrays)
     arrays["gt_boxes_xyxy"] = arrays["gt_boxes_xyxy"].copy()
     arrays["gt_boxes_xyxy"][0, 0] += 1.0
@@ -764,20 +1036,26 @@ def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace
     changed_manifest["source_sha256"] = "c" * 64
     changed_manifest["telemetry"] = {"gpu_utilization": 99.0}
     changed = RawTrace("02", arrays, changed_manifest)
-    unchanged = profile_training_traces(
-        [changed, *traces[1:]], reserve_ms=1.0, normalization=normalization
-    )
+    unchanged = _profile([changed, *traces[1:]])
     assert unchanged.canonical_json == original.canonical_json
     causal_arrays = dict(traces[0].arrays)
-    causal_arrays["detector_latency_ms"] = causal_arrays["detector_latency_ms"].copy()
-    causal_arrays["detector_latency_ms"][0] += 1.0
+    causal_arrays["scene_change"] = causal_arrays["scene_change"].copy()
+    causal_arrays["scene_change"][0, 0, 0] = 0.5
     causal_manifest = dict(traces[0].manifest_fields)
     causal_manifest["causal_trace_sha256"] = causal_trace_sha256(causal_arrays)
     causal_changed = RawTrace("02", causal_arrays, causal_manifest)
-    changed_profile = profile_training_traces(
-        [causal_changed, *traces[1:]], reserve_ms=1.0, normalization=normalization
-    )
+    changed_profile = _profile([causal_changed, *traces[1:]])
     assert changed_profile.canonical_json != original.canonical_json
+    assert changed_profile.normalization == original.normalization
+    assert {
+        key: value
+        for key, value in changed_profile.cost_profile.items()
+        if key != "profile_sha256"
+    } == {
+        key: value
+        for key, value in original.cost_profile.items()
+        if key != "profile_sha256"
+    }
 
 
 @pytest.mark.parametrize(
@@ -795,15 +1073,8 @@ def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace
 def test_profile_load_rejects_schema_numeric_and_hash_mutations(
     tmp_path: Path, mutation: dict[str, object]
 ) -> None:
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=1.0,
-        normalization={
-            "active_tracks": 1,
-            "age_s": 1.0,
-            "motion_px_s": 1.0,
-            "time_since_detector_s": 1.0,
-        },
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     payload = profile.to_dict()
     for key, value in mutation.items():
@@ -820,10 +1091,8 @@ def test_profile_load_rejects_schema_numeric_and_hash_mutations(
 
 
 def test_profile_load_rejects_bool_schema_version_contextually(tmp_path: Path) -> None:
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=1.0,
-        normalization=_normalization(),
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     payload = profile.to_dict()
     payload["schema"] = {"name": "squint.reference-profile", "version": True}
@@ -854,10 +1123,8 @@ def test_profile_load_rejects_bool_schema_version_contextually(tmp_path: Path) -
 def test_profile_load_wraps_every_malformed_top_level_type_as_value_error(
     tmp_path: Path, field: str, malformed: object
 ) -> None:
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=1.0,
-        normalization=_normalization(),
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     payload = profile.to_dict()
     payload[field] = malformed
@@ -872,15 +1139,8 @@ def test_profile_load_wraps_every_malformed_top_level_type_as_value_error(
 def test_profile_write_requires_new_destination_and_load_requires_canonical_json(
     tmp_path: Path,
 ) -> None:
-    profile = profile_training_traces(
-        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
-        reserve_ms=1.0,
-        normalization={
-            "active_tracks": 1,
-            "age_s": 1.0,
-            "motion_px_s": 1.0,
-            "time_since_detector_s": 1.0,
-        },
+    profile = _profile(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")]
     )
     destination = tmp_path / "profile.json"
     profile.write(destination)

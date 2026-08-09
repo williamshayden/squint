@@ -18,6 +18,8 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from squint_rl.budget import BudgetConfig, TokenBucket
+from squint_rl.reference.bytetrack import ByteTrackAdapter
 from squint_rl.reference.dfine import (
     MODEL_ID,
     MODEL_REVISION,
@@ -26,7 +28,7 @@ from squint_rl.reference.dfine import (
     scene_change_grid,
 )
 from squint_rl.reference.mot17 import Mot17Sequence
-from squint_rl.tracker import DetectionBatch
+from squint_rl.tracker import DetectionBatch, Tracker
 
 _ARRAY_NAMES = (
     "timestamps_s", "detector_latency_ms", "scene_change", "det_boxes_xyxy",
@@ -61,6 +63,7 @@ _PROFILE_SCHEMA_NAME = "squint.reference-profile"
 _PROFILE_SCHEMA_VERSION = 1
 _PROFILE_HASH_DOMAIN = "squint.reference-profile/v1"
 _PROFILE_TRAINING_IDS = ("02", "04", "05", "10")
+_PROFILE_RATES = (0.10, 0.25, 0.50, 0.75, 1.00)
 _PROFILE_COST_FIELDS = ("unit", "p95_ms", "reserve_ms", "capacity_ms", "profile_sha256")
 _PROFILE_NORMALIZATION_FIELDS = (
     "active_tracks", "age_s", "motion_px_s", "time_since_detector_s"
@@ -75,6 +78,10 @@ _HARDWARE_FIELDS = {"platform", "runtime", "device"}
 
 class Detector(Protocol):
     def predict(self, image: Image.Image) -> tuple[DetectionBatch, float]: ...
+
+
+class _TrackerFactory(Protocol):
+    def __call__(self, *, frame_rate: float) -> Tracker: ...
 
 
 def _framed(digest: Any, value: bytes) -> None:
@@ -731,15 +738,111 @@ class ReferenceProfile:
         return profile
 
 
+def _profile_percentile(
+    values: Sequence[object],
+    percentile: float,
+    *,
+    expected_count: int,
+    field: str,
+    positive: bool = False,
+) -> float:
+    try:
+        domain = np.asarray(values, dtype=np.float64)
+        if domain.shape != (expected_count,) or expected_count == 0:
+            raise ValueError("wrong domain cardinality")
+        if not np.all(np.isfinite(domain)) or np.any(domain < 0.0):
+            raise ValueError("nonfinite or negative domain value")
+        result = float(np.percentile(domain, percentile, method="linear"))
+    except (FloatingPointError, IndexError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{field} requires exactly {expected_count} finite nonnegative samples"
+        ) from error
+    if not math.isfinite(result) or result < 0.0 or (positive and result <= 0.0):
+        qualifier = "strictly positive" if positive else "nonnegative"
+        raise ValueError(f"{field} percentile must be finite and {qualifier}")
+    return result
+
+
+def _summary_sample(value: object, field: str, *, integer: bool = False) -> float:
+    valid_type = isinstance(value, (int, np.integer)) if integer else isinstance(
+        value, (int, float, np.integer, np.floating)
+    )
+    if isinstance(value, (bool, np.bool_)) or not valid_type:
+        raise ValueError(f"normalization.{field} requires numeric tracker summaries")
+    try:
+        result = float(cast(Any, value))
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"normalization.{field} requires numeric tracker summaries") from error
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"normalization.{field} requires finite nonnegative samples")
+    return result
+
+
+def _frame_detections(trace: RawTrace, frame_index: int) -> DetectionBatch:
+    arrays = trace.arrays
+    try:
+        offsets = arrays["det_frame_offsets"]
+        start, stop = int(offsets[frame_index]), int(offsets[frame_index + 1])
+        return DetectionBatch(
+            arrays["det_boxes_xyxy"][start:stop],
+            arrays["det_scores"][start:stop],
+            arrays["det_class_ids"][start:stop],
+        )
+    except (IndexError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError("normalization.active_tracks detector slices are invalid") from error
+
+
+def _run_profile_schedule(
+    trace: RawTrace,
+    tracker: Tracker,
+    *,
+    budget: BudgetConfig | None,
+    samples: dict[str, list[float]],
+) -> None:
+    timestamps = trace.arrays["timestamps_s"]
+    bucket = TokenBucket(budget) if budget is not None else None
+    if bucket is not None:
+        bucket.reset(timestamp_s=float(timestamps[0]))
+    last_detector_timestamp_s: float | None = None
+    for frame_index in range(len(timestamps)):
+        try:
+            timestamp_s = float(timestamps[frame_index])
+        except (IndexError, OverflowError, TypeError, ValueError) as error:
+            raise ValueError("normalization.time_since_detector_s timestamps are invalid") from error
+        if frame_index > 0 and bucket is not None:
+            bucket.refill(timestamp_s=timestamp_s)
+        summary = tracker.summary()
+        samples["active_tracks"].append(
+            _summary_sample(summary.active_tracks, "active_tracks", integer=True)
+        )
+        samples["age_s"].append(_summary_sample(summary.mean_age_s, "age_s"))
+        samples["motion_px_s"].append(
+            _summary_sample(summary.mean_motion_px_s, "motion_px_s")
+        )
+        if last_detector_timestamp_s is not None:
+            samples["time_since_detector_s"].append(
+                timestamp_s - last_detector_timestamp_s
+            )
+        run_detector = bucket is None or bucket.affordable
+        detections = _frame_detections(trace, frame_index) if run_detector else None
+        tracker.step(detections, timestamp_s)
+        if run_detector:
+            if bucket is not None:
+                try:
+                    bucket.charge(
+                        float(trace.arrays["detector_latency_ms"][frame_index])
+                    )
+                except (IndexError, OverflowError, TypeError, ValueError) as error:
+                    raise ValueError("cost_profile.p95_ms latency domain is invalid") from error
+            last_detector_timestamp_s = timestamp_s
+
+
 def profile_training_traces(
     traces: Sequence[RawTrace],
     *,
-    reserve_ms: float = 1.0,
-    normalization: Mapping[str, object] | None = None,
-    tracker_factory: object | None = None,
+    tracker_factory: _TrackerFactory = ByteTrackAdapter,
 ) -> ReferenceProfile:
-    """Freeze C2a1 profile inputs; schedule profiling is intentionally deferred."""
-    del tracker_factory
+    """Derive one causal detector-budget profile from canonical training traces."""
     if len(traces) != len(_PROFILE_TRAINING_IDS):
         raise ValueError("profile requires exactly training traces 02, 04, 05, and 10")
     if len({trace.sequence_id for trace in traces}) != len(traces):
@@ -750,12 +853,17 @@ def profile_training_traces(
     first_manifest = ordered[0].manifest_fields
     detector = _validate_detector_identity(first_manifest.get("detector"))
     hardware = _validate_hardware_identity(first_manifest.get("hardware"))
+    _validate_identity_matrix(detector, hardware)
     detector_json = _canonical_json(detector)
     hardware_json = _canonical_json(hardware)
     profile_traces: list[Mapping[str, object]] = []
+    frame_counts: list[int] = []
+    frame_rates: list[float] = []
+    latency_domain: list[object] = []
     for trace in ordered:
         current_detector = _validate_detector_identity(trace.manifest_fields.get("detector"))
         current_hardware = _validate_hardware_identity(trace.manifest_fields.get("hardware"))
+        _validate_identity_matrix(current_detector, current_hardware)
         if _canonical_json(current_detector) != detector_json:
             raise ValueError("training traces must share one detector identity")
         if _canonical_json(current_hardware) != hardware_json:
@@ -767,29 +875,105 @@ def profile_training_traces(
         profile_traces.append(
             {"sequence_id": trace.sequence_id, "causal_trace_sha256": causal_hash}
         )
-    if normalization is None:
-        normalization = {
-            "active_tracks": 1,
-            "age_s": 1.0,
-            "motion_px_s": 1.0,
-            "time_since_detector_s": 1.0,
-        }
-    reserve = _positive_number(reserve_ms, "cost_profile.reserve_ms")
+        fps = _positive_number(
+            trace.manifest_fields.get("fps"), f"trace {trace.sequence_id}.fps"
+        )
+        timestamps = trace.arrays["timestamps_s"]
+        latencies = trace.arrays["detector_latency_ms"]
+        frame_counts.append(len(timestamps))
+        frame_rates.append(fps)
+        latency_domain.extend(latencies)
+
+    total_frames = sum(frame_counts)
+    expected_summary_count = (len(_PROFILE_RATES) + 1) * total_frames
+    expected_time_count = (len(_PROFILE_RATES) + 1) * sum(
+        frame_count - 1 for frame_count in frame_counts
+    )
+    if expected_time_count == 0:
+        raise ValueError("normalization.time_since_detector_s domain must be nonempty")
+    reserve = _profile_percentile(
+        latency_domain,
+        95.0,
+        expected_count=total_frames,
+        field="cost_profile.p95_ms",
+        positive=True,
+    )
+    budgets = [
+        [
+            BudgetConfig.for_rate(
+                reserve_ms=reserve, source_fps=fps, nominal_rate=rate
+            )
+            for rate in _PROFILE_RATES
+        ]
+        for fps in frame_rates
+    ]
+    samples: dict[str, list[float]] = {
+        name: [] for name in _PROFILE_NORMALIZATION_FIELDS
+    }
+    tracker_instances: list[Tracker] = []
+    for trace, fps, trace_budgets in zip(
+        ordered, frame_rates, budgets, strict=True
+    ):
+        for budget in (None, *trace_budgets):
+            tracker = tracker_factory(frame_rate=fps)
+            if not isinstance(tracker, Tracker):
+                raise TypeError("tracker_factory must return a Tracker")
+            if any(tracker is previous for previous in tracker_instances):
+                raise ValueError("tracker_factory must return a new Tracker per schedule")
+            tracker_instances.append(tracker)
+            tracker.reset()
+            _run_profile_schedule(
+                trace,
+                tracker,
+                budget=budget,
+                samples=samples,
+            )
+
+    active_tracks = _profile_percentile(
+        samples["active_tracks"],
+        99.0,
+        expected_count=expected_summary_count,
+        field="normalization.active_tracks",
+    )
+    age_s = _profile_percentile(
+        samples["age_s"],
+        99.0,
+        expected_count=expected_summary_count,
+        field="normalization.age_s",
+    )
+    motion_px_s = _profile_percentile(
+        samples["motion_px_s"],
+        99.0,
+        expected_count=expected_summary_count,
+        field="normalization.motion_px_s",
+    )
+    time_since_detector_s = _profile_percentile(
+        samples["time_since_detector_s"],
+        99.0,
+        expected_count=expected_time_count,
+        field="normalization.time_since_detector_s",
+    )
+    largest_frame_interval = max(1.0 / fps for fps in frame_rates)
+    normalization: Mapping[str, object] = {
+        "active_tracks": max(1, math.ceil(active_tracks)),
+        "age_s": float(max(largest_frame_interval, age_s)),
+        "motion_px_s": float(max(1.0, motion_px_s)),
+        "time_since_detector_s": float(
+            max(largest_frame_interval, time_since_detector_s)
+        ),
+    }
     cost_without_hash: dict[str, object] = {
         "unit": "detector_ms",
         "p95_ms": reserve,
         "reserve_ms": reserve,
         "capacity_ms": 2.0 * reserve,
     }
-    normalized = _freeze_json(normalization, path="normalization")
-    if not isinstance(normalized, Mapping):
-        raise ValueError("normalization must be a JSON object")  # noqa: TRY004
     hash_payload = _profile_hash_payload(
-        detector, hardware, cost_without_hash, cast(Mapping[str, object], normalized), profile_traces
+        detector, hardware, cost_without_hash, normalization, profile_traces
     )
     cost = dict(cost_without_hash)
     cost["profile_sha256"] = hashlib.sha256(_canonical_json(hash_payload).encode()).hexdigest()
-    return ReferenceProfile(detector, hardware, cost, cast(Mapping[str, object], normalized), tuple(profile_traces))
+    return ReferenceProfile(detector, hardware, cost, normalization, tuple(profile_traces))
 
 
 def build_sequence(
