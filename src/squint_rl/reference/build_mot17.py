@@ -28,7 +28,7 @@ from squint_rl.reference.dfine import (
     scene_change_grid,
 )
 from squint_rl.reference.mot17 import Mot17Sequence
-from squint_rl.tracker import DetectionBatch, Tracker
+from squint_rl.tracker import DetectionBatch, TrackBatch, Tracker, TrackerSummary
 
 _ARRAY_NAMES = (
     "timestamps_s", "detector_latency_ms", "scene_change", "det_boxes_xyxy",
@@ -797,6 +797,7 @@ def _run_profile_schedule(
     tracker: Tracker,
     *,
     budget: BudgetConfig | None,
+    context: str,
     samples: dict[str, list[float]],
 ) -> None:
     timestamps = trace.arrays["timestamps_s"]
@@ -811,7 +812,14 @@ def _run_profile_schedule(
             raise ValueError("normalization.time_since_detector_s timestamps are invalid") from error
         if frame_index > 0 and bucket is not None:
             bucket.refill(timestamp_s=timestamp_s)
-        summary = tracker.summary()
+        try:
+            summary = tracker.summary()
+        except Exception as error:
+            raise ValueError(f"{context} summary failed at frame {frame_index}") from error
+        if not isinstance(summary, TrackerSummary):
+            raise ValueError(  # noqa: TRY004
+                f"{context} summary returned invalid TrackerSummary"
+            )
         samples["active_tracks"].append(
             _summary_sample(summary.active_tracks, "active_tracks", integer=True)
         )
@@ -825,7 +833,14 @@ def _run_profile_schedule(
             )
         run_detector = bucket is None or bucket.affordable
         detections = _frame_detections(trace, frame_index) if run_detector else None
-        tracker.step(detections, timestamp_s)
+        try:
+            tracks = tracker.step(detections, timestamp_s)
+        except Exception as error:
+            raise ValueError(f"{context} step failed at frame {frame_index}") from error
+        if not isinstance(tracks, TrackBatch):
+            raise ValueError(  # noqa: TRY004
+                f"{context} step returned invalid TrackBatch"
+            )
         if run_detector:
             if bucket is not None:
                 try:
@@ -911,21 +926,34 @@ def profile_training_traces(
         name: [] for name in _PROFILE_NORMALIZATION_FIELDS
     }
     tracker_instances: list[Tracker] = []
+    schedule_names = ("all-frame", *(f"greedy-{rate:.2f}" for rate in _PROFILE_RATES))
     for trace, fps, trace_budgets in zip(
         ordered, frame_rates, budgets, strict=True
     ):
-        for budget in (None, *trace_budgets):
-            tracker = tracker_factory(frame_rate=fps)
+        for schedule, budget in zip(
+            schedule_names, (None, *trace_budgets), strict=True
+        ):
+            context = f"trace {trace.sequence_id} schedule {schedule}"
+            try:
+                tracker = tracker_factory(frame_rate=fps)
+            except Exception as error:
+                raise ValueError(f"{context} factory failed") from error
             if not isinstance(tracker, Tracker):
-                raise TypeError("tracker_factory must return a Tracker")
+                raise ValueError(  # noqa: TRY004
+                    f"{context} factory returned invalid Tracker"
+                )
             if any(tracker is previous for previous in tracker_instances):
-                raise ValueError("tracker_factory must return a new Tracker per schedule")
+                raise ValueError(f"{context} factory reused a Tracker")
             tracker_instances.append(tracker)
-            tracker.reset()
+            try:
+                tracker.reset()
+            except Exception as error:
+                raise ValueError(f"{context} reset failed") from error
             _run_profile_schedule(
                 trace,
                 tracker,
                 budget=budget,
+                context=context,
                 samples=samples,
             )
 

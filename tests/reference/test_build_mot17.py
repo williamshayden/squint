@@ -417,6 +417,53 @@ class _SummaryFactory:
         return SummaryTracker()
 
 
+class _AdversarialTracker(_EmptyTracker):
+    def __init__(self, case: str) -> None:
+        self.case = case
+
+    def reset(self) -> None:
+        if self.case == "reset_raises":
+            raise RuntimeError("reset exploded")
+
+    def summary(self) -> Any:
+        if self.case == "summary_raises":
+            raise RuntimeError("summary exploded")
+        if self.case == "summary_none":
+            return None
+        if self.case == "summary_wrong_type":
+            return TrackBatch.empty()
+        return super().summary()
+
+    def step(
+        self, detections: DetectionBatch | None, timestamp_s: float
+    ) -> Any:
+        if self.case == "step_raises":
+            raise IndexError("step exploded")
+        if self.case == "step_none":
+            return None
+        if self.case == "step_wrong_type":
+            return TrackerSummary.empty()
+        return super().step(detections, timestamp_s)
+
+
+class _AdversarialFactory:
+    def __init__(self, case: str) -> None:
+        self.case = case
+
+    def __call__(self, *, frame_rate: float) -> Any:
+        del frame_rate
+        if self.case == "factory_raises":
+            raise RuntimeError("factory exploded")
+        if self.case == "missing_protocol":
+            return object()
+        return _AdversarialTracker(self.case)
+
+
+class _WrongSignatureFactory:
+    def __call__(self) -> _EmptyTracker:
+        return _EmptyTracker()
+
+
 class _AccessTrap(Mapping[str, object]):
     def __init__(self, values: Mapping[str, object], allowed: set[str]) -> None:
         self._values = values
@@ -655,6 +702,69 @@ def test_profile_rejects_invalid_domains_before_tracker_creation(
         )
 
     assert factory.trackers == []
+
+
+@pytest.mark.parametrize(
+    ("case", "operation"),
+    [
+        ("wrong_signature", "factory"),
+        ("factory_raises", "factory"),
+        ("missing_protocol", "factory"),
+        ("reset_raises", "reset"),
+        ("summary_raises", "summary"),
+        ("summary_none", "summary"),
+        ("summary_wrong_type", "summary"),
+        ("step_raises", "step"),
+        ("step_none", "step"),
+        ("step_wrong_type", "step"),
+    ],
+)
+def test_profile_wraps_malformed_tracker_boundaries_contextually(
+    tmp_path: Path, case: str, operation: str
+) -> None:
+    factory: Any = (
+        _WrongSignatureFactory()
+        if case == "wrong_signature"
+        else _AdversarialFactory(case)
+    )
+    traces = [
+        _profile_trace(tmp_path, identifier, latency=10.0, frame_count=2)
+        for identifier in ("02", "04", "05", "10")
+    ]
+
+    with pytest.raises(
+        ValueError, match=rf"trace 02.*all-frame.*{operation}"
+    ):
+        profile_training_traces(traces, tracker_factory=factory)
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_profile_does_not_wrap_process_control_exceptions(
+    tmp_path: Path, error_type: type[BaseException]
+) -> None:
+    def factory(*, frame_rate: float) -> _EmptyTracker:
+        del frame_rate
+        raise error_type()
+
+    with pytest.raises(error_type):
+        profile_training_traces(
+            [
+                _profile_trace(tmp_path, identifier, latency=10.0, frame_count=2)
+                for identifier in ("02", "04", "05", "10")
+            ],
+            tracker_factory=factory,
+        )
+
+
+def test_profile_default_bytetrack_factory_succeeds(tmp_path: Path) -> None:
+    profile = profile_training_traces(
+        [
+            _profile_trace(tmp_path, identifier, latency=10.0, frame_count=2)
+            for identifier in ("02", "04", "05", "10")
+        ]
+    )
+
+    assert profile.cost_profile["reserve_ms"] == 10.0
 
 
 def test_profile_is_order_independent_and_avoids_noncausal_trace_access(
