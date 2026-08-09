@@ -321,8 +321,8 @@ def _validate_detector_identity(value: object) -> Mapping[str, object]:
     if class_mapping["source_label"] != "person":
         raise ValueError("detector.class_mapping.source_label must be person")
     source_label_id = class_mapping["source_label_id"]
-    if type(source_label_id) is not int or source_label_id < 0:
-        raise ValueError("detector.class_mapping.source_label_id must be nonnegative integer")
+    if type(source_label_id) is not int or source_label_id != 0:
+        raise ValueError("detector.class_mapping.source_label_id must be integer 0")
     output_class_id = class_mapping["output_class_id"]
     if type(output_class_id) is not int or output_class_id != 1:
         raise ValueError("detector.class_mapping.output_class_id must be integer 1")
@@ -367,15 +367,27 @@ def _validate_hardware_identity(value: object) -> Mapping[str, object]:
     for field in ("cuda", "driver"):
         _nullable_string(runtime[field], f"hardware.runtime.{field}")
     device_type = _nonempty_string(device["type"], "hardware.device.type")
+    if device_type not in ("cpu", "cuda"):
+        raise ValueError("hardware.device.type must be cpu or cuda")
     _nonempty_string(device["name"], "hardware.device.name")
     for field in ("uuid", "pci_bus_id"):
         _nullable_string(device[field], f"hardware.device.{field}")
-    if device_type != "cpu" and any(
-        item is None
-        for item in (runtime["cuda"], runtime["driver"], device["uuid"], device["pci_bus_id"])
-    ):
-        raise ValueError("non-CPU hardware identity requires CUDA, driver, UUID, and PCI bus ID")
+    optional_identity = (
+        runtime["cuda"], runtime["driver"], device["uuid"], device["pci_bus_id"]
+    )
+    if device_type == "cpu" and any(item is not None for item in optional_identity):
+        raise ValueError("CPU hardware identity requires null CUDA, driver, UUID, and PCI bus ID")
+    if device_type == "cuda" and any(item is None for item in optional_identity):
+        raise ValueError("CUDA hardware identity requires CUDA, driver, UUID, and PCI bus ID")
     return hardware
+
+
+def _validate_identity_matrix(
+    detector: Mapping[str, object], hardware: Mapping[str, object]
+) -> None:
+    device = cast(Mapping[str, object], hardware["device"])
+    if device["type"] == "cpu" and detector["precision"] != "float32":
+        raise ValueError("CPU detector.precision must be float32")
 
 
 def _validate_trace_manifest(
@@ -568,6 +580,7 @@ class ReferenceProfile:
     def __post_init__(self) -> None:
         detector = _validate_detector_identity(self.detector)
         hardware = _validate_hardware_identity(self.hardware)
+        _validate_identity_matrix(detector, hardware)
         cost = _freeze_json(self.cost_profile, path="cost_profile")
         normalization = _freeze_json(self.normalization, path="normalization")
         traces = tuple(_freeze_json(trace, path="training_traces") for trace in self.training_traces)

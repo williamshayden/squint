@@ -87,7 +87,7 @@ def _detector_identity() -> dict[str, object]:
         "threshold": 0.10,
         "class_mapping": {
             "source_label": "person",
-            "source_label_id": 1,
+            "source_label_id": 0,
             "output_class_id": 1,
         },
         "precision": "float32",
@@ -554,6 +554,9 @@ def test_profile_requires_exact_training_ids_and_matching_nested_identities(
         (("class_mapping",), {}),
         (("class_mapping", "source_label"), _DELETE),
         (("class_mapping", "source_label"), "car"),
+        (("class_mapping", "source_label_id"), _DELETE),
+        (("class_mapping", "source_label_id"), 1),
+        (("class_mapping", "source_label_id"), 999),
         (("class_mapping", "source_label_id"), -1),
         (("class_mapping", "source_label_id"), True),
         (("class_mapping", "output_class_id"), 2),
@@ -616,16 +619,24 @@ def test_profile_rejects_invalid_detector_identity(
         (("device", "uuid"), _DELETE),
         (("device", "pci_bus_id"), _DELETE),
         (("device", "type"), ""),
+        (("device", "type"), "tpu"),
         (("device", "name"), True),
         (("device", "uuid"), ""),
         (("device", "pci_bus_id"), False),
         (("device", "extra"), None),
+        (("runtime", "cuda"), "12.4"),
+        (("runtime", "driver"), "550.54"),
+        (("device", "uuid"), "CPU-fixture"),
+        (("device", "pci_bus_id"), "0000:00:00.0"),
     ],
 )
 def test_profile_rejects_invalid_hardware_identity(
     tmp_path: Path, path: tuple[str, ...], value: object
 ) -> None:
-    hardware = _mutate_identity(_hardware_identity(), path, value)
+    hardware = _hardware_identity(
+        device_type="cuda" if path == ("device", "type") and value == "tpu" else "cpu"
+    )
+    hardware = _mutate_identity(hardware, path, value)
     with pytest.raises(ValueError, match="hardware"):
         traces = [
             _profile_trace(tmp_path, identifier, hardware=hardware)
@@ -672,23 +683,67 @@ def test_complete_accelerated_hardware_identity_is_supported(tmp_path: Path) -> 
     assert profile.to_dict()["hardware"] == hardware
 
 
-def test_detector_allows_float16_and_any_nonnegative_person_label_id(
+def test_cuda_detector_allows_float16_with_pinned_person_label_id(
     tmp_path: Path,
 ) -> None:
     detector = _detector_identity()
     detector["precision"] = "float16"
-    class_mapping = detector["class_mapping"]
-    assert isinstance(class_mapping, dict)
-    class_mapping["source_label_id"] = 0
+    hardware = _hardware_identity(device_type="cuda")
     profile = profile_training_traces(
         [
-            _profile_trace(tmp_path, identifier, detector=detector)
+            _profile_trace(
+                tmp_path, identifier, detector=detector, hardware=hardware
+            )
             for identifier in ("02", "04", "05", "10")
         ],
         reserve_ms=1.0,
         normalization=_normalization(),
     )
     assert profile.to_dict()["detector"] == detector
+
+
+@pytest.mark.parametrize("entry_point", ["training", "direct", "load"])
+def test_cpu_profile_rejects_float16_through_every_entry_point(
+    tmp_path: Path, entry_point: str
+) -> None:
+    detector = _detector_identity()
+    detector["precision"] = "float16"
+    if entry_point == "training":
+        with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
+            profile_training_traces(
+                [
+                    _profile_trace(tmp_path, identifier, detector=detector)
+                    for identifier in ("02", "04", "05", "10")
+                ],
+                reserve_ms=1.0,
+                normalization=_normalization(),
+            )
+        return
+
+    profile = profile_training_traces(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
+        reserve_ms=1.0,
+        normalization=_normalization(),
+    )
+    if entry_point == "direct":
+        with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
+            ReferenceProfile(
+                detector,
+                profile.hardware,
+                profile.cost_profile,
+                profile.normalization,
+                profile.training_traces,
+            )
+        return
+
+    payload = profile.to_dict()
+    payload["detector"] = detector
+    path = tmp_path / "cpu-float16.json"
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
+        ReferenceProfile.load(path)
 
 
 def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace(
