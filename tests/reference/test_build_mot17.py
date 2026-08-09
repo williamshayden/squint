@@ -10,12 +10,14 @@ from dataclasses import replace
 from hashlib import sha256
 from math import nan
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 from PIL import Image
 
+from squint_rl.reference import build_mot17 as build_mot17_module
 from squint_rl.reference.build_mot17 import (
     RawTrace,
     ReferenceProfile,
@@ -32,6 +34,8 @@ from squint_rl.tracker import (
     TrackBatch,
     TrackerSummary,
 )
+
+_FAKE_UUID_BARE = "01234567-89ab-cdef-0123-456789abcdef"
 
 
 def _sequence(
@@ -118,10 +122,206 @@ def _hardware_identity(*, device_type: str = "cpu") -> dict[str, object]:
         "device": {
             "type": device_type,
             "name": "Fixture accelerator" if accelerated else "Fixture CPU",
-            "uuid": "GPU-fixture" if accelerated else None,
+            "uuid": f"GPU-{_FAKE_UUID_BARE}" if accelerated else None,
             "pci_bus_id": "0000:01:00.0" if accelerated else None,
         },
     }
+
+
+def _plain_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+class _FakePlatformRuntime:
+    @staticmethod
+    def system() -> str:
+        return "Linux"
+
+    @staticmethod
+    def machine() -> str:
+        return "x86_64"
+
+    @staticmethod
+    def python_version() -> str:
+        return "3.10.20"
+
+    @staticmethod
+    def processor() -> str:
+        return "Fixture CPU"
+
+
+class _FakeCudaRuntime:
+    def __init__(
+        self,
+        *,
+        uuid: object | None = None,
+        available: bool = True,
+        current_device: int = 1,
+    ) -> None:
+        self.uuid = _FakeTorchUuid(_FAKE_UUID_BARE) if uuid is None else uuid
+        self.available = available
+        self.selected = current_device
+        self.property_requests: list[int] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def current_device(self) -> int:
+        return self.selected
+
+    def get_device_properties(self, index: int) -> SimpleNamespace:
+        self.property_requests.append(index)
+        return SimpleNamespace(name="Fixture accelerator", uuid=self.uuid)
+
+
+class _FakeTorchUuid:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class _FakeTorchRuntime:
+    __version__ = "2.6.0+cu124"
+
+    def __init__(self, cuda: _FakeCudaRuntime | None = None) -> None:
+        self.cuda = _FakeCudaRuntime() if cuda is None else cuda
+        self.version = SimpleNamespace(cuda="12.4")
+
+
+class _FakeNvmlRuntime:
+    def __init__(
+        self,
+        readings: Sequence[tuple[object, object] | Exception] = (),
+        *,
+        uuid: object | None = None,
+        pci_bus_id: object = b"0000:01:00.0",
+        driver: object = b"573.44",
+        events: list[str] | None = None,
+    ) -> None:
+        self.readings = list(readings)
+        self.uuid = f"GPU-{_FAKE_UUID_BARE}".encode("ascii") if uuid is None else uuid
+        self.pci_bus_id = pci_bus_id
+        self.driver = driver
+        self.events = [] if events is None else events
+        self.handle = object()
+        self.initialized = 0
+        self.shutdowns = 0
+        self.handle_uuids: list[object] = []
+        self.utilization_reads = 0
+        self.memory_reads = 0
+        self._reading_index = 0
+        self._pending_vram: object | None = None
+
+    def nvmlInit(self) -> None:
+        self.initialized += 1
+
+    def nvmlShutdown(self) -> None:
+        self.shutdowns += 1
+
+    def nvmlDeviceGetHandleByUUID(self, uuid: object) -> object:
+        self.handle_uuids.append(uuid)
+        return self.handle
+
+    def nvmlDeviceGetUUID(self, handle: object) -> object:
+        assert handle is self.handle
+        return self.uuid
+
+    def nvmlDeviceGetPciInfo(self, handle: object) -> SimpleNamespace:
+        assert handle is self.handle
+        return SimpleNamespace(busId=self.pci_bus_id)
+
+    def nvmlSystemGetDriverVersion(self) -> object:
+        return self.driver
+
+    def nvmlDeviceGetUtilizationRates(self, handle: object) -> SimpleNamespace:
+        assert handle is self.handle
+        self.utilization_reads += 1
+        self.events.append("sample-utilization")
+        reading = self.readings[self._reading_index]
+        if isinstance(reading, Exception):
+            self._reading_index += 1
+            raise reading
+        utilization, self._pending_vram = reading
+        return SimpleNamespace(gpu=utilization)
+
+    def nvmlDeviceGetMemoryInfo(self, handle: object) -> SimpleNamespace:
+        assert handle is self.handle
+        self.memory_reads += 1
+        self.events.append("sample-memory")
+        used = self._pending_vram
+        self._pending_vram = None
+        self._reading_index += 1
+        if isinstance(used, Exception):
+            raise used
+        return SimpleNamespace(used=used)
+
+
+def _runtime_loader(
+    nvml: _FakeNvmlRuntime,
+    *,
+    cuda: _FakeCudaRuntime | None = None,
+    calls: list[str] | None = None,
+) -> Any:
+    modules = {
+        "platform": _FakePlatformRuntime(),
+        "torch": _FakeTorchRuntime(cuda),
+        "transformers": SimpleNamespace(__version__="4.57.6"),
+        "pynvml": nvml,
+    }
+
+    def load(name: str) -> object:
+        if calls is not None:
+            calls.append(name)
+        return modules[name]
+
+    return load
+
+
+def _hardware_session(
+    nvml: _FakeNvmlRuntime,
+    *,
+    device: str = "cuda:1",
+    cuda: _FakeCudaRuntime | None = None,
+) -> Any:
+    return build_mot17_module._HardwareSession.create(
+        device,
+        load=_runtime_loader(nvml, cuda=cuda),
+    )
+
+
+class _ConstantDetector:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.calls = 0
+        self.failure = failure
+
+    def predict(self, image: Image.Image) -> tuple[DetectionBatch, float]:
+        del image
+        self.calls += 1
+        if self.failure is not None:
+            raise self.failure
+        return _detections(1)[0], 5.0
+
+
+def _trace_with_session(
+    tmp_path: Path,
+    session: Any,
+    *,
+    frame_count: int = 3,
+) -> RawTrace:
+    return build_sequence(
+        _sequence(tmp_path, frame_count=frame_count),
+        _ConstantDetector(),
+        warmup_frames=0,
+        detector_identity=_detector_identity(),
+        hardware_identity=session.hardware_identity,
+        telemetry_session=session,
+    )
 
 
 def _trace_manifest(
@@ -213,7 +413,13 @@ def test_warmups_are_extra_and_the_complete_sequence_is_measured(tmp_path: Path)
             return _detections(1)[0], float(len(self.calls))
 
     detector = Detector()
-    trace = build_sequence(sequence, detector, warmup_frames=2)
+    trace = build_sequence(
+        sequence,
+        detector,
+        warmup_frames=2,
+        detector_identity=_detector_identity(),
+        hardware_identity=_hardware_identity(),
+    )
     assert isinstance(trace, RawTrace)
     assert detector.calls == [0, 1, 0, 1, 2, 3]
     assert trace.arrays["timestamps_s"].tolist() == [0.0, 0.04, 0.08, 0.12]
@@ -221,11 +427,337 @@ def test_warmups_are_extra_and_the_complete_sequence_is_measured(tmp_path: Path)
     assert trace.arrays["scene_change"].shape == (4, 3, 3)
     assert trace.arrays["gt_track_ids"].tolist() == [1, 2, 3, 4]
     assert trace.manifest_fields["frame_count"] == 4
+    assert _plain_json(trace.manifest_fields["detector"]) == _detector_identity()
+    assert _plain_json(trace.manifest_fields["hardware"]) == _hardware_identity()
+    assert _plain_json(trace.manifest_fields["telemetry"]) == {
+        "nvml": {"available": False, "error": None},
+        "sample_count": 0,
+        "gpu_utilization_percent": {"mean": None, "p95": None, "max": None},
+        "used_vram_bytes": {"mean": None, "p95": None, "max": None},
+    }
     assert trace.manifest_fields["causal_trace_sha256"] == causal_trace_sha256(trace.arrays)
     with pytest.raises(TypeError):
-        build_sequence(sequence, detector, warmup_frames=True)
+        build_sequence(
+            sequence,
+            detector,
+            warmup_frames=True,
+            detector_identity=_detector_identity(),
+            hardware_identity=_hardware_identity(),
+        )
     with pytest.raises(ValueError):
-        build_sequence(sequence, detector, warmup_frames=-1)
+        build_sequence(
+            sequence,
+            detector,
+            warmup_frames=-1,
+            detector_identity=_detector_identity(),
+            hardware_identity=_hardware_identity(),
+        )
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+def test_pinned_detector_identity_serializes_the_exact_reference_contract(
+    precision: str,
+) -> None:
+    expected = _detector_identity()
+    expected["precision"] = precision
+    identity = build_mot17_module._pinned_detector_identity(precision)
+    assert _plain_json(identity) == expected
+
+
+def test_cpu_session_never_calls_nvml_and_has_a_complete_identity() -> None:
+    nvml = _FakeNvmlRuntime()
+    imports: list[str] = []
+    session = build_mot17_module._HardwareSession.create(
+        "cpu",
+        load=_runtime_loader(nvml, calls=imports),
+    )
+    expected = _hardware_identity()
+    runtime = expected["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["torch"] = "2.6.0+cu124"
+    assert _plain_json(session.hardware_identity) == expected
+    assert nvml.initialized == 0
+    assert nvml.handle_uuids == []
+    assert imports == ["platform", "torch", "transformers"]
+    session.close()
+    assert nvml.shutdowns == 0
+
+
+def test_cuda_session_binds_nvml_by_normalized_torch_uuid() -> None:
+    cuda = _FakeCudaRuntime(uuid=f" {_FAKE_UUID_BARE.upper()}\x00 ".encode())
+    nvml = _FakeNvmlRuntime(
+        uuid=f"GPU-{_FAKE_UUID_BARE}".encode(),
+        pci_bus_id=b"0000:01:00.0\x00",
+        driver="573.44",
+    )
+    session = _hardware_session(nvml, device="cuda", cuda=cuda)
+    assert cuda.property_requests == [1]
+    assert nvml.handle_uuids == [f"GPU-{_FAKE_UUID_BARE}".encode("ascii")]
+    assert _plain_json(session.hardware_identity) == _hardware_identity(
+        device_type="cuda"
+    ) | {
+        "runtime": {
+            "torch": "2.6.0+cu124",
+            "transformers": "4.57.6",
+            "cuda": "12.4",
+            "driver": "573.44",
+        }
+    }
+
+
+def test_cuda_session_converts_torch_cuuuid_to_nvml_ascii_bytes() -> None:
+    bare = "01234567-89ab-cdef-0123-456789abcdef"
+    cuda = _FakeCudaRuntime(uuid=_FakeTorchUuid(bare.upper()))
+    nvml = _FakeNvmlRuntime(uuid=f"GPU-{bare}".encode("ascii"))
+    session = _hardware_session(nvml, cuda=cuda)
+    assert nvml.handle_uuids == [f"GPU-{bare}".encode("ascii")]
+    hardware = _plain_json(session.hardware_identity)
+    assert isinstance(hardware, dict)
+    device = hardware["device"]
+    assert isinstance(device, dict)
+    assert device["uuid"] == f"GPU-{bare}"
+
+
+@pytest.mark.parametrize(
+    "nvml_uuid",
+    [
+        b"01234567-89ab-cdef-0123-456789abcdef",
+        b"GPU-GPU-01234567-89ab-cdef-0123-456789abcdef",
+        b"GPU-fedcba98-7654-3210-fedc-ba9876543210",
+    ],
+)
+def test_cuda_session_rejects_malformed_or_mismatched_nvml_uuid_and_shuts_down(
+    nvml_uuid: bytes,
+) -> None:
+    bare = "01234567-89ab-cdef-0123-456789abcdef"
+    nvml = _FakeNvmlRuntime(uuid=nvml_uuid)
+    with pytest.raises(RuntimeError, match="runtime identity"):
+        _hardware_session(nvml, cuda=_FakeCudaRuntime(uuid=_FakeTorchUuid(bare)))
+    assert nvml.handle_uuids == [f"GPU-{bare}".encode("ascii")]
+    assert nvml.shutdowns == 1
+
+
+def test_cuda_session_rejects_malformed_torch_uuid_before_nvml_init() -> None:
+    nvml = _FakeNvmlRuntime()
+    with pytest.raises(RuntimeError, match="runtime identity"):
+        _hardware_session(nvml, cuda=_FakeCudaRuntime(uuid=_FakeTorchUuid("not-a-uuid")))
+    assert nvml.initialized == 0
+
+
+def test_build_sequence_samples_after_each_measured_prediction_and_aggregates(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    nvml = _FakeNvmlRuntime(
+        [(10, 100), (20, 200), (30, 300), (40, 400)], events=events
+    )
+    session = _hardware_session(nvml)
+
+    class Detector:
+        def predict(self, image: Image.Image) -> tuple[DetectionBatch, float]:
+            events.append(f"predict-{int(image.getpixel((0, 0))[0])}")  # type: ignore[index]
+            return _detections(1)[0], 5.0
+
+    trace = build_sequence(
+        _sequence(tmp_path, frame_count=4),
+        Detector(),
+        warmup_frames=2,
+        detector_identity=_detector_identity(),
+        hardware_identity=session.hardware_identity,
+        telemetry_session=session,
+    )
+    assert events == [
+        "predict-0", "predict-1",
+        "predict-0", "sample-utilization", "sample-memory",
+        "predict-1", "sample-utilization", "sample-memory",
+        "predict-2", "sample-utilization", "sample-memory",
+        "predict-3", "sample-utilization", "sample-memory",
+    ]
+    telemetry = _plain_json(trace.manifest_fields["telemetry"])
+    assert telemetry == {
+        "nvml": {"available": True, "error": None},
+        "sample_count": 4,
+        "gpu_utilization_percent": {"mean": 25.0, "p95": 38.5, "max": 40.0},
+        "used_vram_bytes": {
+            "mean": 250.0,
+            "p95": pytest.approx(385.0),
+            "max": 400.0,
+        },
+    }
+    assert type(telemetry["sample_count"]) is int  # type: ignore[index]
+    for field in ("gpu_utilization_percent", "used_vram_bytes"):
+        statistics = telemetry[field]  # type: ignore[index]
+        assert isinstance(statistics, dict)
+        assert all(type(value) is float for value in statistics.values())
+
+
+@pytest.mark.parametrize("precision", ["bfloat16", "", True, None])
+def test_pinned_detector_identity_rejects_invalid_precision(precision: object) -> None:
+    with pytest.raises(ValueError, match="precision"):
+        build_mot17_module._pinned_detector_identity(precision)
+
+
+def test_build_sequence_rejects_invalid_identity_before_prediction(
+    tmp_path: Path,
+) -> None:
+    detector = _ConstantDetector()
+    float16 = _detector_identity()
+    float16["precision"] = "float16"
+    with pytest.raises(ValueError, match=r"CPU.*float32|float32.*CPU"):
+        build_sequence(
+            _sequence(tmp_path / "matrix"),
+            detector,
+            warmup_frames=0,
+            detector_identity=float16,
+            hardware_identity=_hardware_identity(),
+        )
+    with pytest.raises(ValueError, match="detector"):
+        build_sequence(
+            _sequence(tmp_path / "malformed"),
+            detector,
+            warmup_frames=0,
+            detector_identity={},
+            hardware_identity=_hardware_identity(),
+        )
+    assert detector.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("uuid", "pci_bus_id", "driver"),
+    [
+        (b"GPU-fedcba98-7654-3210-fedc-ba9876543210", "0000:01:00.0", "573.44"),
+        (f"GPU-{_FAKE_UUID_BARE}".encode(), "", "573.44"),
+        (f"GPU-{_FAKE_UUID_BARE}".encode(), "0000:01:00.0", b"\x00"),
+    ],
+)
+def test_cuda_static_identity_failure_is_contextual_and_shuts_down_once(
+    uuid: object,
+    pci_bus_id: object,
+    driver: object,
+) -> None:
+    nvml = _FakeNvmlRuntime(uuid=uuid, pci_bus_id=pci_bus_id, driver=driver)
+    with pytest.raises(RuntimeError, match="runtime identity"):
+        _hardware_session(nvml)
+    assert nvml.initialized == 1
+    assert nvml.shutdowns == 1
+
+
+@pytest.mark.parametrize("device", ["cuda:", "cuda:-1", "cuda:one", "cuda:1:2", "gpu"])
+def test_hardware_session_rejects_unsupported_device_before_nvml(device: str) -> None:
+    nvml = _FakeNvmlRuntime()
+    with pytest.raises(ValueError, match="device"):
+        _hardware_session(nvml, device=device)
+    assert nvml.initialized == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("name", "Other GPU"), ("uuid", "GPU-other"), ("pci_bus_id", "0000:02:00.0")],
+)
+def test_build_sequence_rejects_session_hardware_mismatch_before_prediction(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    nvml = _FakeNvmlRuntime([(10, 100)])
+    session = _hardware_session(nvml)
+    hardware = _plain_json(session.hardware_identity)
+    assert isinstance(hardware, dict)
+    device = hardware["device"]
+    assert isinstance(device, dict)
+    device[field] = value
+    detector = _ConstantDetector()
+    with pytest.raises(ValueError, match=r"telemetry session.*hardware"):
+        build_sequence(
+            _sequence(tmp_path),
+            detector,
+            warmup_frames=0,
+            detector_identity=_detector_identity(),
+            hardware_identity=hardware,
+            telemetry_session=session,
+        )
+    assert detector.calls == 0
+    assert nvml.utilization_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("reading", "error_code", "memory_reads"),
+    [
+        (RuntimeError("private driver text"), "sample_failed", 0),
+        ((nan, 100), "invalid_sample", 1),
+        ((-1, 100), "invalid_sample", 1),
+        ((101, 100), "invalid_sample", 1),
+        ((True, 100), "invalid_sample", 1),
+        (("10", 100), "invalid_sample", 1),
+        ((10, -1), "invalid_sample", 1),
+        ((10, True), "invalid_sample", 1),
+        ((10, np.int64(100)), "invalid_sample", 1),
+        ((10, RuntimeError("private memory text")), "sample_failed", 1),
+    ],
+)
+def test_invalid_dynamic_sample_is_discarded_and_disables_session(
+    tmp_path: Path,
+    reading: tuple[object, object] | Exception,
+    error_code: str,
+    memory_reads: int,
+) -> None:
+    nvml = _FakeNvmlRuntime([reading, (50, 500)])
+    session = _hardware_session(nvml)
+    trace = _trace_with_session(tmp_path, session)
+    telemetry = _plain_json(trace.manifest_fields["telemetry"])
+    assert telemetry == {
+        "nvml": {"available": True, "error": error_code},
+        "sample_count": 0,
+        "gpu_utilization_percent": {"mean": None, "p95": None, "max": None},
+        "used_vram_bytes": {"mean": None, "p95": None, "max": None},
+    }
+    assert nvml.utilization_reads == 1
+    assert nvml.memory_reads == memory_reads
+    assert "private" not in json.dumps(telemetry)
+
+
+def test_partial_telemetry_is_retained_and_error_disables_later_traces(
+    tmp_path: Path,
+) -> None:
+    nvml = _FakeNvmlRuntime(
+        [(12, 120), RuntimeError("private driver text"), (99, 999)]
+    )
+    session = _hardware_session(nvml)
+    first = _trace_with_session(tmp_path / "first", session, frame_count=4)
+    first_telemetry = _plain_json(first.manifest_fields["telemetry"])
+    assert first_telemetry == {
+        "nvml": {"available": True, "error": "sample_failed"},
+        "sample_count": 1,
+        "gpu_utilization_percent": {"mean": 12.0, "p95": 12.0, "max": 12.0},
+        "used_vram_bytes": {"mean": 120.0, "p95": 120.0, "max": 120.0},
+    }
+    assert (nvml.utilization_reads, nvml.memory_reads) == (2, 1)
+    second = _trace_with_session(tmp_path / "second", session, frame_count=2)
+    second_telemetry = _plain_json(second.manifest_fields["telemetry"])
+    assert second_telemetry["nvml"] == {
+        "available": True,
+        "error": "sample_failed",
+    }
+    assert second_telemetry["sample_count"] == 0
+    assert (nvml.utilization_reads, nvml.memory_reads) == (2, 1)
+
+
+def test_hardware_session_closes_once_on_normal_and_error_exit() -> None:
+    normal_nvml = _FakeNvmlRuntime()
+    normal = _hardware_session(normal_nvml)
+    normal.close()
+    normal.close()
+    assert normal_nvml.shutdowns == 1
+
+    error_nvml = _FakeNvmlRuntime()
+    failing = _hardware_session(error_nvml)
+    with pytest.raises(LookupError, match="experiment failed"):
+        try:
+            raise LookupError("experiment failed")
+        finally:
+            failing.close()
+    failing.close()
+    assert error_nvml.shutdowns == 1
 
 
 def test_pack_rejects_cardinality_and_nonfinite_inputs(tmp_path: Path) -> None:

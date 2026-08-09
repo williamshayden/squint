@@ -7,8 +7,10 @@ import json
 import math
 import re
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from importlib import import_module
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
@@ -74,6 +76,28 @@ _DETECTOR_FIELDS = {
     "class_mapping", "precision", "timing",
 }
 _HARDWARE_FIELDS = {"platform", "runtime", "device"}
+_PINNED_DETECTOR_BASE: dict[str, object] = {
+    "model_id": MODEL_ID,
+    "revision": MODEL_REVISION,
+    "weights": {"model.safetensors": WEIGHTS_SHA256},
+    "preprocessor": {
+        "class": "RTDetrImageProcessor", "height": 640, "width": 640,
+        "do_pad": False, "use_fast": False,
+    },
+    "threshold": THRESHOLD,
+    "class_mapping": {
+        "source_label": "person", "source_label_id": 0, "output_class_id": 1,
+    },
+    "timing": {
+        "protocol": "synchronized-forward-only-v1", "unit": "ms",
+        "includes": ["model_forward"],
+        "excludes": ["preprocess", "postprocess", "telemetry"],
+    },
+}
+_CUDA_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
 
 
 class Detector(Protocol):
@@ -284,71 +308,20 @@ def _nullable_string(value: object, name: str) -> str | None:
     return _nonempty_string(value, name)
 
 
+def _pinned_detector_identity(precision: object) -> Mapping[str, object]:
+    if precision not in ("float32", "float16"):
+        raise ValueError("detector.precision must be float32 or float16")
+    return cast(
+        Mapping[str, object],
+        _freeze_json({**_PINNED_DETECTOR_BASE, "precision": precision}, path="detector"),
+    )
+
+
 def _validate_detector_identity(value: object) -> Mapping[str, object]:
     detector = _identity_object(value, "detector", _DETECTOR_FIELDS)
-    if detector["model_id"] != MODEL_ID:
-        raise ValueError("detector.model_id does not match the D-FINE pin")
-    if detector["revision"] != MODEL_REVISION:
-        raise ValueError("detector.revision does not match the D-FINE pin")
-
-    weights = _nested_object(
-        detector["weights"], "detector.weights", {"model.safetensors"}
-    )
-    if weights["model.safetensors"] != WEIGHTS_SHA256:
-        raise ValueError("detector.weights model.safetensors does not match the D-FINE pin")
-
-    preprocessor = _nested_object(
-        detector["preprocessor"],
-        "detector.preprocessor",
-        {"class", "height", "width", "do_pad", "use_fast"},
-    )
-    if preprocessor["class"] != "RTDetrImageProcessor":
-        raise ValueError("detector.preprocessor.class must be RTDetrImageProcessor")
-    for dimension in ("height", "width"):
-        if type(preprocessor[dimension]) is not int or preprocessor[dimension] != 640:
-            raise ValueError(f"detector.preprocessor.{dimension} must be integer 640")
-    for flag in ("do_pad", "use_fast"):
-        if preprocessor[flag] is not False:
-            raise ValueError(f"detector.preprocessor.{flag} must be false")
-
-    threshold = detector["threshold"]
-    if (
-        isinstance(threshold, bool)
-        or not isinstance(threshold, (int, float))
-        or not math.isfinite(float(threshold))
-        or float(threshold) != THRESHOLD
-    ):
-        raise ValueError("detector.threshold must match the finite D-FINE threshold")
-
-    class_mapping = _nested_object(
-        detector["class_mapping"],
-        "detector.class_mapping",
-        {"source_label", "source_label_id", "output_class_id"},
-    )
-    if class_mapping["source_label"] != "person":
-        raise ValueError("detector.class_mapping.source_label must be person")
-    source_label_id = class_mapping["source_label_id"]
-    if type(source_label_id) is not int or source_label_id != 0:
-        raise ValueError("detector.class_mapping.source_label_id must be integer 0")
-    output_class_id = class_mapping["output_class_id"]
-    if type(output_class_id) is not int or output_class_id != 1:
-        raise ValueError("detector.class_mapping.output_class_id must be integer 1")
-
-    if detector["precision"] not in ("float32", "float16"):
-        raise ValueError("detector.precision must be float32 or float16")
-    timing = _nested_object(
-        detector["timing"],
-        "detector.timing",
-        {"protocol", "unit", "includes", "excludes"},
-    )
-    if timing["protocol"] != "synchronized-forward-only-v1":
-        raise ValueError("detector.timing.protocol is unsupported")
-    if timing["unit"] != "ms":
-        raise ValueError("detector.timing.unit must be ms")
-    if timing["includes"] != ("model_forward",):
-        raise ValueError("detector.timing.includes must contain only model_forward")
-    if timing["excludes"] != ("preprocess", "postprocess", "telemetry"):
-        raise ValueError("detector.timing.excludes is invalid")
+    expected = _pinned_detector_identity(detector["precision"])
+    if _canonical_json(detector) != _canonical_json(expected):
+        raise ValueError("detector identity does not match the pinned D-FINE contract")
     return detector
 
 
@@ -395,6 +368,161 @@ def _validate_identity_matrix(
     device = cast(Mapping[str, object], hardware["device"])
     if device["type"] == "cpu" and detector["precision"] != "float32":
         raise ValueError("CPU detector.precision must be float32")
+
+
+def _runtime_text(value: object, name: str) -> str:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{name} must be UTF-8 bytes or a string") from error
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be bytes or a string")  # noqa: TRY004
+    normalized = value.strip().strip("\x00").strip()
+    if not normalized or "\x00" in normalized:
+        raise ValueError(f"{name} must be nonempty")
+    return normalized
+
+
+def _cuda_uuid(value: object, *, nvml: bool) -> str:
+    if not isinstance(value, (str, bytes)):
+        value = str(value)
+    text = _runtime_text(value, "NVML CUDA UUID" if nvml else "Torch CUDA UUID")
+    if nvml:
+        if not text.startswith("GPU-"):
+            raise ValueError("NVML CUDA UUID must have exactly one GPU- prefix")
+        text = text[4:]
+    if _CUDA_UUID_RE.fullmatch(text) is None:
+        raise ValueError("CUDA UUID must contain one canonical bare UUID")
+    return text.lower()
+
+
+@dataclass(slots=True)
+class _HardwareSession:
+    hardware_identity: Mapping[str, object]
+    _nvml: Any | None = None
+    _handle: object | None = None
+    available: bool = False
+    error_code: str | None = None
+    closed: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        device: str,
+        *,
+        load: Callable[[str], Any] = import_module,
+    ) -> _HardwareSession:
+        cuda_match = (
+            re.fullmatch(r"cuda:(0|[1-9][0-9]*)", device)
+            if isinstance(device, str)
+            else None
+        )
+        if device not in ("cpu", "cuda") and cuda_match is None:
+            raise ValueError("device must be cpu, cuda, or cuda:N")
+        try:
+            platform_runtime = load("platform")
+            torch_runtime = load("torch")
+            transformers_runtime = load("transformers")
+            system = _runtime_text(platform_runtime.system(), "platform system")
+            machine = _runtime_text(platform_runtime.machine(), "platform machine")
+            python = _runtime_text(platform_runtime.python_version(), "Python version")
+            processor = platform_runtime.processor()
+            cpu_name = _runtime_text(processor or machine, "CPU device name")
+            torch_version = _runtime_text(torch_runtime.__version__, "Torch version")
+            transformers_version = _runtime_text(
+                transformers_runtime.__version__, "Transformers version"
+            )
+        except Exception as error:
+            raise RuntimeError("unable to establish runtime identity") from error
+        identity: dict[str, object] = {
+            "platform": {"system": system, "machine": machine, "python": python},
+            "runtime": {
+                "torch": torch_version, "transformers": transformers_version,
+                "cuda": None, "driver": None,
+            },
+            "device": {"type": "cpu", "name": cpu_name, "uuid": None, "pci_bus_id": None},
+        }
+        if device == "cpu":
+            return cls(_validate_hardware_identity(identity))
+
+        initialized = False
+        try:
+            if not torch_runtime.cuda.is_available():
+                raise RuntimeError("CUDA is unavailable")
+            index = torch_runtime.cuda.current_device() if device == "cuda" else int(device[5:])
+            if type(index) is not int or index < 0:
+                raise ValueError("selected CUDA ordinal must be a nonnegative integer")
+            properties = torch_runtime.cuda.get_device_properties(index)
+            name = _runtime_text(properties.name, "CUDA device name")
+            torch_uuid = _cuda_uuid(properties.uuid, nvml=False)
+            canonical_uuid = f"GPU-{torch_uuid}"
+            cuda_version = _runtime_text(torch_runtime.version.cuda, "CUDA version")
+            nvml_runtime = load("pynvml")
+            nvml_runtime.nvmlInit()
+            initialized = True
+            handle = nvml_runtime.nvmlDeviceGetHandleByUUID(
+                canonical_uuid.encode("ascii")
+            )
+            nvml_uuid = _cuda_uuid(nvml_runtime.nvmlDeviceGetUUID(handle), nvml=True)
+            if nvml_uuid != torch_uuid:
+                raise ValueError("Torch and NVML CUDA UUIDs do not match")
+            pci_bus_id = _runtime_text(
+                nvml_runtime.nvmlDeviceGetPciInfo(handle).busId, "NVML PCI bus ID"
+            )
+            driver = _runtime_text(
+                nvml_runtime.nvmlSystemGetDriverVersion(), "NVIDIA driver version"
+            )
+            cast(dict[str, object], identity["runtime"]).update(
+                cuda=cuda_version, driver=driver
+            )
+            cast(dict[str, object], identity["device"]).update(
+                type="cuda", name=name, uuid=canonical_uuid, pci_bus_id=pci_bus_id
+            )
+            return cls(
+                _validate_hardware_identity(identity), nvml_runtime, handle, available=True
+            )
+        except BaseException as error:
+            if initialized:
+                with suppress(Exception):
+                    nvml_runtime.nvmlShutdown()
+            if isinstance(error, Exception):
+                raise RuntimeError(  # noqa: TRY004
+                    "unable to establish CUDA runtime identity"
+                ) from error
+            raise
+
+    def sample(self) -> tuple[float, int] | None:
+        nvml, handle = self._nvml, self._handle
+        if nvml is None or handle is None or self.error_code is not None or self.closed:
+            return None
+        try:
+            utilization = nvml.nvmlDeviceGetUtilizationRates(handle).gpu
+            used_vram = nvml.nvmlDeviceGetMemoryInfo(handle).used
+        except Exception:  # noqa: BLE001 - dynamic telemetry is deliberately nonfatal
+            self.error_code = "sample_failed"
+            return None
+        try:
+            normalized_utilization = float(utilization)
+        except (TypeError, ValueError, OverflowError):
+            normalized_utilization = math.nan
+        if (
+            isinstance(utilization, (bool, str, bytes))
+            or not math.isfinite(normalized_utilization)
+            or not 0.0 <= normalized_utilization <= 100.0
+            or type(used_vram) is not int
+            or used_vram < 0
+        ):
+            self.error_code = "invalid_sample"
+            return None
+        return normalized_utilization, used_vram
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self._nvml is not None:
+            self._nvml.nvmlShutdown()
 
 
 def _validate_trace_manifest(
@@ -1004,15 +1132,42 @@ def profile_training_traces(
     return ReferenceProfile(detector, hardware, cost, normalization, tuple(profile_traces))
 
 
+def _telemetry_statistics(values: Sequence[float | int]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "p95": None, "max": None}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "p95": float(np.percentile(array, 95.0, method="linear")),
+        "max": float(np.max(array)),
+    }
+
+
 def build_sequence(
     sequence: Mot17Sequence,
     detector: Detector,
     warmup_frames: int = 10,
+    *,
+    detector_identity: Mapping[str, object],
+    hardware_identity: Mapping[str, object],
+    telemetry_session: _HardwareSession | None = None,
 ) -> RawTrace:
     if isinstance(warmup_frames, bool) or not isinstance(warmup_frames, int):
         raise TypeError("warmup_frames must be an integer")
     if warmup_frames < 0:
         raise ValueError("warmup_frames must be nonnegative")
+    validated_detector = _validate_detector_identity(detector_identity)
+    validated_hardware = _validate_hardware_identity(hardware_identity)
+    _validate_identity_matrix(validated_detector, validated_hardware)
+    if telemetry_session is not None:
+        if not isinstance(telemetry_session, _HardwareSession):
+            raise ValueError("telemetry session must be a HardwareSession")
+        if telemetry_session.closed:
+            raise ValueError("telemetry session is closed")
+        if _canonical_json(telemetry_session.hardware_identity) != _canonical_json(
+            validated_hardware
+        ):
+            raise ValueError("telemetry session hardware identity does not match trace hardware")
     for image_path in sequence.image_paths[:warmup_frames]:
         with Image.open(image_path) as opened:
             detector.predict(opened.convert("RGB"))
@@ -1021,15 +1176,31 @@ def build_sequence(
     detections: list[DetectionBatch] = []
     scenes: list[NDArray[Any]] = []
     latencies: list[float] = []
+    utilization_samples: list[float] = []
+    vram_samples: list[int] = []
     for image_path in sequence.image_paths:
         with Image.open(image_path) as opened:
             image = opened.convert("RGB")
             scenes.append(scene_change_grid(previous, image))
             batch, latency = detector.predict(image)
+            sample = telemetry_session.sample() if telemetry_session is not None else None
+            if sample is not None:
+                utilization, used_vram = sample
+                utilization_samples.append(utilization)
+                vram_samples.append(used_vram)
             detections.append(batch)
             latencies.append(float(latency))
             previous = image.copy()
     packed = pack_episode_arrays(sequence, detections, scenes, latencies)
+    telemetry = {
+        "nvml": {
+            "available": telemetry_session.available if telemetry_session is not None else False,
+            "error": telemetry_session.error_code if telemetry_session is not None else None,
+        },
+        "sample_count": len(utilization_samples),
+        "gpu_utilization_percent": _telemetry_statistics(utilization_samples),
+        "used_vram_bytes": _telemetry_statistics(vram_samples),
+    }
     manifest = {
         "schema": "squint.replay",
         "schema_version": 1,
@@ -1041,5 +1212,8 @@ def build_sequence(
         "warmup_frames": warmup_frames,
         "source_sha256": canonical_source_sha256(sequence),
         "causal_trace_sha256": causal_trace_sha256(packed),
+        "detector": validated_detector,
+        "hardware": validated_hardware,
+        "telemetry": telemetry,
     }
     return RawTrace(sequence.identifier, packed, manifest)
