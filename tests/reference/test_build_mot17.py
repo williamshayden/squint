@@ -186,6 +186,14 @@ class _FakeTorchUuid:
         return self.value
 
 
+class _ExplodingFloat:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error or RuntimeError("private conversion text")
+
+    def __float__(self) -> float:
+        raise self.error
+
+
 class _FakeTorchRuntime:
     __version__ = "2.6.0+cu124"
 
@@ -505,6 +513,16 @@ def test_cuda_session_binds_nvml_by_normalized_torch_uuid() -> None:
     }
 
 
+def test_cuda_session_normalizes_eight_digit_nvml_pci_domain() -> None:
+    nvml = _FakeNvmlRuntime(pci_bus_id=b"00000000:0A:0B.3\x00")
+    session = _hardware_session(nvml)
+    hardware = _plain_json(session.hardware_identity)
+    assert isinstance(hardware, dict)
+    device = hardware["device"]
+    assert isinstance(device, dict)
+    assert device["pci_bus_id"] == "00000000:0a:0b.3"
+
+
 def test_cuda_session_converts_torch_cuuuid_to_nvml_ascii_bytes() -> None:
     bare = "01234567-89ab-cdef-0123-456789abcdef"
     cuda = _FakeCudaRuntime(uuid=_FakeTorchUuid(bare.upper()))
@@ -591,6 +609,21 @@ def test_build_sequence_samples_after_each_measured_prediction_and_aggregates(
         assert all(type(value) is float for value in statistics.values())
 
 
+def test_representable_vram_cannot_overflow_telemetry_aggregates(
+    tmp_path: Path,
+) -> None:
+    used_vram = 10**308
+    session = _hardware_session(_FakeNvmlRuntime([(10, used_vram)] * 3))
+    trace = _trace_with_session(tmp_path, session)
+    telemetry = _plain_json(trace.manifest_fields["telemetry"])
+    assert isinstance(telemetry, dict)
+    assert telemetry["used_vram_bytes"] == {
+        "mean": float(used_vram),
+        "p95": float(used_vram),
+        "max": float(used_vram),
+    }
+
+
 @pytest.mark.parametrize("precision", ["bfloat16", "", True, None])
 def test_pinned_detector_identity_rejects_invalid_precision(precision: object) -> None:
     with pytest.raises(ValueError, match="precision"):
@@ -652,7 +685,11 @@ def test_hardware_session_rejects_unsupported_device_before_nvml(device: str) ->
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("name", "Other GPU"), ("uuid", "GPU-other"), ("pci_bus_id", "0000:02:00.0")],
+    [
+        ("name", "Other GPU"),
+        ("uuid", "GPU-fedcba98-7654-3210-fedc-ba9876543210"),
+        ("pci_bus_id", "0000:02:00.0"),
+    ],
 )
 def test_build_sequence_rejects_session_hardware_mismatch_before_prediction(
     tmp_path: Path,
@@ -681,6 +718,72 @@ def test_build_sequence_rejects_session_hardware_mismatch_before_prediction(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("uuid", _FAKE_UUID_BARE),
+        ("uuid", f"GPU-GPU-{_FAKE_UUID_BARE}"),
+        ("uuid", f"GPU-{_FAKE_UUID_BARE.upper()}"),
+        ("uuid", "GPU-not-a-uuid"),
+        ("pci_bus_id", "000:01:00.0"),
+        ("pci_bus_id", "00000:01:00.0"),
+        ("pci_bus_id", "0000:1:00.0"),
+        ("pci_bus_id", "0000:01:0.0"),
+        ("pci_bus_id", "0000:01:00.8"),
+        ("pci_bus_id", "0000:0A:00.0"),
+        ("pci_bus_id", " 0000:01:00.0"),
+    ],
+)
+def test_build_sequence_rejects_noncanonical_cuda_identity_before_image_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    hardware = _hardware_identity(device_type="cuda")
+    device = hardware["device"]
+    assert isinstance(device, dict)
+    device[field] = value
+    detector = _ConstantDetector()
+
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("identity validation must precede image I/O")
+
+    monkeypatch.setattr(Image, "open", fail_open)
+    with pytest.raises(ValueError, match="hardware"):
+        build_sequence(
+            _sequence(tmp_path),
+            detector,
+            warmup_frames=0,
+            detector_identity=_detector_identity(),
+            hardware_identity=hardware,
+        )
+    assert detector.calls == 0
+
+
+@pytest.mark.parametrize("pci_bus_id", ["0000:0a:0b.3", "00000000:0a:0b.3"])
+def test_build_sequence_accepts_canonical_cuda_pci_domain_widths(
+    tmp_path: Path,
+    pci_bus_id: str,
+) -> None:
+    hardware = _hardware_identity(device_type="cuda")
+    device = hardware["device"]
+    assert isinstance(device, dict)
+    device["pci_bus_id"] = pci_bus_id
+    trace = build_sequence(
+        _sequence(tmp_path),
+        _ConstantDetector(),
+        warmup_frames=0,
+        detector_identity=_detector_identity(),
+        hardware_identity=hardware,
+    )
+    manifest_hardware = _plain_json(trace.manifest_fields["hardware"])
+    assert isinstance(manifest_hardware, dict)
+    manifest_device = manifest_hardware["device"]
+    assert isinstance(manifest_device, dict)
+    assert manifest_device["pci_bus_id"] == pci_bus_id
+
+
+@pytest.mark.parametrize(
     ("reading", "error_code", "memory_reads"),
     [
         (RuntimeError("private driver text"), "sample_failed", 0),
@@ -693,6 +796,14 @@ def test_build_sequence_rejects_session_hardware_mismatch_before_prediction(
         ((10, True), "invalid_sample", 1),
         ((10, np.int64(100)), "invalid_sample", 1),
         ((10, RuntimeError("private memory text")), "sample_failed", 1),
+        pytest.param(
+            (_ExplodingFloat(), 100), "invalid_sample", 1,
+            id="exceptional-utilization-conversion",
+        ),
+        pytest.param(
+            (10, 10**10000), "invalid_sample", 1,
+            id="unrepresentable-vram",
+        ),
     ],
 )
 def test_invalid_dynamic_sample_is_discarded_and_disables_session(
@@ -714,6 +825,18 @@ def test_invalid_dynamic_sample_is_discarded_and_disables_session(
     assert nvml.utilization_reads == 1
     assert nvml.memory_reads == memory_reads
     assert "private" not in json.dumps(telemetry)
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_dynamic_sample_does_not_swallow_base_exceptions(
+    exception_type: type[BaseException],
+) -> None:
+    session = _hardware_session(
+        _FakeNvmlRuntime([(_ExplodingFloat(exception_type()), 100)])
+    )
+    with pytest.raises(exception_type):
+        session.sample()
+    assert session.error_code is None
 
 
 def test_partial_telemetry_is_retained_and_error_disables_later_traces(

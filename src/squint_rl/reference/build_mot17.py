@@ -98,6 +98,9 @@ _CUDA_UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
 )
+_PCI_BDF_RE = re.compile(
+    r"(?:[0-9a-f]{4}|[0-9a-f]{8}):[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\Z"
+)
 
 
 class Detector(Protocol):
@@ -359,6 +362,17 @@ def _validate_hardware_identity(value: object) -> Mapping[str, object]:
         raise ValueError("CPU hardware identity requires null CUDA, driver, UUID, and PCI bus ID")
     if device_type == "cuda" and any(item is None for item in optional_identity):
         raise ValueError("CUDA hardware identity requires CUDA, driver, UUID, and PCI bus ID")
+    if device_type == "cuda":
+        uuid = cast(str, device["uuid"])
+        pci_bus_id = cast(str, device["pci_bus_id"])
+        if (
+            not uuid.startswith("GPU-")
+            or _CUDA_UUID_RE.fullmatch(uuid[4:]) is None
+            or uuid[4:] != uuid[4:].lower()
+        ):
+            raise ValueError("hardware.device.uuid must be a canonical lowercase CUDA UUID")
+        if _PCI_BDF_RE.fullmatch(pci_bus_id) is None:
+            raise ValueError("hardware.device.pci_bus_id must be a canonical lowercase PCI BDF")
     return hardware
 
 
@@ -395,6 +409,13 @@ def _cuda_uuid(value: object, *, nvml: bool) -> str:
     if _CUDA_UUID_RE.fullmatch(text) is None:
         raise ValueError("CUDA UUID must contain one canonical bare UUID")
     return text.lower()
+
+
+def _pci_bus_id(value: object) -> str:
+    normalized = _runtime_text(value, "NVML PCI bus ID").lower()
+    if _PCI_BDF_RE.fullmatch(normalized) is None:
+        raise ValueError("NVML PCI bus ID must be a canonical PCI BDF")
+    return normalized
 
 
 @dataclass(slots=True)
@@ -467,9 +488,7 @@ class _HardwareSession:
             nvml_uuid = _cuda_uuid(nvml_runtime.nvmlDeviceGetUUID(handle), nvml=True)
             if nvml_uuid != torch_uuid:
                 raise ValueError("Torch and NVML CUDA UUIDs do not match")
-            pci_bus_id = _runtime_text(
-                nvml_runtime.nvmlDeviceGetPciInfo(handle).busId, "NVML PCI bus ID"
-            )
+            pci_bus_id = _pci_bus_id(nvml_runtime.nvmlDeviceGetPciInfo(handle).busId)
             driver = _runtime_text(
                 nvml_runtime.nvmlSystemGetDriverVersion(), "NVIDIA driver version"
             )
@@ -502,16 +521,23 @@ class _HardwareSession:
         except Exception:  # noqa: BLE001 - dynamic telemetry is deliberately nonfatal
             self.error_code = "sample_failed"
             return None
-        try:
-            normalized_utilization = float(utilization)
-        except (TypeError, ValueError, OverflowError):
-            normalized_utilization = math.nan
         if (
             isinstance(utilization, (bool, str, bytes))
-            or not math.isfinite(normalized_utilization)
-            or not 0.0 <= normalized_utilization <= 100.0
             or type(used_vram) is not int
             or used_vram < 0
+        ):
+            self.error_code = "invalid_sample"
+            return None
+        try:
+            normalized_utilization = float(utilization)
+            normalized_vram = float(used_vram)
+        except Exception:  # noqa: BLE001 - malformed telemetry is nonfatal
+            self.error_code = "invalid_sample"
+            return None
+        if (
+            not math.isfinite(normalized_utilization)
+            or not 0.0 <= normalized_utilization <= 100.0
+            or not math.isfinite(normalized_vram)
         ):
             self.error_code = "invalid_sample"
             return None
@@ -1137,7 +1163,7 @@ def _telemetry_statistics(values: Sequence[float | int]) -> dict[str, float | No
         return {"mean": None, "p95": None, "max": None}
     array = np.asarray(values, dtype=np.float64)
     return {
-        "mean": float(np.mean(array)),
+        "mean": float(np.sum(array / len(array), dtype=np.float64)),
         "p95": float(np.percentile(array, 95.0, method="linear")),
         "max": float(np.max(array)),
     }
