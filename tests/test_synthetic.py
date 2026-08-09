@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 from pathlib import Path
 from types import ModuleType
 
@@ -73,6 +75,43 @@ def test_synthetic_fixture_sealing_is_deterministic(tmp_path: Path) -> None:
 
     assert first.content_sha256 == second.content_sha256
     assert (first.path / "arrays.npz").read_bytes() == (second.path / "arrays.npz").read_bytes()
+
+
+def test_synthetic_source_hash_uses_literal_canonical_generator_parameters() -> None:
+    synthetic_module = _synthetic_module()
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    parameters = {
+        "change_frames": [0, 4, 8],
+        "fps": 2.0,
+        "frame_count": 12,
+        "latency_ms": 10.0,
+    }
+    literal = json.dumps(parameters, sort_keys=True, separators=(",", ":"))
+
+    assert synthetic_module.synthetic_manifest(
+        frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=10.0
+    )["source"]["sha256"] == hashlib.sha256(literal.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"frame_count": 13, "fps": 2.0, "change_frames": (0, 4, 8), "latency_ms": 10.0},
+        {"frame_count": 12, "fps": 3.0, "change_frames": (0, 4, 8), "latency_ms": 10.0},
+        {"frame_count": 12, "fps": 2.0, "change_frames": (0, 4, 8), "latency_ms": 11.0},
+        {"frame_count": 12, "fps": 2.0, "change_frames": (0, 3, 8), "latency_ms": 10.0},
+    ],
+)
+def test_synthetic_source_hash_changes_with_each_generator_parameter(
+    parameters: dict[str, int | float | tuple[int, ...]],
+) -> None:
+    synthetic_module = _synthetic_module()
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    baseline = synthetic_module.synthetic_manifest(
+        frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=10.0
+    )
+
+    assert synthetic_module.synthetic_manifest(**parameters)["source"]["sha256"] != baseline["source"]["sha256"]
 
 
 @pytest.mark.parametrize("change_frames", [(), (1,), (0, 5), (-1, 0)])

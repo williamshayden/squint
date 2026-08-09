@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -34,6 +36,21 @@ def _episode_at(path: Path) -> object:
     return episode_module.Episode.open(synthetic_module.make_synthetic_episode(path))
 
 
+def _reseal_arrays(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    arrays_path = path / "arrays.npz"
+    np.savez(arrays_path, **arrays)
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = manifest["artifacts"]
+    artifacts["arrays.npz_sha256"] = hashlib.sha256(arrays_path.read_bytes()).hexdigest()
+    artifacts.pop("content_sha256", None)
+    normalized = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    artifacts["content_sha256"] = hashlib.sha256(
+        normalized + artifacts["arrays.npz_sha256"].encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def test_episode_modules_are_available() -> None:
     assert _episode_module() is not None, "Task 3 episode loader must exist"
     assert _synthetic_module() is not None, "Task 3 synthetic fixture builder must exist"
@@ -62,6 +79,96 @@ def test_loader_rejects_hash_mismatch_before_frame_access(tmp_path: Path) -> Non
     np.savez(path / "arrays.npz", **arrays)
 
     with pytest.raises(episode_module.EpisodeValidationError, match="arrays.npz sha256"):
+        episode_module.Episode.open(path)
+
+
+def test_loader_parses_the_verified_array_bytes_when_archive_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode_module = _episode_module()
+    synthetic_module = _synthetic_module()
+    assert episode_module is not None, "Task 3 episode loader must exist"
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    path = synthetic_module.make_synthetic_episode(tmp_path / "episode")
+    arrays_path = path / "arrays.npz"
+    replacement = tmp_path / "replacement.npz"
+    replacement.write_bytes(b"not an NPZ archive")
+    original_read_bytes = Path.read_bytes
+
+    def replace_after_read(candidate: Path) -> bytes:
+        result = original_read_bytes(candidate)
+        if candidate == arrays_path:
+            os.replace(replacement, arrays_path)
+        return result
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+
+    assert episode_module.Episode.open(path).frame_count == 12
+
+
+def test_loader_checks_arrays_hash_before_manifest_semantics(tmp_path: Path) -> None:
+    episode_module = _episode_module()
+    synthetic_module = _synthetic_module()
+    assert episode_module is not None, "Task 3 episode loader must exist"
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    path = synthetic_module.make_synthetic_episode(tmp_path / "episode")
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source"]["fps"] = 0.0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (path / "arrays.npz").write_bytes(b"tampered")
+
+    with pytest.raises(episode_module.EpisodeValidationError, match="arrays.npz sha256"):
+        episode_module.Episode.open(path)
+
+
+def _drop_detection_scores(arrays: dict[str, np.ndarray]) -> None:
+    del arrays["det_scores"]
+
+
+def _add_unexpected_array(arrays: dict[str, np.ndarray]) -> None:
+    arrays["unexpected"] = np.empty(0, np.float32)
+
+
+def _change_detection_score_dtype(arrays: dict[str, np.ndarray]) -> None:
+    arrays["det_scores"] = arrays["det_scores"].astype(np.float64)
+
+
+def _change_scene_shape(arrays: dict[str, np.ndarray]) -> None:
+    arrays["scene_change"] = arrays["scene_change"][:, :, :2]
+
+
+def _make_offsets_nonmonotonic(arrays: dict[str, np.ndarray]) -> None:
+    arrays["det_frame_offsets"] = arrays["det_frame_offsets"].copy()
+    arrays["det_frame_offsets"][1:3] = (2, 1)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (_drop_detection_scores, "array set mismatch"),
+        (_add_unexpected_array, "array set mismatch"),
+        (_change_detection_score_dtype, "det_scores must have dtype"),
+        (_change_scene_shape, "scene_change must have shape"),
+        (_make_offsets_nonmonotonic, "offsets must be monotonic"),
+    ],
+)
+def test_loader_rejects_sealed_malformed_arrays(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, np.ndarray]], None],
+    message: str,
+) -> None:
+    episode_module = _episode_module()
+    synthetic_module = _synthetic_module()
+    assert episode_module is not None, "Task 3 episode loader must exist"
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    path = synthetic_module.make_synthetic_episode(tmp_path / "episode")
+    with np.load(path / "arrays.npz") as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    mutate(arrays)
+    _reseal_arrays(path, arrays)
+
+    with pytest.raises(episode_module.EpisodeValidationError, match=message):
         episode_module.Episode.open(path)
 
 
@@ -129,6 +236,17 @@ def test_episode_arrays_scene_and_nested_manifest_are_irreversibly_immutable(tmp
         episode.manifest["source"] = {}
     with pytest.raises(TypeError):
         episode.manifest["source"]["frame_count"] = 1
+
+
+def test_replay_frame_batches_are_irreversibly_immutable(tmp_path: Path) -> None:
+    frame = _episode_at(tmp_path / "episode").frame(0)
+
+    for batch in (frame.detections, frame.ground_truth):
+        for field in batch.__dataclass_fields__:
+            array = getattr(batch, field)
+            assert not array.flags.writeable
+            with pytest.raises(ValueError, match="WRITEABLE"):
+                array.setflags(write=True)
 
 
 def test_slice_rebases_index_without_copying_arrays_or_timestamps(tmp_path: Path) -> None:

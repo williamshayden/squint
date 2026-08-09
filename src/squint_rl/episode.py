@@ -107,7 +107,7 @@ def _canonical_content_hash(manifest: Mapping[str, object]) -> str:
     return sha256(encoded + arrays_hash.encode()).hexdigest()
 
 
-def _validate_manifest(manifest: Mapping[str, object], *, sealed: bool) -> None:
+def _validate_manifest_structure(manifest: Mapping[str, object], *, sealed: bool) -> None:
     schema = _mapping(manifest.get("schema"), "schema")
     if schema.get("name") != SCHEMA_NAME:
         raise EpisodeValidationError(f"unsupported schema name: {schema.get('name')!r}")
@@ -117,11 +117,6 @@ def _validate_manifest(manifest: Mapping[str, object], *, sealed: bool) -> None:
         if name not in manifest:
             raise EpisodeValidationError(f"manifest {name} object is required")
         _mapping(manifest[name], name)
-    source = _mapping(manifest["source"], "source")
-    _manifest_frame_count(manifest)
-    fps = source.get("fps")
-    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
-        raise EpisodeValidationError("manifest source.fps must be finite and positive")
     artifacts = _mapping(manifest["artifacts"], "artifacts")
     if sealed:
         for name in ("arrays.npz_sha256", "content_sha256"):
@@ -139,7 +134,10 @@ def _validate_arrays(manifest: Mapping[str, object], arrays: Mapping[str, NDArra
         raise EpisodeValidationError(
             f"arrays.npz array set mismatch (missing={missing}, unexpected={unexpected})"
         )
-    frame_count = _manifest_frame_count(manifest)
+    timestamps = arrays["timestamps_s"]
+    if timestamps.ndim != 1:
+        raise EpisodeValidationError("timestamps_s must have shape (F,)")
+    frame_count = timestamps.shape[0]
     values = {
         "F": frame_count,
         "D": len(arrays["det_boxes_xyxy"]),
@@ -165,7 +163,13 @@ def _validate_arrays(manifest: Mapping[str, object], arrays: Mapping[str, NDArra
         frame_count=frame_count,
         value_count=values["G"],
     )
-    timestamps = arrays["timestamps_s"]
+    manifest_frame_count = _manifest_frame_count(manifest)
+    if manifest_frame_count != frame_count:
+        raise EpisodeValidationError("manifest source.frame_count must equal timestamps_s length")
+    source = _mapping(manifest["source"], "source")
+    fps = source.get("fps")
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise EpisodeValidationError("manifest source.fps must be finite and positive")
     if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0):
         raise EpisodeValidationError("timestamps_s must be finite and strictly increasing")
     latency = arrays["detector_latency_ms"]
@@ -246,13 +250,14 @@ class Episode:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise EpisodeValidationError(f"{manifest_path}: invalid JSON") from error
         manifest = _mapping(loaded_manifest, "root")
-        _validate_manifest(manifest, sealed=True)
+        _validate_manifest_structure(manifest, sealed=True)
         expected_arrays_hash = _mapping(manifest["artifacts"], "artifacts")["arrays.npz_sha256"]
-        actual_arrays_hash = sha256(arrays_path.read_bytes()).hexdigest()
+        arrays_bytes = arrays_path.read_bytes()
+        actual_arrays_hash = sha256(arrays_bytes).hexdigest()
         if actual_arrays_hash != expected_arrays_hash:
             raise EpisodeValidationError("arrays.npz sha256 mismatch")
         try:
-            with np.load(arrays_path, allow_pickle=False) as stored:
+            with np.load(BytesIO(arrays_bytes), allow_pickle=False) as stored:
                 arrays = {name: _immutable_array(np.array(stored[name], copy=True)) for name in stored.files}
         except (OSError, ValueError) as error:
             raise EpisodeValidationError(f"{arrays_path}: invalid arrays.npz") from error
@@ -305,7 +310,7 @@ class Episode:
         return EpisodeView(self, start, stop)
 
     def validate(self) -> None:
-        _validate_manifest(self.manifest, sealed=True)
+        _validate_manifest_structure(self.manifest, sealed=True)
         _validate_arrays(self.manifest, self.arrays)
         _validate_content_hash(self.manifest)
 
@@ -378,7 +383,7 @@ def seal_episode(
     destination = Path(path).resolve()
     if destination.exists():
         raise FileExistsError(destination)
-    _validate_manifest(manifest, sealed=False)
+    _validate_manifest_structure(manifest, sealed=False)
     _validate_arrays(manifest, arrays)
     working = destination.parent / f".{destination.name}.{uuid4().hex}.incomplete"
     working.mkdir(parents=True)

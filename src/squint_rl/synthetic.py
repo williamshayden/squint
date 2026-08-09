@@ -31,6 +31,7 @@ def synthetic_manifest(
             "frame_count": frame_count,
             "latency_ms": latency_ms,
         },
+        sort_keys=True,
         separators=(",", ":"),
     )
     source_hash = sha256(literal_parameters.encode()).hexdigest()
