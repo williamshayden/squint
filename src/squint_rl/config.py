@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import importlib
 import math
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
-    import tomli as tomllib  # type: ignore[import-not-found]
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib
 
 from .tracker import ObservationScales
 

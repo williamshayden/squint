@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .episode import SCHEMA_NAME, SCHEMA_VERSION, seal_episode
 
@@ -110,7 +112,7 @@ def make_synthetic_episode(
     gt_boxes = np.stack((valid_boxes, ignored_boxes), axis=1).reshape(-1, 4)
     scene = np.zeros((frame_count, 3, 3), np.float32)
     scene[list(change_frames)] = 1.0
-    arrays = {
+    arrays: dict[str, NDArray[Any]] = {
         "timestamps_s": np.arange(frame_count, dtype=np.float64) / fps,
         "detector_latency_ms": np.full(frame_count, latency_ms, np.float32),
         "scene_change": scene,
