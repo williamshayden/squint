@@ -67,6 +67,8 @@ def _make_episode(
     latency_ms: float,
     identifier: str,
     detector_overrides: dict[str, object] | None = None,
+    cost_profile_overrides: dict[str, object] | None = None,
+    normalization_overrides: dict[str, object] | None = None,
 ) -> Path:
     source = make_synthetic_episode(
         path.with_name(f"{path.name}-source"),
@@ -81,6 +83,10 @@ def _make_episode(
     manifest["detector"]["weights_sha256"] = "f" * 64
     if detector_overrides is not None:
         manifest["detector"].update(detector_overrides)
+    if cost_profile_overrides is not None:
+        manifest["cost_profile"].update(cost_profile_overrides)
+    if normalization_overrides is not None:
+        manifest["normalization"].update(normalization_overrides)
     manifest["artifacts"] = {}
     arrays = {
         name: np.array(value, copy=True) for name, value in episode.arrays.items()
@@ -578,6 +584,89 @@ def test_complete_detector_profile_must_match_before_atomic_publication(
     config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
 
     with pytest.raises(EpisodeValidationError, match="detector profile"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
+@pytest.mark.parametrize(
+    "profile_sha256",
+    [None, "", "a" * 63, "a" * 65, "A" * 64, "g" * 64],
+)
+def test_profile_hash_must_be_lowercase_sha256_before_atomic_publication(
+    tmp_path: Path, profile_sha256: object
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    _make_episode(
+        tmp_path / "episode-a",
+        frame_count=5,
+        latency_ms=10.0,
+        identifier="a",
+        cost_profile_overrides={"profile_sha256": profile_sha256},
+    )
+    _make_episode(
+        tmp_path / "episode-b", frame_count=7, latency_ms=20.0, identifier="b"
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match="cost_profile.profile_sha256"):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
+@pytest.mark.parametrize(
+    ("cost_profile_overrides", "normalization_overrides", "message"),
+    [
+        ({"profile_sha256": "b" * 64}, None, "cost_profile.profile_sha256"),
+        ({"capacity_ms": 21.0}, None, "cost_profile"),
+        (None, {"age_s": 6.0}, "normalization"),
+    ],
+)
+def test_frozen_episode_profiles_must_match_before_atomic_publication(
+    tmp_path: Path,
+    cost_profile_overrides: dict[str, object] | None,
+    normalization_overrides: dict[str, object] | None,
+    message: str,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    _make_episode(
+        tmp_path / "episode-a", frame_count=5, latency_ms=10.0, identifier="a"
+    )
+    _make_episode(
+        tmp_path / "episode-b",
+        frame_count=7,
+        latency_ms=20.0,
+        identifier="b",
+        cost_profile_overrides=cost_profile_overrides,
+        normalization_overrides=normalization_overrides,
+    )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match=message):
+        evaluate(config_path)
+    assert not (tmp_path / "result").exists()
+
+
+def test_config_observation_scales_must_match_frozen_normalization(
+    tmp_path: Path,
+) -> None:
+    from squint_rl.benchmark import evaluate
+
+    for name, frame_count, latency_ms in (("a", 5, 10.0), ("b", 7, 20.0)):
+        _make_episode(
+            tmp_path / f"episode-{name}",
+            frame_count=frame_count,
+            latency_ms=latency_ms,
+            identifier=name,
+            normalization_overrides={"age_s": 6.0},
+        )
+    config_path = tmp_path / "benchmark.toml"
+    config_path.write_text(_config_text(output_dir="result"), encoding="utf-8")
+
+    with pytest.raises(EpisodeValidationError, match="observation_scales.age_s"):
         evaluate(config_path)
     assert not (tmp_path / "result").exists()
 

@@ -77,6 +77,49 @@ def test_synthetic_fixture_sealing_is_deterministic(tmp_path: Path) -> None:
     assert (first.path / "arrays.npz").read_bytes() == (second.path / "arrays.npz").read_bytes()
 
 
+def test_synthetic_profile_hash_identifies_its_frozen_cost_and_normalization() -> None:
+    synthetic_module = _synthetic_module()
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    manifest = synthetic_module.synthetic_manifest(
+        frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=10.0
+    )
+    expected_payload = {
+        "cost_profile": {
+            "capacity_ms": 20.0,
+            "p95_ms": 10.0,
+            "reserve_ms": 10.0,
+            "unit": "detector_ms",
+        },
+        "normalization": {
+            "active_tracks": 8,
+            "age_s": 5,
+            "motion_px_s": 20,
+            "time_since_detector_s": 5,
+        },
+    }
+    encoded = json.dumps(
+        expected_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+    assert manifest["cost_profile"]["profile_sha256"] == hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+
+def test_synthetic_profile_is_frozen_across_realized_frame_latencies() -> None:
+    synthetic_module = _synthetic_module()
+    assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"
+    first = synthetic_module.synthetic_manifest(
+        frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=10.0
+    )
+    second = synthetic_module.synthetic_manifest(
+        frame_count=12, fps=2.0, change_frames=(0, 4, 8), latency_ms=20.0
+    )
+
+    assert first["cost_profile"] == second["cost_profile"]
+    assert first["normalization"] == second["normalization"]
+
+
 def test_synthetic_source_hash_uses_literal_canonical_generator_parameters() -> None:
     synthetic_module = _synthetic_module()
     assert synthetic_module is not None, "Task 3 synthetic fixture builder must exist"

@@ -30,7 +30,7 @@ from .env import RUN_DETECTOR, SKIP, SquintEnv
 from .episode import Episode, EpisodeValidationError
 from .metrics import CurvePoint, MetricReport, common_support_areas, run_trackeval
 from .policies import Policy, reset_policy
-from .tracker import Observation, PolicyContext, TrackBatch, Tracker
+from .tracker import Observation, ObservationScales, PolicyContext, TrackBatch, Tracker
 
 _ACTION_FORMAT = b"squint.action.v1"
 _METRIC_FORMAT = b"squint.metric-input.v1"
@@ -100,7 +100,7 @@ def evaluate(
     if not isinstance(config, BenchmarkConfig):
         config = BenchmarkConfig.load(config)
     episodes = tuple(Episode.open(path) for path in config.episodes)
-    _validate_episodes(episodes)
+    _validate_episodes(episodes, config.observation_scales)
     policy_specs = _effective_policy_specs(config, policy_factory)
     _validate_benchmark_configuration(config, policy_specs)
 
@@ -188,12 +188,18 @@ def _portable_component(value: object) -> bool:
     return value.split(".", 1)[0].casefold() not in _WINDOWS_RESERVED_COMPONENTS
 
 
-def _validate_episodes(episodes: Sequence[Episode]) -> None:
+def _validate_episodes(
+    episodes: Sequence[Episode], observation_scales: ObservationScales
+) -> None:
     if not episodes:
         raise EpisodeValidationError("benchmark requires at least one episode")
     identifiers: set[str] = set()
     detector_profile: str | None = None
     hardware_profile: str | None = None
+    cost_profile: str | None = None
+    normalization_profile: str | None = None
+    frozen_normalization: Mapping[str, object] | None = None
+    profile_sha256: str | None = None
     cost_unit: str | None = None
     for episode in episodes:
         manifest = episode.manifest
@@ -228,7 +234,8 @@ def _validate_episodes(episodes: Sequence[Episode]) -> None:
             raise EpisodeValidationError(
                 "episodes must share the same hardware profile"
             )
-        unit = _manifest_mapping(manifest, "cost_profile").get("unit")
+        episode_cost_profile = _manifest_mapping(manifest, "cost_profile")
+        unit = episode_cost_profile.get("unit")
         if not isinstance(unit, str) or not unit:
             raise EpisodeValidationError(
                 "manifest cost_profile.unit must be a nonempty string"
@@ -239,7 +246,79 @@ def _validate_episodes(episodes: Sequence[Episode]) -> None:
             raise EpisodeValidationError(
                 "episodes must share the same detector-cost unit"
             )
+        episode_profile_sha256 = episode_cost_profile.get("profile_sha256")
+        if (
+            not isinstance(episode_profile_sha256, str)
+            or len(episode_profile_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in episode_profile_sha256
+            )
+        ):
+            raise EpisodeValidationError(
+                "manifest cost_profile.profile_sha256 must be a 64-character lowercase hex digest"
+            )
+        if profile_sha256 is None:
+            profile_sha256 = episode_profile_sha256
+        elif profile_sha256 != episode_profile_sha256:
+            raise EpisodeValidationError(
+                "episodes must share the same cost_profile.profile_sha256"
+            )
+        canonical_cost_profile = json.dumps(
+            _jsonable(episode_cost_profile),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if cost_profile is None:
+            cost_profile = canonical_cost_profile
+        elif cost_profile != canonical_cost_profile:
+            raise EpisodeValidationError(
+                "episodes must share the same cost_profile object"
+            )
+        normalization = _manifest_mapping(manifest, "normalization")
+        canonical_normalization = json.dumps(
+            _jsonable(normalization),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if normalization_profile is None:
+            normalization_profile = canonical_normalization
+            frozen_normalization = normalization
+        elif normalization_profile != canonical_normalization:
+            raise EpisodeValidationError(
+                "episodes must share the same normalization object"
+            )
         _reserve_ms(episode)
+    assert frozen_normalization is not None
+    _validate_observation_scales(observation_scales, frozen_normalization)
+
+
+def _validate_observation_scales(
+    configured: ObservationScales, frozen: Mapping[str, object]
+) -> None:
+    expected = {
+        "active_tracks": configured.active_tracks,
+        "age_s": configured.age_s,
+        "motion_px_s": configured.motion_px_s,
+        "time_since_detector_s": configured.time_since_detector_s,
+    }
+    for name, configured_value in expected.items():
+        frozen_value = frozen.get(name)
+        if (
+            isinstance(frozen_value, bool)
+            or not isinstance(frozen_value, (int, float))
+            or not math.isfinite(float(frozen_value))
+            or float(frozen_value) <= 0.0
+        ):
+            raise EpisodeValidationError(
+                f"manifest normalization.{name} must be a positive finite number"
+            )
+        if float(frozen_value) != configured_value:
+            raise EpisodeValidationError(
+                f"benchmark observation_scales.{name} must match manifest normalization.{name}"
+            )
 
 
 def _manifest_mapping(

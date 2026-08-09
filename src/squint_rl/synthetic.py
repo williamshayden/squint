@@ -37,6 +37,24 @@ def synthetic_manifest(
         separators=(",", ":"),
     )
     source_hash = sha256(literal_parameters.encode()).hexdigest()
+    cost_profile: dict[str, object] = {
+        "unit": "detector_ms",
+        "p95_ms": 10.0,
+        "reserve_ms": 10.0,
+        "capacity_ms": 20.0,
+    }
+    normalization = {
+        "active_tracks": 8,
+        "age_s": 5,
+        "motion_px_s": 20,
+        "time_since_detector_s": 5,
+    }
+    profile_payload = json.dumps(
+        {"cost_profile": cost_profile, "normalization": normalization},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    cost_profile["profile_sha256"] = sha256(profile_payload).hexdigest()
     return {
         "schema": {"name": SCHEMA_NAME, "version": SCHEMA_VERSION},
         "episode": {"id": "synthetic"},
@@ -71,19 +89,9 @@ def synthetic_manifest(
             "runtime_version": "synthetic",
             "timing_protocol": "synthetic deterministic fixture",
         },
-        "cost_profile": {
-            "unit": "detector_ms",
-            "p95_ms": latency_ms,
-            "reserve_ms": latency_ms,
-            "capacity_ms": 2.0 * latency_ms,
-        },
+        "cost_profile": cost_profile,
         "scene_feature": {"name": "synthetic_scene_change", "shape": [3, 3]},
-        "normalization": {
-            "active_tracks": 8,
-            "age_s": 5,
-            "motion_px_s": 20,
-            "time_since_detector_s": 5,
-        },
+        "normalization": normalization,
         "telemetry": {
             "latency_mean_ms": None,
             "gpu_utilization_percent": None,
