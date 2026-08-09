@@ -74,7 +74,10 @@ def _string(value: object, field: str, *, nonempty: bool = True) -> str:
 
 def _number(value: object, field: str) -> float:
     if type(value) is int:
-        numeric = float(value)
+        try:
+            numeric = float(value)
+        except OverflowError as exc:
+            raise ConfigurationError(f"{field} must be a finite real number") from exc
     elif type(value) is float:
         numeric = value
     else:
@@ -92,7 +95,7 @@ def _integer(value: object, field: str) -> int:
 
 def _config_path(value: object, field: str, base: Path) -> Path:
     path_text = _string(value, field)
-    if Path(path_text).is_absolute() or PureWindowsPath(path_text).is_absolute():
+    if Path(path_text).is_absolute() or PureWindowsPath(path_text).root:
         raise ConfigurationError(f"{field} must be relative to the TOML file")
     return (base / path_text).resolve()
 
@@ -177,6 +180,14 @@ class BenchmarkConfig:
             _config_path(item, f"episodes[{index}]", base)
             for index, item in enumerate(raw_episodes)
         )
+        seen_episodes: dict[Path, int] = {}
+        for index, episode in enumerate(episodes):
+            previous = seen_episodes.get(episode)
+            if previous is not None:
+                raise ConfigurationError(
+                    f"episodes[{index}] duplicates episodes[{previous}] after resolution: {episode}"
+                )
+            seen_episodes[episode] = index
         missing = next(
             ((index, episode) for index, episode in enumerate(episodes) if not episode.is_dir()),
             None,

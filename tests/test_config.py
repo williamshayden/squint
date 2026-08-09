@@ -237,6 +237,44 @@ def test_episode_paths_must_exist_as_directories_but_output_need_not_exist(tmp_p
     assert not config.output_dir.exists()
 
 
+def test_duplicate_resolved_episode_paths_are_rejected(tmp_path: Path) -> None:
+    text = _VALID_CONFIG.replace(
+        'episodes = ["episodes/a"]',
+        'episodes = ["episodes/a", "episodes/../episodes/a"]',
+    )
+    error = _load_invalid(tmp_path, text)
+    assert "episodes[1]" in str(error)
+    assert "duplicate" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("field", "original", "replacement"),
+    [
+        ("episodes", 'episodes = ["episodes/a"]', 'episodes = ["\\\\output"]'),
+        ("output_dir", 'output_dir = "runs/result"', 'output_dir = "\\\\output"'),
+    ],
+)
+def test_windows_root_relative_config_paths_are_rejected(
+    tmp_path: Path, field: str, original: str, replacement: str
+) -> None:
+    if field == "episodes":
+        (tmp_path / "\\output").mkdir()
+    error = _load_invalid(tmp_path, _VALID_CONFIG.replace(original, replacement))
+    assert field in str(error)
+    assert "relative" in str(error)
+
+
+def test_huge_budget_rate_integer_is_wrapped_as_configuration_error(tmp_path: Path) -> None:
+    huge_integer = "1" + "0" * 400
+    text = _VALID_CONFIG.replace(
+        "[0.1, 0.25, 0.5, 0.75, 1.0]", f"[{huge_integer}]"
+    )
+    with pytest.raises(ConfigurationError) as error:
+        BenchmarkConfig.load(_write_config(tmp_path, text))
+    assert "budget_rates[0]" in str(error.value)
+    assert isinstance(error.value.__cause__, OverflowError)
+
+
 def test_malformed_parameter_values_are_rejected(tmp_path: Path) -> None:
     text = _VALID_CONFIG.replace(
         'parameters = { nested = { values = [1, { enabled = true }] }, label = "tracker" }',
