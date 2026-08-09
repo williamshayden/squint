@@ -15,6 +15,12 @@ from squint_rl.tracker import (
 )
 
 
+def _assert_irreversibly_readonly(array: np.ndarray) -> None:
+    assert not array.flags.writeable
+    with pytest.raises(ValueError, match="WRITEABLE"):
+        array.setflags(write=True)
+
+
 def test_tracker_module_is_available() -> None:
     try:
         module = importlib.import_module("squint_rl.tracker")
@@ -35,7 +41,13 @@ def test_detection_batch_validates_shapes_and_freezes_arrays() -> None:
     assert not batch.scores.flags.writeable
     assert not batch.class_ids.flags.writeable
     boxes[0, 0] = 99
+    scores[0] = 0.2
+    class_ids[0] = 9
     assert batch.boxes_xyxy[0, 0] == 1
+    assert batch.scores[0] == 0.7
+    assert batch.class_ids[0] == 1
+    for value in (batch.boxes_xyxy, batch.scores, batch.class_ids):
+        _assert_irreversibly_readonly(value)
     with pytest.raises(ValueError, match="boxes_xyxy"):
         DetectionBatch(np.zeros((1, 5), np.float32), np.ones(1), np.ones(1, np.int64))
     with pytest.raises(FrozenInstanceError):
@@ -65,16 +77,27 @@ def test_detection_batch_rejects_invalid_scores(scores: np.ndarray) -> None:
 
 
 def test_ground_truth_batch_validates_and_freezes_all_vectors() -> None:
-    batch = GroundTruthBatch(
-        np.array([[1, 2, 5, 8]], np.float32),
-        np.array([4], np.int64),
-        np.array([1], np.int64),
-        np.array([0.5], np.float32),
-        np.array([True]),
-        np.array([False]),
-    )
+    boxes = np.array([[1, 2, 5, 8]], np.float32)
+    track_ids = np.array([4], np.int64)
+    class_ids = np.array([1], np.int64)
+    visibility = np.array([0.5], np.float32)
+    valid = np.array([True])
+    ignore = np.array([False])
+    batch = GroundTruthBatch(boxes, track_ids, class_ids, visibility, valid, ignore)
 
     assert len(batch) == 1
+    boxes[0, 0] = 99
+    track_ids[0] = 9
+    class_ids[0] = 9
+    visibility[0] = 0.2
+    valid[0] = False
+    ignore[0] = True
+    np.testing.assert_array_equal(batch.boxes_xyxy, [[1, 2, 5, 8]])
+    np.testing.assert_array_equal(batch.track_ids, [4])
+    np.testing.assert_array_equal(batch.class_ids, [1])
+    np.testing.assert_array_equal(batch.visibility, [0.5])
+    np.testing.assert_array_equal(batch.valid, [True])
+    np.testing.assert_array_equal(batch.ignore, [False])
     for value in (
         batch.boxes_xyxy,
         batch.track_ids,
@@ -83,7 +106,7 @@ def test_ground_truth_batch_validates_and_freezes_all_vectors() -> None:
         batch.valid,
         batch.ignore,
     ):
-        assert not value.flags.writeable
+        _assert_irreversibly_readonly(value)
 
     with pytest.raises(ValueError, match="both valid and ignored"):
         GroundTruthBatch(
@@ -115,15 +138,22 @@ def test_ground_truth_batch_validates_and_freezes_all_vectors() -> None:
 
 
 def test_track_batch_rejects_invalid_ids_scores_and_freezes_arrays() -> None:
-    batch = TrackBatch(
-        np.array([[1, 2, 5, 8]], np.float32),
-        np.array([4], np.int64),
-        np.array([1], np.int64),
-        np.array([0.8], np.float32),
-    )
+    boxes = np.array([[1, 2, 5, 8]], np.float32)
+    track_ids = np.array([4], np.int64)
+    class_ids = np.array([1], np.int64)
+    scores = np.array([0.8], np.float32)
+    batch = TrackBatch(boxes, track_ids, class_ids, scores)
     assert len(batch) == 1
+    boxes[0, 0] = 99
+    track_ids[0] = 9
+    class_ids[0] = 9
+    scores[0] = 0.2
+    np.testing.assert_array_equal(batch.boxes_xyxy, [[1, 2, 5, 8]])
+    np.testing.assert_array_equal(batch.track_ids, [4])
+    np.testing.assert_array_equal(batch.class_ids, [1])
+    np.testing.assert_array_equal(batch.scores, np.array([0.8], np.float32))
     for value in (batch.boxes_xyxy, batch.track_ids, batch.class_ids, batch.scores):
-        assert not value.flags.writeable
+        _assert_irreversibly_readonly(value)
 
     with pytest.raises(ValueError, match="unique and nonnegative"):
         TrackBatch(
@@ -151,12 +181,8 @@ def test_track_batch_rejects_invalid_ids_scores_and_freezes_arrays() -> None:
 def test_empty_batches_have_zero_length_and_frozen_arrays() -> None:
     for batch in (DetectionBatch.empty(), GroundTruthBatch.empty(), TrackBatch.empty()):
         assert len(batch) == 0
-        for value in vars(batch) if hasattr(batch, "__dict__") else ():
-            assert value is not None
-
-    assert not DetectionBatch.empty().boxes_xyxy.flags.writeable
-    assert not GroundTruthBatch.empty().visibility.flags.writeable
-    assert not TrackBatch.empty().scores.flags.writeable
+        for field in batch.__dataclass_fields__:
+            _assert_irreversibly_readonly(getattr(batch, field))
 
 
 @pytest.mark.parametrize(

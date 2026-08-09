@@ -12,6 +12,10 @@ BoolArray = NDArray[np.bool_]
 Observation = dict[str, FloatArray]
 
 
+def _immutable(value: NDArray[Any]) -> NDArray[Any]:
+    return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
+
+
 def _array(
     value: object,
     dtype: np.dtype[Any],
@@ -26,8 +30,7 @@ def _array(
         raise ValueError(f"{name} must contain only finite values")
     if np.any(result[:, 2] <= result[:, 0]) or np.any(result[:, 3] <= result[:, 1]):
         raise ValueError(f"{name} must have x2 > x1 and y2 > y1")
-    result.setflags(write=False)
-    return result
+    return cast(FloatArray, _immutable(result))
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +47,8 @@ class DetectionBatch:
             raise ValueError("scores and class_ids must have shape (N,)")
         if not np.all(np.isfinite(scores)) or np.any((scores < 0) | (scores > 1)):
             raise ValueError("scores must be finite values in [0, 1]")
-        scores.setflags(write=False)
-        classes.setflags(write=False)
+        scores = cast(FloatArray, _immutable(scores))
+        classes = cast(IntArray, _immutable(classes))
         object.__setattr__(self, "boxes_xyxy", boxes)
         object.__setattr__(self, "scores", scores)
         object.__setattr__(self, "class_ids", classes)
@@ -90,8 +93,7 @@ class GroundTruthBatch:
             raise ValueError("ground truth cannot be both valid and ignored")
         if len(np.unique(vectors["track_ids"])) != len(boxes):
             raise ValueError("ground-truth track_ids must be unique within a frame")
-        for value in vectors.values():
-            value.setflags(write=False)
+        vectors = {name: _immutable(value) for name, value in vectors.items()}
         object.__setattr__(self, "boxes_xyxy", boxes)
         for name, value in vectors.items():
             object.__setattr__(self, name, value)
@@ -129,8 +131,9 @@ class TrackBatch:
             raise ValueError("emitted track_ids must be unique and nonnegative")
         if not np.all(np.isfinite(scores)) or np.any((scores < 0) | (scores > 1)):
             raise ValueError("track scores must be finite values in [0, 1]")
-        for value in (track_ids, class_ids, scores):
-            value.setflags(write=False)
+        track_ids = cast(IntArray, _immutable(track_ids))
+        class_ids = cast(IntArray, _immutable(class_ids))
+        scores = cast(FloatArray, _immutable(scores))
         object.__setattr__(self, "boxes_xyxy", boxes)
         object.__setattr__(self, "track_ids", track_ids)
         object.__setattr__(self, "class_ids", class_ids)
