@@ -4,7 +4,10 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
+from hashlib import sha256
 from math import nan
 from pathlib import Path
 from typing import Any
@@ -63,6 +66,105 @@ def _detections(count: int) -> tuple[DetectionBatch, ...]:
         )
         for index in range(count)
     )
+
+
+def _detector_identity() -> dict[str, object]:
+    return {
+        "model_id": "ustc-community/dfine-nano-coco",
+        "revision": "066438d3d8f0da137a37b38fdf3368fd4afceced",
+        "weights": {
+            "model.safetensors": (
+                "19e06bdc873da819920a8d373b879721a5b9759d822f8213220bb09abbdab58b"
+            )
+        },
+        "preprocessor": {
+            "class": "RTDetrImageProcessor",
+            "height": 640,
+            "width": 640,
+            "do_pad": False,
+            "use_fast": False,
+        },
+        "threshold": 0.10,
+        "class_mapping": {
+            "source_label": "person",
+            "source_label_id": 1,
+            "output_class_id": 1,
+        },
+        "precision": "float32",
+        "timing": {
+            "protocol": "synchronized-forward-only-v1",
+            "unit": "ms",
+            "includes": ["model_forward"],
+            "excludes": ["preprocess", "postprocess", "telemetry"],
+        },
+    }
+
+
+def _hardware_identity(*, device_type: str = "cpu") -> dict[str, object]:
+    accelerated = device_type != "cpu"
+    return {
+        "platform": {"system": "Linux", "machine": "x86_64", "python": "3.10.20"},
+        "runtime": {
+            "torch": "2.6.0",
+            "transformers": "4.57.6",
+            "cuda": "12.4" if accelerated else None,
+            "driver": "550.54" if accelerated else None,
+        },
+        "device": {
+            "type": device_type,
+            "name": "Fixture accelerator" if accelerated else "Fixture CPU",
+            "uuid": "GPU-fixture" if accelerated else None,
+            "pci_bus_id": "0000:01:00.0" if accelerated else None,
+        },
+    }
+
+
+def _trace_manifest(
+    arrays: dict[str, np.ndarray[Any, Any]],
+    *,
+    identifier: str = "02",
+    detector: dict[str, object] | None = None,
+    hardware: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema": "squint.replay",
+        "schema_version": 1,
+        "sequence_id": identifier,
+        "frame_count": len(arrays["timestamps_s"]),
+        "fps": 25.0,
+        "source_sha256": "a" * 64,
+        "causal_trace_sha256": causal_trace_sha256(arrays),
+        "detector": _detector_identity() if detector is None else detector,
+        "hardware": _hardware_identity() if hardware is None else hardware,
+        "telemetry": {"gpu_utilization": 1.0},
+    }
+
+
+_DELETE = object()
+
+
+def _mutate_identity(
+    identity: dict[str, object], path: tuple[str, ...], value: object
+) -> dict[str, object]:
+    target = identity
+    for name in path[:-1]:
+        child = target[name]
+        assert isinstance(child, dict)
+        target = child
+    if value is _DELETE:
+        target.pop(path[-1])
+    else:
+        target[path[-1]] = value
+    return identity
+
+
+def _normalization() -> dict[str, object]:
+    return {
+        "active_tracks": 1,
+        "age_s": 1.0,
+        "motion_px_s": 1.0,
+        "time_since_detector_s": 1.0,
+    }
 
 
 def test_pack_episode_arrays_uses_replay_v1_schema_and_offsets(tmp_path: Path) -> None:
@@ -185,7 +287,7 @@ def test_raw_trace_arrays_are_non_bypassably_immutable_and_detached(tmp_path: Pa
     trace = RawTrace(
         sequence.identifier,
         source,
-        {"causal_trace_sha256": causal_trace_sha256(source)},
+        _trace_manifest(source),
     )
     source["det_scores"][0] = 0.99
     np.testing.assert_array_equal(trace.arrays["det_scores"], expected_scores)
@@ -205,7 +307,7 @@ def _valid_raw_trace_inputs(tmp_path: Path) -> tuple[dict[str, np.ndarray[Any, A
         [np.zeros((3, 3), np.float32)] * 3,
         [1.0, 2.0, 3.0],
     )
-    return arrays, {"causal_trace_sha256": causal_trace_sha256(arrays)}
+    return arrays, _trace_manifest(arrays)
 
 
 def _profile_trace(
@@ -222,35 +324,61 @@ def _profile_trace(
         [np.zeros((3, 3), np.float32)] * 3,
         [latency, latency, latency],
     )
-    manifest: dict[str, object] = {
-        "schema": "squint.replay",
-        "schema_version": 1,
-        "sequence_id": identifier,
-        "frame_count": 3,
-        "fps": 25.0,
-        "width": 4,
-        "height": 4,
-        "source_sha256": "a" * 64,
-        "causal_trace_sha256": causal_trace_sha256(arrays),
-        "detector": detector
-        or {
-            "adapter": "fixture",
-            "model_id": "fixture/model",
-            "revision": "r1",
-            "weights_sha256": "b" * 64,
-            "precision": "float32",
-            "preprocessor": {"name": "fixture", "revision": "p1"},
-            "timing": {"protocol": "synchronized", "unit": "ms"},
-        },
-        "hardware": hardware
-        or {
-            "device": "cpu",
-            "runtime": {"name": "python", "version": "3.10"},
-            "identity": {"processor": "fixture-cpu", "revision": "r1"},
-        },
-        "telemetry": {"gpu_utilization": 1.0},
-    }
+    manifest = _trace_manifest(
+        arrays, identifier=identifier, detector=detector, hardware=hardware
+    )
     return RawTrace(identifier, arrays, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("sequence_id", _DELETE, "sequence_id"),
+        ("sequence_id", "04", "sequence_id"),
+        ("sequence_id", True, "sequence_id"),
+        ("frame_count", _DELETE, "frame_count"),
+        ("frame_count", 2, "frame_count"),
+        ("frame_count", True, "frame_count"),
+        ("fps", _DELETE, "fps"),
+        ("fps", 30.0, "timestamps_s"),
+        ("fps", 0.0, "fps"),
+        ("fps", nan, "fps"),
+        ("fps", True, "fps"),
+        ("schema", "other.replay", "schema"),
+        ("schema", True, "schema"),
+        ("schema_version", 2, "schema_version"),
+        ("schema_version", True, "schema_version"),
+    ],
+)
+def test_raw_trace_rejects_incoherent_manifest_metadata(
+    tmp_path: Path, field: str, value: object, match: str
+) -> None:
+    arrays, manifest = _valid_raw_trace_inputs(tmp_path)
+    if value is _DELETE:
+        manifest.pop(field)
+    else:
+        manifest[field] = value
+    with pytest.raises(ValueError, match=match):
+        RawTrace("02", arrays, manifest)
+
+
+def test_raw_trace_requires_timestamps_exactly_derived_from_manifest_fps(
+    tmp_path: Path,
+) -> None:
+    arrays, manifest = _valid_raw_trace_inputs(tmp_path)
+    arrays["timestamps_s"] = arrays["timestamps_s"].copy()
+    arrays["timestamps_s"][1] += 0.000001
+    manifest["causal_trace_sha256"] = causal_trace_sha256(arrays)
+    with pytest.raises(ValueError, match="timestamps_s"):
+        RawTrace("02", arrays, manifest)
+
+
+def test_raw_trace_schema_fields_are_optional_as_a_pair(tmp_path: Path) -> None:
+    arrays, manifest = _valid_raw_trace_inputs(tmp_path)
+    manifest.pop("schema")
+    manifest.pop("schema_version")
+    trace = RawTrace("02", arrays, manifest)
+    assert "schema" not in trace.manifest_fields
 
 
 def test_reference_profile_uses_explicit_canonical_schema_and_hash(tmp_path: Path) -> None:
@@ -278,78 +406,289 @@ def test_reference_profile_uses_explicit_canonical_schema_and_hash(tmp_path: Pat
     assert ReferenceProfile.load(destination).canonical_json == profile.canonical_json
 
 
+def test_profile_hash_binds_domain_schema_and_only_nonrecursive_profile_fields(
+    tmp_path: Path,
+) -> None:
+    profile = profile_training_traces(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
+        reserve_ms=4.0,
+        normalization=_normalization(),
+    )
+    serialized = profile.to_dict()
+    cost_profile = deepcopy(serialized["cost_profile"])
+    assert isinstance(cost_profile, dict)
+    cost_profile.pop("profile_sha256")
+    payload = {
+        "hash_domain": "squint.reference-profile/v1",
+        "schema": {"name": "squint.reference-profile", "version": 1},
+        "detector": serialized["detector"],
+        "hardware": serialized["hardware"],
+        "cost_profile": cost_profile,
+        "normalization": serialized["normalization"],
+        "training_traces": serialized["training_traces"],
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+    assert profile.profile_sha256 == sha256(encoded).hexdigest()
+    assert "profile_sha256" not in json.dumps(payload["detector"])
+    assert "profile_sha256" not in json.dumps(payload["hardware"])
+
+    changed_domain = deepcopy(payload)
+    changed_domain["hash_domain"] = "squint.reference-profile/v2"
+    changed_schema = deepcopy(payload)
+    schema = changed_schema["schema"]
+    assert isinstance(schema, dict)
+    schema["version"] = 2
+    assert sha256(
+        json.dumps(changed_domain, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() != profile.profile_sha256
+    assert sha256(
+        json.dumps(changed_schema, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() != profile.profile_sha256
+
+
 def test_raw_trace_deep_freezes_json_manifest_and_rejects_non_json_values(
     tmp_path: Path,
 ) -> None:
     arrays, _manifest = _valid_raw_trace_inputs(tmp_path)
-    manifest: dict[str, object] = {
-        "causal_trace_sha256": causal_trace_sha256(arrays),
-        "detector": {"identity": {"precision": "float32"}},
-        "hardware": {"runtime": {"name": "python"}},
-    }
+    manifest = _trace_manifest(arrays)
     trace = RawTrace("02", arrays, manifest)
-    manifest["detector"] = {"identity": {"precision": "float16"}}
-    assert trace.manifest_fields["detector"] == {
-        "identity": {"precision": "float32"}
-    }
+    manifest["detector"] = {"precision": "float16"}
+    detector = trace.manifest_fields["detector"]
+    assert isinstance(detector, Mapping)
+    assert detector["precision"] == "float32"
+    timing = detector["timing"]
+    assert isinstance(timing, Mapping)
+    assert timing["includes"] == ("model_forward",)
+    preprocessor = detector["preprocessor"]
+    assert isinstance(preprocessor, Mapping)
     with pytest.raises(TypeError):
-        trace.manifest_fields["detector"]["identity"]["precision"] = "float16"
+        preprocessor["width"] = 320  # type: ignore[index]
     with pytest.raises(ValueError, match="JSON"):
         RawTrace(
             "02",
             arrays,
-            {
-                "causal_trace_sha256": causal_trace_sha256(arrays),
-                "detector": {"bad": object()},
-                "hardware": {},
-            },
+            {**_trace_manifest(arrays), "detector": {"bad": object()}},
         )
     with pytest.raises(ValueError, match="finite"):
         RawTrace(
             "02",
             arrays,
-            {
-                "causal_trace_sha256": causal_trace_sha256(arrays),
-                "detector": {"bad": nan},
-                "hardware": {},
-            },
+            {**_trace_manifest(arrays), "detector": {"bad": nan}},
         )
 
 
 def test_profile_requires_exact_training_ids_and_matching_nested_identities(
     tmp_path: Path,
 ) -> None:
-    values = {
-        "active_tracks": 1,
-        "age_s": 1.0,
-        "motion_px_s": 1.0,
-        "time_since_detector_s": 1.0,
-    }
     with pytest.raises(ValueError, match="02, 04, 05, and 10"):
         profile_training_traces(
             [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05")],
             reserve_ms=1.0,
-            normalization=values,
+            normalization=_normalization(),
         )
-    mixed_detector = _profile_trace(tmp_path, "04", detector={"precision": "float16"})
+    mixed_detector_identity = _detector_identity()
+    mixed_detector_identity["precision"] = "float16"
+    mixed_detector = _profile_trace(
+        tmp_path, "04", detector=mixed_detector_identity
+    )
     with pytest.raises(ValueError, match="detector"):
         profile_training_traces(
             [_profile_trace(tmp_path, "02"), mixed_detector]
             + [_profile_trace(tmp_path, identifier) for identifier in ("05", "10")],
             reserve_ms=1.0,
-            normalization=values,
+            normalization=_normalization(),
         )
+    mixed_hardware_identity = _hardware_identity()
+    platform = mixed_hardware_identity["platform"]
+    assert isinstance(platform, dict)
+    platform["machine"] = "aarch64"
     mixed_hardware = _profile_trace(
-        tmp_path,
-        "05",
-        hardware={"device": "different", "runtime": {"name": "python", "version": "3.10"}},
+        tmp_path, "05", hardware=mixed_hardware_identity
     )
     with pytest.raises(ValueError, match="hardware"):
         profile_training_traces(
             [_profile_trace(tmp_path, "02"), _profile_trace(tmp_path, "04"), mixed_hardware, _profile_trace(tmp_path, "10")],
             reserve_ms=1.0,
-            normalization=values,
+            normalization=_normalization(),
         )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("model_id",), _DELETE),
+        (("revision",), _DELETE),
+        (("weights",), _DELETE),
+        (("preprocessor",), _DELETE),
+        (("threshold",), _DELETE),
+        (("class_mapping",), _DELETE),
+        (("precision",), _DELETE),
+        (("timing",), _DELETE),
+        (("unexpected",), "value"),
+        (("model_id",), "other/model"),
+        (("model_id",), True),
+        (("revision",), "main"),
+        (("revision",), None),
+        (("weights",), {}),
+        (("weights",), {"alternate.safetensors": "19e06bdc873da819920a8d373b879721a5b9759d822f8213220bb09abbdab58b"}),
+        (("weights", "model.safetensors"), "0" * 64),
+        (("weights", "model.safetensors"), True),
+        (("preprocessor",), {}),
+        (("preprocessor", "class"), _DELETE),
+        (("preprocessor", "class"), "OtherProcessor"),
+        (("preprocessor", "height"), 320),
+        (("preprocessor", "height"), True),
+        (("preprocessor", "width"), 320),
+        (("preprocessor", "width"), 640.0),
+        (("preprocessor", "do_pad"), True),
+        (("preprocessor", "do_pad"), 0),
+        (("preprocessor", "use_fast"), True),
+        (("preprocessor", "use_fast"), 0),
+        (("preprocessor", "extra"), False),
+        (("threshold",), 0.2),
+        (("threshold",), True),
+        (("threshold",), nan),
+        (("threshold",), "0.10"),
+        (("class_mapping",), {}),
+        (("class_mapping", "source_label"), _DELETE),
+        (("class_mapping", "source_label"), "car"),
+        (("class_mapping", "source_label_id"), -1),
+        (("class_mapping", "source_label_id"), True),
+        (("class_mapping", "output_class_id"), 2),
+        (("class_mapping", "output_class_id"), True),
+        (("class_mapping", "extra"), 1),
+        (("precision",), "bfloat16"),
+        (("precision",), True),
+        (("timing",), {}),
+        (("timing", "protocol"), _DELETE),
+        (("timing", "protocol"), "wall-clock-v1"),
+        (("timing", "unit"), "seconds"),
+        (("timing", "includes"), ["preprocess", "model_forward"]),
+        (("timing", "includes"), "model_forward"),
+        (("timing", "excludes"), ["telemetry", "postprocess", "preprocess"]),
+        (("timing", "extra"), []),
+    ],
+)
+def test_profile_rejects_invalid_detector_identity(
+    tmp_path: Path, path: tuple[str, ...], value: object
+) -> None:
+    detector = _mutate_identity(_detector_identity(), path, value)
+    with pytest.raises(ValueError, match="detector"):
+        traces = [
+            _profile_trace(tmp_path, identifier, detector=detector)
+            for identifier in ("02", "04", "05", "10")
+        ]
+        profile_training_traces(
+            traces, reserve_ms=1.0, normalization=_normalization()
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("platform",), _DELETE),
+        (("runtime",), _DELETE),
+        (("device",), _DELETE),
+        (("unexpected",), {}),
+        (("platform",), {}),
+        (("platform", "system"), _DELETE),
+        (("platform", "machine"), _DELETE),
+        (("platform", "python"), _DELETE),
+        (("platform", "system"), ""),
+        (("platform", "machine"), True),
+        (("platform", "python"), None),
+        (("platform", "extra"), "value"),
+        (("runtime",), {}),
+        (("runtime", "torch"), _DELETE),
+        (("runtime", "transformers"), _DELETE),
+        (("runtime", "cuda"), _DELETE),
+        (("runtime", "driver"), _DELETE),
+        (("runtime", "torch"), ""),
+        (("runtime", "transformers"), True),
+        (("runtime", "cuda"), ""),
+        (("runtime", "driver"), False),
+        (("runtime", "extra"), None),
+        (("device",), {}),
+        (("device", "type"), _DELETE),
+        (("device", "name"), _DELETE),
+        (("device", "uuid"), _DELETE),
+        (("device", "pci_bus_id"), _DELETE),
+        (("device", "type"), ""),
+        (("device", "name"), True),
+        (("device", "uuid"), ""),
+        (("device", "pci_bus_id"), False),
+        (("device", "extra"), None),
+    ],
+)
+def test_profile_rejects_invalid_hardware_identity(
+    tmp_path: Path, path: tuple[str, ...], value: object
+) -> None:
+    hardware = _mutate_identity(_hardware_identity(), path, value)
+    with pytest.raises(ValueError, match="hardware"):
+        traces = [
+            _profile_trace(tmp_path, identifier, hardware=hardware)
+            for identifier in ("02", "04", "05", "10")
+        ]
+        profile_training_traces(
+            traces, reserve_ms=1.0, normalization=_normalization()
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("runtime", "cuda"),
+        ("runtime", "driver"),
+        ("device", "uuid"),
+        ("device", "pci_bus_id"),
+    ],
+)
+def test_accelerated_hardware_requires_complete_runtime_and_device_identity(
+    tmp_path: Path, path: tuple[str, ...]
+) -> None:
+    hardware = _mutate_identity(_hardware_identity(device_type="cuda"), path, None)
+    traces = [
+        _profile_trace(tmp_path, identifier, hardware=hardware)
+        for identifier in ("02", "04", "05", "10")
+    ]
+    with pytest.raises(ValueError, match="hardware"):
+        profile_training_traces(
+            traces, reserve_ms=1.0, normalization=_normalization()
+        )
+
+
+def test_complete_accelerated_hardware_identity_is_supported(tmp_path: Path) -> None:
+    hardware = _hardware_identity(device_type="cuda")
+    profile = profile_training_traces(
+        [
+            _profile_trace(tmp_path, identifier, hardware=hardware)
+            for identifier in ("02", "04", "05", "10")
+        ],
+        reserve_ms=1.0,
+        normalization=_normalization(),
+    )
+    assert profile.to_dict()["hardware"] == hardware
+
+
+def test_detector_allows_float16_and_any_nonnegative_person_label_id(
+    tmp_path: Path,
+) -> None:
+    detector = _detector_identity()
+    detector["precision"] = "float16"
+    class_mapping = detector["class_mapping"]
+    assert isinstance(class_mapping, dict)
+    class_mapping["source_label_id"] = 0
+    profile = profile_training_traces(
+        [
+            _profile_trace(tmp_path, identifier, detector=detector)
+            for identifier in ("02", "04", "05", "10")
+        ],
+        reserve_ms=1.0,
+        normalization=_normalization(),
+    )
+    assert profile.to_dict()["detector"] == detector
 
 
 def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace(
@@ -391,6 +730,7 @@ def test_profile_hash_excludes_gt_source_and_telemetry_but_includes_causal_trace
     [
         {"schema": {"name": "wrong", "version": 1}},
         {"schema": {"name": "squint.reference-profile", "version": 2}},
+        {"schema": {"name": "squint.reference-profile", "version": True}},
         {"cost_profile": {"reserve_ms": True}},
         {"cost_profile": {"profile_sha256": "A" * 64}},
         {"cost_profile": {"profile_sha256": "0" * 63}},
@@ -420,6 +760,56 @@ def test_profile_load_rejects_schema_numeric_and_hash_mutations(
             payload[key] = value
     path = tmp_path / "mutated.json"
     path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+    with pytest.raises(ValueError):
+        ReferenceProfile.load(path)
+
+
+def test_profile_load_rejects_bool_schema_version_contextually(tmp_path: Path) -> None:
+    profile = profile_training_traces(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
+        reserve_ms=1.0,
+        normalization=_normalization(),
+    )
+    payload = profile.to_dict()
+    payload["schema"] = {"name": "squint.reference-profile", "version": True}
+    path = tmp_path / "bool-version.json"
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="version"):
+        ReferenceProfile.load(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("schema", []),
+        ("detector", []),
+        ("hardware", False),
+        ("cost_profile", "bad"),
+        ("normalization", 1),
+        ("training_traces", None),
+        ("training_traces", True),
+        ("training_traces", 1),
+        ("training_traces", "02"),
+        ("training_traces", {}),
+        ("training_traces", ["02"]),
+    ],
+)
+def test_profile_load_wraps_every_malformed_top_level_type_as_value_error(
+    tmp_path: Path, field: str, malformed: object
+) -> None:
+    profile = profile_training_traces(
+        [_profile_trace(tmp_path, identifier) for identifier in ("02", "04", "05", "10")],
+        reserve_ms=1.0,
+        normalization=_normalization(),
+    )
+    payload = profile.to_dict()
+    payload[field] = malformed
+    path = tmp_path / f"malformed-{field}.json"
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
     with pytest.raises(ValueError):
         ReferenceProfile.load(path)
 
@@ -499,8 +889,10 @@ def test_raw_trace_direct_construction_requires_coherent_causal_hash(tmp_path: P
     manifest["causal_trace_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="causal_trace_sha256"):
         RawTrace("02", arrays, manifest)
+    manifest = _trace_manifest(arrays)
+    manifest.pop("causal_trace_sha256")
     with pytest.raises(ValueError, match="causal_trace_sha256"):
-        RawTrace("02", arrays, {})
+        RawTrace("02", arrays, manifest)
 
 
 def test_source_hash_streams_sorted_files_without_path_read_bytes(

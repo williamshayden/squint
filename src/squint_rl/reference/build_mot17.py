@@ -18,7 +18,13 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from squint_rl.reference.dfine import scene_change_grid
+from squint_rl.reference.dfine import (
+    MODEL_ID,
+    MODEL_REVISION,
+    THRESHOLD,
+    WEIGHTS_SHA256,
+    scene_change_grid,
+)
 from squint_rl.reference.mot17 import Mot17Sequence
 from squint_rl.tracker import DetectionBatch
 
@@ -49,14 +55,22 @@ _ARRAY_SPECS: dict[str, tuple[np.dtype[Any], tuple[int | str, ...]]] = {
     "gt_frame_offsets": (np.dtype(np.int64), ("F+1",)),
 }
 _SOURCE_HASH_CHUNK_BYTES = 1024 * 1024
+_TRACE_SCHEMA_NAME = "squint.replay"
+_TRACE_SCHEMA_VERSION = 1
 _PROFILE_SCHEMA_NAME = "squint.reference-profile"
 _PROFILE_SCHEMA_VERSION = 1
+_PROFILE_HASH_DOMAIN = "squint.reference-profile/v1"
 _PROFILE_TRAINING_IDS = ("02", "04", "05", "10")
 _PROFILE_COST_FIELDS = ("unit", "p95_ms", "reserve_ms", "capacity_ms", "profile_sha256")
 _PROFILE_NORMALIZATION_FIELDS = (
     "active_tracks", "age_s", "motion_px_s", "time_since_detector_s"
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_DETECTOR_FIELDS = {
+    "model_id", "revision", "weights", "preprocessor", "threshold",
+    "class_mapping", "precision", "timing",
+}
+_HARDWARE_FIELDS = {"platform", "runtime", "device"}
 
 
 class Detector(Protocol):
@@ -228,24 +242,171 @@ def _positive_number(value: object, name: str) -> float:
     return normalized
 
 
-def _profile_identity(value: object, name: str) -> Mapping[str, object]:
+def _identity_object(
+    value: object, name: str, fields: set[str]
+) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} identity must be a JSON object")  # noqa: TRY004
     frozen = _freeze_json(value, path=name)
     identity = cast(Mapping[str, object], frozen)
-
-    def validate_hashes(item: object, path: str) -> None:
-        if isinstance(item, Mapping):
-            for key, child in item.items():
-                if key.endswith("sha256"):
-                    _lowercase_sha256(child, f"{path}.{key}")
-                validate_hashes(child, f"{path}.{key}")
-        elif isinstance(item, tuple):
-            for index, child in enumerate(item):
-                validate_hashes(child, f"{path}[{index}]")
-
-    validate_hashes(identity, name)
+    if set(identity) != fields:
+        raise ValueError(f"{name} identity has missing or unexpected fields")
     return identity
+
+
+def _nested_object(
+    value: object, name: str, fields: set[str]
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a JSON object")  # noqa: TRY004
+    nested = cast(Mapping[str, object], value)
+    if set(nested) != fields:
+        raise ValueError(f"{name} has missing or unexpected fields")
+    return nested
+
+
+def _nonempty_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a nonempty string")
+    return value
+
+
+def _nullable_string(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _nonempty_string(value, name)
+
+
+def _validate_detector_identity(value: object) -> Mapping[str, object]:
+    detector = _identity_object(value, "detector", _DETECTOR_FIELDS)
+    if detector["model_id"] != MODEL_ID:
+        raise ValueError("detector.model_id does not match the D-FINE pin")
+    if detector["revision"] != MODEL_REVISION:
+        raise ValueError("detector.revision does not match the D-FINE pin")
+
+    weights = _nested_object(
+        detector["weights"], "detector.weights", {"model.safetensors"}
+    )
+    if weights["model.safetensors"] != WEIGHTS_SHA256:
+        raise ValueError("detector.weights model.safetensors does not match the D-FINE pin")
+
+    preprocessor = _nested_object(
+        detector["preprocessor"],
+        "detector.preprocessor",
+        {"class", "height", "width", "do_pad", "use_fast"},
+    )
+    if preprocessor["class"] != "RTDetrImageProcessor":
+        raise ValueError("detector.preprocessor.class must be RTDetrImageProcessor")
+    for dimension in ("height", "width"):
+        if type(preprocessor[dimension]) is not int or preprocessor[dimension] != 640:
+            raise ValueError(f"detector.preprocessor.{dimension} must be integer 640")
+    for flag in ("do_pad", "use_fast"):
+        if preprocessor[flag] is not False:
+            raise ValueError(f"detector.preprocessor.{flag} must be false")
+
+    threshold = detector["threshold"]
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) != THRESHOLD
+    ):
+        raise ValueError("detector.threshold must match the finite D-FINE threshold")
+
+    class_mapping = _nested_object(
+        detector["class_mapping"],
+        "detector.class_mapping",
+        {"source_label", "source_label_id", "output_class_id"},
+    )
+    if class_mapping["source_label"] != "person":
+        raise ValueError("detector.class_mapping.source_label must be person")
+    source_label_id = class_mapping["source_label_id"]
+    if type(source_label_id) is not int or source_label_id < 0:
+        raise ValueError("detector.class_mapping.source_label_id must be nonnegative integer")
+    output_class_id = class_mapping["output_class_id"]
+    if type(output_class_id) is not int or output_class_id != 1:
+        raise ValueError("detector.class_mapping.output_class_id must be integer 1")
+
+    if detector["precision"] not in ("float32", "float16"):
+        raise ValueError("detector.precision must be float32 or float16")
+    timing = _nested_object(
+        detector["timing"],
+        "detector.timing",
+        {"protocol", "unit", "includes", "excludes"},
+    )
+    if timing["protocol"] != "synchronized-forward-only-v1":
+        raise ValueError("detector.timing.protocol is unsupported")
+    if timing["unit"] != "ms":
+        raise ValueError("detector.timing.unit must be ms")
+    if timing["includes"] != ("model_forward",):
+        raise ValueError("detector.timing.includes must contain only model_forward")
+    if timing["excludes"] != ("preprocess", "postprocess", "telemetry"):
+        raise ValueError("detector.timing.excludes is invalid")
+    return detector
+
+
+def _validate_hardware_identity(value: object) -> Mapping[str, object]:
+    hardware = _identity_object(value, "hardware", _HARDWARE_FIELDS)
+    platform = _nested_object(
+        hardware["platform"], "hardware.platform", {"system", "machine", "python"}
+    )
+    runtime = _nested_object(
+        hardware["runtime"],
+        "hardware.runtime",
+        {"torch", "transformers", "cuda", "driver"},
+    )
+    device = _nested_object(
+        hardware["device"],
+        "hardware.device",
+        {"type", "name", "uuid", "pci_bus_id"},
+    )
+    for field in ("system", "machine", "python"):
+        _nonempty_string(platform[field], f"hardware.platform.{field}")
+    for field in ("torch", "transformers"):
+        _nonempty_string(runtime[field], f"hardware.runtime.{field}")
+    for field in ("cuda", "driver"):
+        _nullable_string(runtime[field], f"hardware.runtime.{field}")
+    device_type = _nonempty_string(device["type"], "hardware.device.type")
+    _nonempty_string(device["name"], "hardware.device.name")
+    for field in ("uuid", "pci_bus_id"):
+        _nullable_string(device[field], f"hardware.device.{field}")
+    if device_type != "cpu" and any(
+        item is None
+        for item in (runtime["cuda"], runtime["driver"], device["uuid"], device["pci_bus_id"])
+    ):
+        raise ValueError("non-CPU hardware identity requires CUDA, driver, UUID, and PCI bus ID")
+    return hardware
+
+
+def _validate_trace_manifest(
+    sequence_id: str,
+    arrays: Mapping[str, NDArray[Any]],
+    manifest: Mapping[str, object],
+) -> None:
+    manifest_sequence_id = manifest.get("sequence_id")
+    if not isinstance(manifest_sequence_id, str) or manifest_sequence_id != sequence_id:
+        raise ValueError("manifest_fields sequence_id must match RawTrace sequence_id")
+    frame_count = manifest.get("frame_count")
+    if type(frame_count) is not int or frame_count != len(arrays["timestamps_s"]):
+        raise ValueError("manifest_fields frame_count must exactly match array frame count")
+    fps_value = manifest.get("fps")
+    if (
+        isinstance(fps_value, bool)
+        or not isinstance(fps_value, (int, float))
+        or not math.isfinite(float(fps_value))
+        or float(fps_value) <= 0.0
+    ):
+        raise ValueError("manifest_fields fps must be a finite positive number")
+    expected_timestamps = np.arange(frame_count, dtype=np.float64) / float(fps_value)
+    if not np.array_equal(arrays["timestamps_s"], expected_timestamps):
+        raise ValueError("timestamps_s must exactly equal arange(frame_count) / manifest fps")
+    if "schema" in manifest and manifest["schema"] != _TRACE_SCHEMA_NAME:
+        raise ValueError("manifest_fields schema must be squint.replay")
+    if "schema_version" in manifest and (
+        type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != _TRACE_SCHEMA_VERSION
+    ):
+        raise ValueError("manifest_fields schema_version must be integer 1")
 
 
 def _profile_hash_payload(
@@ -259,6 +420,8 @@ def _profile_hash_payload(
         key: value for key, value in cost_profile.items() if key != "profile_sha256"
     }
     return {
+        "hash_domain": _PROFILE_HASH_DOMAIN,
+        "schema": {"name": _PROFILE_SCHEMA_NAME, "version": _PROFILE_SCHEMA_VERSION},
         "detector": _jsonable(detector),
         "hardware": _jsonable(hardware),
         "cost_profile": _jsonable(cost_without_hash),
@@ -382,6 +545,7 @@ class RawTrace:
         if not isinstance(self.manifest_fields, Mapping):
             raise ValueError("manifest_fields must be a mapping")  # noqa: TRY004
         manifest = dict(self.manifest_fields)
+        _validate_trace_manifest(self.sequence_id, self.arrays, manifest)
         expected_hash = causal_trace_sha256(self.arrays)
         if manifest.get("causal_trace_sha256") != expected_hash:
             raise ValueError("manifest_fields causal_trace_sha256 does not match arrays")
@@ -402,8 +566,8 @@ class ReferenceProfile:
     training_traces: tuple[Mapping[str, object], ...]
 
     def __post_init__(self) -> None:
-        detector = _profile_identity(self.detector, "detector")
-        hardware = _profile_identity(self.hardware, "hardware")
+        detector = _validate_detector_identity(self.detector)
+        hardware = _validate_hardware_identity(self.hardware)
         cost = _freeze_json(self.cost_profile, path="cost_profile")
         normalization = _freeze_json(self.normalization, path="normalization")
         traces = tuple(_freeze_json(trace, path="training_traces") for trace in self.training_traces)
@@ -534,14 +698,20 @@ class ReferenceProfile:
         schema = payload["schema"]
         if not isinstance(schema, Mapping) or set(schema) != {"name", "version"}:
             raise ValueError("reference profile schema must contain name and version")
-        if schema.get("name") != _PROFILE_SCHEMA_NAME or schema.get("version") != _PROFILE_SCHEMA_VERSION:
-            raise ValueError("unsupported reference profile schema")
+        version = schema.get("version")
+        if schema.get("name") != _PROFILE_SCHEMA_NAME:
+            raise ValueError("unsupported reference profile schema name")
+        if type(version) is not int or version != _PROFILE_SCHEMA_VERSION:
+            raise ValueError("unsupported reference profile schema version")
+        training_traces = payload["training_traces"]
+        if not isinstance(training_traces, list):
+            raise ValueError("reference profile training_traces must be a JSON array")  # noqa: TRY004
         profile = cls(
             cast(Mapping[str, object], payload["detector"]),
             cast(Mapping[str, object], payload["hardware"]),
             cast(Mapping[str, object], payload["cost_profile"]),
             cast(Mapping[str, object], payload["normalization"]),
-            tuple(cast(Sequence[Mapping[str, object]], payload["training_traces"])),
+            tuple(cast(Sequence[Mapping[str, object]], training_traces)),
         )
         if text != profile.canonical_json:
             raise ValueError("reference profile JSON is not canonical")
@@ -565,14 +735,14 @@ def profile_training_traces(
         raise ValueError("profile requires exactly training traces 02, 04, 05, and 10")
     ordered = sorted(traces, key=lambda trace: _PROFILE_TRAINING_IDS.index(trace.sequence_id))
     first_manifest = ordered[0].manifest_fields
-    detector = _profile_identity(first_manifest.get("detector"), "detector")
-    hardware = _profile_identity(first_manifest.get("hardware"), "hardware")
+    detector = _validate_detector_identity(first_manifest.get("detector"))
+    hardware = _validate_hardware_identity(first_manifest.get("hardware"))
     detector_json = _canonical_json(detector)
     hardware_json = _canonical_json(hardware)
     profile_traces: list[Mapping[str, object]] = []
     for trace in ordered:
-        current_detector = _profile_identity(trace.manifest_fields.get("detector"), "detector")
-        current_hardware = _profile_identity(trace.manifest_fields.get("hardware"), "hardware")
+        current_detector = _validate_detector_identity(trace.manifest_fields.get("detector"))
+        current_hardware = _validate_hardware_identity(trace.manifest_fields.get("hardware"))
         if _canonical_json(current_detector) != detector_json:
             raise ValueError("training traces must share one detector identity")
         if _canonical_json(current_hardware) != hardware_json:
