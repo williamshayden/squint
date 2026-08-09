@@ -174,6 +174,10 @@ class DFineDetector:
             raise DFineRuntimeError("D-FINE scores and labels must have shape (N,)")
         if labels.dtype.kind not in "iu":
             raise DFineRuntimeError("D-FINE labels must be integers")
+        if boxes.dtype.kind not in "fiu":
+            raise DFineRuntimeError("D-FINE boxes must be numeric")
+        if scores.dtype.kind not in "fiu":
+            raise DFineRuntimeError("D-FINE scores must be numeric")
         if not np.all(np.isfinite(boxes)):
             raise DFineRuntimeError("D-FINE boxes must be finite")
         if not np.all(np.isfinite(scores)) or np.any((scores < 0) | (scores > 1)):
@@ -199,7 +203,7 @@ class DFineDetector:
 def _tensor_array(value: Any, name: str) -> NDArray[Any]:
     try:
         return np.asarray(value.detach().cpu().numpy())
-    except (AttributeError, TypeError, ValueError) as error:
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
         raise DFineRuntimeError(f"D-FINE {name} output is not a tensor") from error
 
 

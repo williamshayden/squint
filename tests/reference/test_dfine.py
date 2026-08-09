@@ -54,6 +54,34 @@ class _FakeTensor:
         return self.value.copy()
 
 
+class _FailingConversionTensor(_FakeTensor):
+    def __init__(
+        self,
+        name: str,
+        value: object,
+        events: list[tuple[object, ...]],
+        *,
+        stage: str,
+    ) -> None:
+        super().__init__(name, value, events, floating=True)
+        self.stage = stage
+
+    def detach(self) -> _FakeTensor:
+        if self.stage == "detach":
+            raise RuntimeError("synthetic detach failure")
+        return self
+
+    def cpu(self) -> _FakeTensor:
+        if self.stage == "cpu":
+            raise RuntimeError("synthetic cpu failure")
+        return self
+
+    def numpy(self) -> NDArray[Any]:
+        if self.stage == "numpy":
+            raise RuntimeError("synthetic numpy failure")
+        return super().numpy()
+
+
 class _FakeInferenceMode:
     def __init__(self, events: list[tuple[object, ...]]) -> None:
         self.events = events
@@ -516,6 +544,66 @@ def test_predict_rejects_malformed_postprocessor_output(
     detector, _, _ = _prediction_fixture(monkeypatch, results=results)
 
     with pytest.raises(DFineRuntimeError, match=message):
+        detector.predict(Image.new("RGB", (40, 32)))
+
+
+@pytest.mark.parametrize(
+    ("output_name", "bad_value"),
+    [
+        ("boxes", np.array([["1", "2", "20", "30"]], dtype=np.str_)),
+        ("boxes", np.array([[1.0, 2.0, 20.0, 30.0]], dtype=object)),
+        ("scores", np.array(["0.9"], dtype=np.str_)),
+        ("scores", np.array([0.9], dtype=object)),
+    ],
+)
+def test_predict_rejects_nonnumeric_boxes_and_scores_contextually(
+    monkeypatch: pytest.MonkeyPatch,
+    output_name: str,
+    bad_value: NDArray[Any],
+) -> None:
+    events: list[tuple[object, ...]] = []
+    results = [
+        {
+            "boxes": _FakeTensor(
+                "boxes", [[1.0, 2.0, 20.0, 30.0]], events, floating=True
+            ),
+            "scores": _FakeTensor("scores", [0.9], events, floating=True),
+            "labels": _FakeTensor("labels", [0], events, floating=False),
+        }
+    ]
+    results[0][output_name] = _FakeTensor(
+        output_name,
+        bad_value,
+        events,
+        floating=True,
+    )
+    detector, _, _ = _prediction_fixture(monkeypatch, results=results)
+
+    with pytest.raises(DFineRuntimeError, match=rf"D-FINE {output_name}"):
+        detector.predict(Image.new("RGB", (40, 32)))
+
+
+@pytest.mark.parametrize("stage", ["detach", "cpu", "numpy"])
+def test_predict_wraps_runtime_errors_from_each_tensor_conversion_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    results = [
+        {
+            "boxes": _FailingConversionTensor(
+                "boxes",
+                [[1.0, 2.0, 20.0, 30.0]],
+                events,
+                stage=stage,
+            ),
+            "scores": _FakeTensor("scores", [0.9], events, floating=True),
+            "labels": _FakeTensor("labels", [0], events, floating=False),
+        }
+    ]
+    detector, _, _ = _prediction_fixture(monkeypatch, results=results)
+
+    with pytest.raises(DFineRuntimeError, match="D-FINE boxes output"):
         detector.predict(Image.new("RGB", (40, 32)))
 
 
