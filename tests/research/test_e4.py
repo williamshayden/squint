@@ -237,3 +237,31 @@ def test_six_real_environment_rollouts_are_literal_and_exact(tmp_path: Path) -> 
         assert item["mean_reward"] == mean
         assert item["terminated"] is True and item["truncated"] is False
         assert item["action_sha256"] == _expected_action_hash(tuple(expected_actions))
+
+
+def test_audited_identity_freeze(tmp_path: Path) -> None:
+    from squint_rl.episode import Episode
+
+    e4 = _e4()
+    episode = Episode.open(e4._build_episode(tmp_path / "episode"))
+    train = episode.slice(0, 32)
+    evaluation = episode.slice(32, 64)
+    rollouts = e4._run_rollouts(evaluation)
+    assert (
+        episode.content_sha256,
+        train.content_sha256,
+        evaluation.content_sha256,
+        e4._tracker_hash(),
+        *(item["action_sha256"] for item in rollouts),
+    ) == (
+        "094ef10e449fca4dac3797bccf274c27eb548456ccbb305f67764fa66b96d7a6",
+        "f9066ffd6a448c61048687d4afc29432a504bc139bc328a59d89a9cdf92e822b",
+        "4b498f29fb9bf70d4a9a1cdb69c363e022b9fe287486279452c82dfb8cb91326",
+        "6979f555a0ee994d74403026db9c0793d864cebe2e472d58ca215305c6c3aff2",
+        "0bce96cefda9d8330301084ab232e61dcc5f654eeb6886b5134fede91cd90e4b",
+        "0bce96cefda9d8330301084ab232e61dcc5f654eeb6886b5134fede91cd90e4b",
+        "3029675a972017bd89729670f24af26ba0405f3ab9bb1d035cbabb6eed2788f3",
+        "78823c7bff4bd76bd9e19823891b1d0836d859592eda9e292f10d6469a582c05",
+        "78823c7bff4bd76bd9e19823891b1d0836d859592eda9e292f10d6469a582c05",
+        "3029675a972017bd89729670f24af26ba0405f3ab9bb1d035cbabb6eed2788f3",
+    )
