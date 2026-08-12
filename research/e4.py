@@ -11,7 +11,8 @@ _ID = "squint.e4.change-pulse.v1"
 _PULSES = (3, 7, 13, 21, 25, 31, 35, 43, 49, 53, 61)
 _RECORD = {
     "box_a": [10.0, 10.0, 30.0, 30.0], "box_b": [70.0, 70.0, 90.0, 90.0],
-    "class_id": 1, "detector_latency_ms": 10.0, "detector_score": 0.9,
+    "budget_reserve_ms": 10.0, "class_id": 1, "detector_latency_ms": 10.0,
+    "detector_score": 0.9,
     "evaluation_view": {"pulses": [3, 11, 17, 21, 29], "start": 32, "stop": 64},
     "fps": 4.0, "frame_count": 64, "height": 100, "identity": 7,
     "ignore_rule": "no ignored records", "scene_feature_shape": [3, 3],
