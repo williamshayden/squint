@@ -9,8 +9,10 @@ import numpy as np
 
 _ID = "squint.e4.change-pulse.v1"
 _PULSES = (3, 7, 13, 21, 25, 31, 35, 43, 49, 53, 61)
+_BOX_A: list[float] = [10.0, 10.0, 30.0, 30.0]
+_BOX_B: list[float] = [70.0, 70.0, 90.0, 90.0]
 _RECORD = {
-    "box_a": [10.0, 10.0, 30.0, 30.0], "box_b": [70.0, 70.0, 90.0, 90.0],
+    "box_a": _BOX_A, "box_b": _BOX_B,
     "budget_reserve_ms": 10.0, "class_id": 1, "detector_latency_ms": 10.0,
     "detector_score": 0.9,
     "evaluation_view": {"pulses": [3, 11, 17, 21, 29], "start": 32, "stop": 64},
@@ -59,7 +61,7 @@ def _build_episode(path: str | Path) -> Path:
         if empty:
             counts.append(0)
         else:
-            boxes.append(_RECORD["box_a"] if sum(frame >= pulse for pulse in _PULSES) % 2 else _RECORD["box_b"])
+            boxes.append(_BOX_A if sum(frame >= pulse for pulse in _PULSES) % 2 else _BOX_B)
             counts.append(1)
     offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
     box_array = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
@@ -122,9 +124,10 @@ def _action_hash(actions: tuple[int, ...]) -> str:
 def _rollout(view: Any, rho: float, policy_name: str) -> dict[str, object]:
     from squint_rl.budget import BudgetConfig
     from squint_rl.env import RUN_DETECTOR, SKIP, SquintEnv
-    from squint_rl.policies import GreedyAffordable, Periodic, SceneChange
+    from squint_rl.policies import GreedyAffordable, Periodic, Policy, SceneChange
     from squint_rl.tracker import ObservationScales
 
+    policy: Policy
     if policy_name == "greedy-affordable-v1":
         policy = GreedyAffordable()
     elif policy_name == "periodic-v1":
