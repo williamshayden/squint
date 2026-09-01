@@ -6,8 +6,8 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
-from conftest import FakeDetector
 
+from conftest import FakeDetector
 from edge_perception.config import (
     CaptureRequest,
     CaptureResult,

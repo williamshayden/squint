@@ -12,8 +12,8 @@ from typing import Self
 import av
 import numpy as np
 import pytest
-from conftest import FakeDetector
 
+from conftest import FakeDetector
 from edge_perception import runner as runner_module
 from edge_perception.config import CaptureRequest, CaptureResult
 from edge_perception.contracts import Region

@@ -1,11 +1,11 @@
 # Squint M0 Design Specification
 
 **Status:** Approved for implementation
-**Date:** 2026-08-08  
-**Owner:** William Hayden  
-**Product:** Squint  
-**Distribution:** squint-rl  
-**Python package:** squint_rl  
+**Date:** 2026-08-08
+**Owner:** William Hayden
+**Product:** Squint
+**Distribution:** squint-rl
+**Python package:** squint_rl
 **CLI:** squint
 
 ## 1. The project in one sentence
