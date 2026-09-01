@@ -60,11 +60,17 @@ def write_completed_run_fixture(
     for index, filename in enumerate(annotation_names):
         Image.new("RGB", (3, 2), color=(index * 40, 20, 10)).save(annotated / filename)
     run_id = f"{name}-run-id"
+    source_path = (
+        (tmp_path / "historical-source.mp4").resolve()
+        if capture is None
+        else capture.path.resolve()
+    )
+    source_sha256 = "a" * 64 if capture is None else capture.sha256
     manifest = {
         "schema_version": "0.1.0",
         "run_id": run_id,
         "configuration": {
-            "input_path": str((tmp_path / "historical-source.mp4").resolve()),
+            "input_path": str(source_path),
             "output_dir": str(run_dir.resolve()),
             "regions": [
                 {"region_id": "left", "x": 0, "y": 0, "width": 320, "height": 480},
@@ -84,8 +90,8 @@ def write_completed_run_fixture(
             "batch_size": 1,
         },
         "source_video": {
-            "path": str((tmp_path / "historical-source.mp4").resolve()),
-            "sha256": "a" * 64,
+            "path": str(source_path),
+            "sha256": source_sha256,
             "frame_width": 640,
             "frame_height": 480,
             "capture": None if capture is None else capture.to_dict(),

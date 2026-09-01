@@ -14,6 +14,7 @@ from typing import NoReturn, TextIO
 from edge_perception.config import load_run_config
 from edge_perception.detector import Detector
 from edge_perception.detectors.registry import load_detector
+from edge_perception.preflight import preflight_run
 from edge_perception.progress import ProgressEvent
 from edge_perception.runner import run_checkpoint
 
@@ -57,6 +58,7 @@ def run_worker(
             _emit_json(stream, event)
 
         with redirect_stdout(diagnostic_stream):
+            preflight_run(config)
             detector = detector_loader(
                 config.detector_id,
                 threshold=config.threshold,

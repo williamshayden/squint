@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from fractions import Fraction
 from pathlib import Path
 
@@ -88,6 +89,31 @@ def test_local_video_run_inspect_rerun_compare_workflow(
 
     assert cli.main([*run_arguments[:2], "--output", str(run_b), *run_arguments[2:]]) == 0
     capsys.readouterr()
+
+    expected_schedule = [
+        (0, "full-frame"),
+        (0, "left"),
+        (0, "right"),
+        (1, "full-frame"),
+        (1, "left"),
+        (1, "right"),
+        (2, "full-frame"),
+        (2, "left"),
+        (2, "right"),
+    ]
+    repeated_schedules: list[list[tuple[int, str]]] = []
+    for run_dir in (run_a, run_b):
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        inference_rows = [
+            json.loads(line)
+            for line in (run_dir / "inferences.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert summary["frames_processed"] == 3
+        assert summary["inference_count"] == 9
+        schedule = sorted((row["frame_index"], row["region_id"]) for row in inference_rows)
+        assert schedule == expected_schedule
+        repeated_schedules.append(schedule)
+    assert repeated_schedules == [expected_schedule, expected_schedule]
 
     assert cli.main(["compare", str(run_a), str(run_b)]) == 0
     comparison = capsys.readouterr()

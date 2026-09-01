@@ -22,8 +22,9 @@ from edge_perception.config import (
 from edge_perception.contracts import Region
 from edge_perception.detectors.registry import detector_descriptors, load_detector
 from edge_perception.inspection import render_run_inspection
+from edge_perception.preflight import preflight_run
 from edge_perception.run_view import load_run_view
-from edge_perception.runner import run_checkpoint, validate_output_directory
+from edge_perception.runner import run_checkpoint
 
 _DETECTOR_RUNTIME_MODULES = (
     "huggingface_hub",
@@ -183,9 +184,7 @@ def _build_parser() -> _Parser:
 
 def _run_command(args: argparse.Namespace) -> int:
     config = _resolve_run_config(args)
-    if not config.input_path.is_file():
-        raise _CliError(f"input video does not exist: {config.input_path}")
-    validate_output_directory(config.output_dir)
+    preflight_run(config)
     cancel_event = threading.Event()
     previous_handler = signal.getsignal(signal.SIGINT)
 
@@ -238,7 +237,11 @@ def _resolve_run_config(args: argparse.Namespace) -> RunConfig:
         if not hasattr(args, "output"):
             raise _CliError("--output is required without --config")
         return _explicit_run_config(args, input_path)
-    return _apply_config_overrides(load_run_config(config_path), args)
+    try:
+        config = load_run_config(config_path)
+    except (TypeError, ValueError) as error:
+        raise _CliError(str(error)) from error
+    return _apply_config_overrides(config, args)
 
 
 def _explicit_run_config(args: argparse.Namespace, input_path: Path | None) -> RunConfig:
