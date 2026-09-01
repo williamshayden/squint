@@ -7,8 +7,8 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
-from conftest import FakeDetector
 
+from conftest import FakeDetector
 from edge_perception import cli
 from edge_perception.video import iter_video, probe_video
 

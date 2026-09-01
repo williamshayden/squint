@@ -9,8 +9,8 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from conftest import FakeDetector
 
+from conftest import FakeDetector
 from edge_perception import cli
 from edge_perception.capture import CameraDeviceInfo, CameraFormatInfo
 from edge_perception.config import (

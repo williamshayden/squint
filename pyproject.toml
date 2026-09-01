@@ -3,92 +3,75 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "adaptive-edge-perception"
+name = "squint-rl"
 version = "0.1.0"
-description = "Adaptive edge-perception checkpoint tooling."
+description = "A detector-neutral Gymnasium benchmark for compute-budgeted tracking-by-detection."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "av>=16,<17",
-    "numpy>=2.2,<3",
-    "pillow>=11,<13",
-    "psutil>=7,<8",
+    "gymnasium>=1.2.2,<2",
+    "numpy>=2,<3",
+    "scipy>=1.14,<2",
+    "trackeval>=1.3,<2",
+    "tomli>=2,<3; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
-camera = [
-    "PySide6>=6.8,<7",
-]
-cpu = [
-    "torch==2.11.0",
-    "transformers==4.57.6",
-    "safetensors>=0.6,<1",
-]
-cu128 = [
-    "torch==2.11.0",
-    "transformers==4.57.6",
-    "safetensors>=0.6,<1",
+reference = [
     "nvidia-ml-py>=13,<14",
+    "pillow>=11,<13",
+    "safetensors>=0.6,<1",
+    "torch==2.6.0",
+    "trackers==2.6.0",
+    "supervision==0.26.1",
+    "transformers==4.57.6",
 ]
-gui = [
-    "PySide6>=6.8,<7",
+research = [
+    "stable-baselines3==2.8.0",
+    "torch==2.6.0",
 ]
-
-[project.scripts]
-edge-perception = "edge_perception.cli:main"
-
-[tool.hatch.build.targets.wheel]
-only-include = ["src/edge_perception"]
-sources = ["src"]
-
-[tool.hatch.build.targets.sdist]
-only-include = [
-    "LICENSE",
-    "README.md",
-    "pyproject.toml",
-    "uv.lock",
-    "src",
-    "tests",
-    "scripts/verify_release_archives.py",
-    "docs/checkpoints",
-]
-
-[tool.hatch.build.hooks.custom]
-path = "scripts/verify_release_archives.py"
-
-[tool.uv]
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "cu128" },
-    ],
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu124", marker = "(sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[project.scripts]
+squint = "squint_rl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/squint_rl"]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/CONTRIBUTING.md",
+    "/pyproject.toml",
+    "/src/squint_rl",
+    "/tests",
+    "/examples",
+    "/research",
+    "/docs/superpowers/specs/2026-08-08-squint-m0-design.md",
+    "/docs/superpowers/plans/2026-08-08-squint-m0.md",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "pytest-cov",
-    "pytest-qt>=4.4,<5",
-    "ruff",
-    "mypy",
+    "build>=1.3,<2",
+    "hypothesis>=6,<7",
+    "mypy>=2.3,<3",
+    "pytest>=8,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.12,<1",
 ]
 
 [tool.pytest.ini_options]
@@ -98,5 +81,9 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
+
+[tool.ruff]
+target-version = "py310"
+src = ["src", "tests"]

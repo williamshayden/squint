@@ -8,11 +8,11 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tomllib
 import zipfile
 from pathlib import Path
 
 import pytest
+import tomllib
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UV_ENV_VAR = "RELEASE_ARCHIVES_UV"
